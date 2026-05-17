@@ -169,7 +169,7 @@ function subscribeRealtime() {
   _subscribed = true;
   supa.channel("ink-global")
     .on("postgres_changes", { event: "*", schema: "public", table: "sessions" }, refreshIfOther)
-    .on("postgres_changes", { event: "*", schema: "public", table: "slide_records" }, refreshIfOther)
+    .on("postgres_changes", { event: "*", schema: "public", table: "slide_records" }, applyRecordPayload)
     .on("postgres_changes", { event: "*", schema: "public", table: "session_participants" }, refresh)
     .on("postgres_changes", { event: "*", schema: "public", table: "lessons" }, refresh)
     .on("postgres_changes", { event: "*", schema: "public", table: "slides" }, refresh)
@@ -179,9 +179,15 @@ function subscribeRealtime() {
 }
 
 // 🚫 자기 자신이 마지막 writer면 refresh 하지 않음 (필기 끊김 방지의 핵심)
+// last_writer 컬럼이 있으면 그걸 우선 사용 + 없어도 fingerprint로 잡아냄.
 function refreshIfOther(payload) {
   const writer = payload?.new?.last_writer || payload?.old?.last_writer;
   if (writer && writer === CLIENT_ID) return; // echo
+  // sessions 테이블: 자기 자신 echo도 fingerprint로 한 번 더 차단
+  if (payload?.new?.id && _recentSessionWrites.has(payload.new.id)) {
+    _recentSessionWrites.delete(payload.new.id);
+    return;
+  }
   refresh();
 }
 
@@ -189,6 +195,62 @@ let _refreshTimer = null;
 function refresh() {
   clearTimeout(_refreshTimer);
   _refreshTimer = setTimeout(() => pullSnapshot(), 300);
+}
+
+// ─── 핵심: slide_records 는 full pullSnapshot 대신 payload 만으로 증분 적용. ──
+// (1) pullSnapshot의 7-table fetch + 전체 records 재구성을 회피 → jank 제거
+// (2) 자기 자신의 write echo는 fingerprint 로 정확히 차단 → 자신의 stroke 가
+//     "왔다 갔다" 하지 않음 (마지막 writer 컬럼 유무와 무관).
+const _recentRecordWrites = new Map(); // fp → expiresAt
+const _recentSessionWrites = new Map(); // sessionId → expiresAt
+function recordFp(sessionId, slideId, scope, scopeId, strokes, texts) {
+  const sid = scopeId || "-";
+  const sLast = strokes?.length ? (strokes[strokes.length - 1].ts || 0) : 0;
+  const tLast = texts?.length ? (texts[texts.length - 1].value || "").length : 0;
+  return `${sessionId}|${slideId}|${scope}|${sid}|${strokes?.length || 0}|${sLast}|${texts?.length || 0}|${tLast}`;
+}
+function markLocalRecordWrite(sessionId, slideId, scope, scopeId, payload) {
+  const fp = recordFp(sessionId, slideId, scope, scopeId, payload.strokes, payload.texts);
+  _recentRecordWrites.set(fp, Date.now() + 5000);
+  // 가끔 청소
+  if (_recentRecordWrites.size > 200) {
+    const now = Date.now();
+    for (const [k, exp] of _recentRecordWrites) if (exp < now) _recentRecordWrites.delete(k);
+  }
+}
+function markLocalSessionWrite(id) {
+  _recentSessionWrites.set(id, Date.now() + 5000);
+}
+
+function applyRecordPayload(payload) {
+  const row = payload?.new;
+  if (!row) return; // DELETE 등은 무시 (현재 앱에 없음)
+  // 1) last_writer 명시 + 일치 → echo
+  if (row.last_writer && row.last_writer === CLIENT_ID) return;
+  // 2) fingerprint 매칭 → echo (last_writer 컬럼 없어도 작동)
+  const fp = recordFp(row.session_id, row.slide_id, row.scope, row.scope_id, row.strokes, row.texts);
+  if (_recentRecordWrites.has(fp)) {
+    _recentRecordWrites.delete(fp);
+    return;
+  }
+  // 3) 그 외 → 해당 슬라이드 record 만 증분 갱신 (전체 pullSnapshot 회피)
+  store.set(s => {
+    const ss = s.sessions.find(x => x.id === row.session_id);
+    if (!ss) return;
+    ss.records ||= {};
+    const payloadRec = { strokes: row.strokes || [], texts: row.texts || [] };
+    if (row.scope === "whole") {
+      ss.records.__whole ||= {};
+      ss.records.__whole[row.slide_id] = payloadRec;
+    } else if (row.scope === "individual") {
+      ss.records[row.scope_id] ||= {};
+      ss.records[row.scope_id][row.slide_id] = payloadRec;
+    } else if (row.scope === "group") {
+      ss.records.__groups ||= {};
+      ss.records.__groups[row.scope_id] ||= {};
+      ss.records.__groups[row.scope_id][row.slide_id] = payloadRec;
+    }
+  });
 }
 
 // ── Write helpers (best-effort, no-op if cloud disabled) ──
@@ -246,6 +308,7 @@ function markNoLW(which) {
 
 export async function cloudUpsertSession(ss) {
   if (!isCloud) return;
+  markLocalSessionWrite(ss.id);
   const base = {
     id: ss.id, lesson_id: ss.lessonId, teacher_id: ss.teacherId, title: ss.title,
     status: ss.status, flow: ss.flow, current_slide: ss.currentSlide,
@@ -268,6 +331,8 @@ export async function cloudAddParticipant(sid, stuId) {
 }
 export async function cloudWriteRecord(sessionId, slideId, scope, scopeId, payload) {
   if (!isCloud) return;
+  // 자기 자신의 realtime echo 차단용 fingerprint 등록 (last_writer 컬럼 부재 시도 작동)
+  markLocalRecordWrite(sessionId, slideId, scope, scopeId, payload);
   const base = {
     session_id: sessionId, slide_id: slideId, scope, scope_id: scopeId,
     strokes: payload.strokes || [], texts: payload.texts || [],

@@ -153,6 +153,29 @@ export function renderSlide({ root, slide, lesson, session, scope, scopeId, read
     }
   }
 
+  // refresh: 사용자가 펜을 대고 있으면 보류 → 끝난 직후 1회 적용
+  let _pendingRefresh = false;
+  function doRefresh() { loadStrokes(); renderTexts(); }
+  function refresh() {
+    if (ink.isDrawing()) {
+      if (_pendingRefresh) return;
+      _pendingRefresh = true;
+      const flush = () => {
+        canvas.removeEventListener("pointerup", flush);
+        canvas.removeEventListener("pointercancel", flush);
+        canvas.removeEventListener("pointerleave", flush);
+        _pendingRefresh = false;
+        // 한 박자 뒤 적용 (commit이 store에 반영될 시간 확보)
+        setTimeout(doRefresh, 16);
+      };
+      canvas.addEventListener("pointerup", flush);
+      canvas.addEventListener("pointercancel", flush);
+      canvas.addEventListener("pointerleave", flush);
+      return;
+    }
+    doRefresh();
+  }
+
   // expose to caller
   return {
     ink,
@@ -165,7 +188,8 @@ export function renderSlide({ root, slide, lesson, session, scope, scopeId, read
     },
     setColor(c) { ink.setColor(c); },
     setSize(s) { ink.setSize(s); },
-    refresh() { loadStrokes(); renderTexts(); },
+    refresh,
+    isDrawing: () => ink.isDrawing(),
     frame,
   };
 }

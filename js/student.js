@@ -134,17 +134,33 @@ export function studentLive({ id }) {
   let mountedKey = null;
   let stageArea = null;
 
+  // sync/store 폭주를 한 프레임에 한 번으로 모음 + 필기 중이면 보류
+  let _renderScheduled = false;
+  function scheduleRender() {
+    if (_renderScheduled) return;
+    _renderScheduled = true;
+    requestAnimationFrame(() => {
+      _renderScheduled = false;
+      if (viewer && viewer.isDrawing && viewer.isDrawing()) {
+        // 필기 중에는 절대 재렌더 금지 (캔버스 깜빡임·캐시 재구축 방지)
+        setTimeout(scheduleRender, 120);
+        return;
+      }
+      render();
+    });
+  }
+
   const unsub = store.subscribe(() => {
     const fresh = getSession();
     if (!fresh) return;
     session = fresh;
     if (session.flow === "teacher") myIdx = Math.min(session.currentSlide, session.slidesSnapshot.length - 1);
-    render();
+    scheduleRender();
   });
   const unsync = sync.on(() => {
     const fresh = getSession();
     if (fresh) session = fresh;
-    render();
+    scheduleRender();
   });
 
   function render() {

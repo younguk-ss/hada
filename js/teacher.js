@@ -848,8 +848,15 @@ function enterFocusMode(session, teacher) {
     }
   }
 
-  // 진행상황 슬라이드인 모달
+  // 진행상황 패널: 토글 (이미 열려있으면 닫음)
   function openProgress() {
+    const existing = shell.querySelector(".focus-progress-modal");
+    if (existing) {
+      existing.remove();
+      clearInterval(progressTimer);
+      progressTimer = null;
+      return;
+    }
     const slide = currentSlide();
     const panel = el("aside", { class: "focus-progress-modal open" }, [
       el("div", { class: "row-flex", style: { marginBottom: "10px" } }, [
@@ -933,9 +940,25 @@ function groupProgress(session, slide) {
     tile.appendChild(prev);
     gal.appendChild(tile);
     queueMicrotask(() => paintMini(cv, session, slide.id, "group", g.id));
+    tile.onclick = () => openGroupView(session, slide, g.id);
   });
   wrap.appendChild(gal);
   return wrap;
+}
+
+function openGroupView(session, slide, gid) {
+  const g = session.groups.find(x => x.id === gid);
+  const body = el("div", {});
+  const stage = el("div", { class: "canvas-stage", style: { padding: 0, height: "60vh" } });
+  body.appendChild(stage);
+  modal({
+    title: `${g ? g.name : "모둠"} · ${session.title}`,
+    body,
+    actions: [{ label: "닫기", primary: true, onClick: (close) => close() }],
+  });
+  setTimeout(() => {
+    renderSlide({ root: stage, slide, session, scope: "group", scopeId: gid, readOnly: true });
+  }, 30);
 }
 
 function paintMini(canvas, session, slideId, scope, scopeId) {

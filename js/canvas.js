@@ -37,10 +37,19 @@ export class InkCanvas {
   }
 
   setStrokes(arr) {
-    this.strokes = arr ? arr.slice() : [];
+    const next = arr || [];
+    // 동일 데이터면 캐시 무효화 생략 (sync 폭주 시 jank 방지)
+    if (next.length === this.strokes.length) {
+      const a = next[next.length - 1], b = this.strokes[this.strokes.length - 1];
+      if (next.length === 0 || (a && b && a.ts === b.ts && a.points?.length === b.points?.length)) {
+        return;
+      }
+    }
+    this.strokes = next.slice();
     this.cacheValid = false;
     this._scheduleDraw();
   }
+  isDrawing() { return !!this.current; }
   appendStroke(s) {
     this.strokes.push(s);
     this._appendToCache(s);

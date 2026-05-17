@@ -486,7 +486,7 @@ input, select, textarea { font-family: inherit; }
   position: fixed; inset: 0;
   background: rgba(20, 20, 20, 0.4);
   display: grid; place-items: center;
-  z-index: 100;
+  z-index: 400;
 }
 .modal {
   background: var(--surface);
