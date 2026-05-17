@@ -209,14 +209,23 @@ export class InkCanvas {
       ctx.globalAlpha = 0.32;
       ctx.lineCap = "butt";
       ctx.globalCompositeOperation = "multiply";
+      ctx.strokeStyle = s.color || "#1a1a1a";
+      ctx.fillStyle = s.color || "#1a1a1a";
+    } else if (s.tool === "eraser") {
+      // 지우개 트레일: 반투명 회색으로 표시 (실제 삭제는 pointerup 시 적용)
+      ctx.globalAlpha = 0.35;
+      ctx.lineCap = "round";
+      ctx.globalCompositeOperation = "source-over";
+      ctx.strokeStyle = "#9a9a9a";
+      ctx.fillStyle = "#9a9a9a";
     } else {
       ctx.globalAlpha = 1;
       ctx.lineCap = "round";
       ctx.globalCompositeOperation = "source-over";
+      ctx.strokeStyle = s.color || "#1a1a1a";
+      ctx.fillStyle = s.color || "#1a1a1a";
     }
     ctx.lineJoin = "round";
-    ctx.strokeStyle = s.color || "#1a1a1a";
-    ctx.fillStyle = s.color || "#1a1a1a";
 
     const pts = s.points;
 

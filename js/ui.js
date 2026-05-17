@@ -30,6 +30,8 @@ export function mount(view) {
 }
 
 export function modal({ title, body, actions }) {
+  // 한 번에 모달은 하나만. 같은 버튼 연타로 창이 누적되지 않도록 기존 모달은 제거.
+  document.querySelectorAll(".modal-back").forEach(n => n.remove());
   const back = el("div", { class: "modal-back" });
   const m = el("div", { class: "modal" });
   m.appendChild(el("h3", {}, title));
