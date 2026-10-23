@@ -5,10 +5,7 @@ const NS = "http://www.w3.org/2000/svg";
 const TRACK = 60;            // 글자 사이 자간 (0.06em)
 const PAD = 40;              // 좌우 여백
 const Y0 = -660, Y1 = 360;   // 모든 단어 공통 세로 범위 → 괄호와 같은 높이로 정렬
-const PEN_SPEED = 11;        // units/ms
-const PEN_MIN_MS = 60;       // 짧은 획도 이 정도는 걸려야 '쓰는' 느낌
-const PEN_LIFT = 18;         // 획 사이 펜 드는 시간
-const CHAR_GAP = 40;         // 글자 사이
+const PEN_LIFT = 6;          // 획 사이 펜 드는 시간
 let uid = 0;
 
 const svgEl = (tag, attrs = {}) => {
@@ -66,27 +63,29 @@ export function inkWord(text, { written = false } = {}) {
     return { strokes, fill };
   });
 
-  // 획순대로 쓴다. 모든 획이 끝나면 resolve.
-  function write({ delay = 0 } = {}) {
+  // 획순대로 duration(ms) 안에 다 쓴다. 시간은 획 길이에 비례해 나눔. 모든 획이 끝나면 resolve.
+  function write({ delay = 0, duration = 300 } = {}) {
+    const all = parts.flatMap(p => p.strokes);
+    const total = all.reduce((a, s) => a + s.len, 0);
+    const draw = duration - PEN_LIFT * (all.length - 1);
     let t = delay;
     const anims = [];
     for (const { strokes, fill } of parts) {
       for (const s of strokes) {
-        const dur = Math.max(PEN_MIN_MS, s.len / PEN_SPEED);
+        const dur = draw * s.len / total;
         anims.push(s.el.animate(
           [{ strokeDashoffset: s.len + 1 }, { strokeDashoffset: 0 }],
-          { duration: dur, delay: t, easing: "cubic-bezier(.45,.05,.3,1)", fill: "both" },
+          { duration: dur, delay: t, easing: "cubic-bezier(.4,0,.3,1)", fill: "both" },
         ));
         t += dur + PEN_LIFT;
       }
-      anims.push(fill.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 200, delay: t - PEN_LIFT, fill: "both" }));
-      t += CHAR_GAP;
+      anims.push(fill.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 50, delay: t - PEN_LIFT - 40, fill: "both" }));
     }
     return Promise.all(anims.map(a => a.finished)).catch(() => {});
   }
 
   // 형광펜으로 단어 아래쪽을 긋는다 (앱 이름 강조용)
-  function highlight({ written: done = false } = {}) {
+  function highlight({ written: done = false, duration = 200 } = {}) {
     const y = -150, h = 230;
     const hl = svgEl("path", {
       class: "ink-highlight",
@@ -99,7 +98,7 @@ export function inkWord(text, { written = false } = {}) {
     hl.setAttribute("stroke-dashoffset", done ? 0 : len + 1);
     if (done) return Promise.resolve();
     return hl.animate([{ strokeDashoffset: len + 1 }, { strokeDashoffset: 0 }],
-      { duration: 420, easing: "cubic-bezier(.3,.6,.2,1)", fill: "both" }).finished.catch(() => {});
+      { duration, easing: "cubic-bezier(.3,.6,.2,1)", fill: "both" }).finished.catch(() => {});
   }
 
   return { svg, write, highlight };

@@ -32,8 +32,10 @@ route("/", () => {
 
 // 인트로 타이포: [필기]하다 → [공유]하다 → [소통]하다 → [수업]하다
 // 각 단어는 획순대로 펜으로 쓰듯 그려지고, 마지막 '수업'이 써지면 앱 이름 (수업)하다로 강조.
+// 강조까지 전체 모션이 2초 안에 끝나도록 빠르게 샥샥 쓴다.
 const INTRO_WORDS = ["필기", "공유", "소통", "수업"];
-const INTRO_HOLD_MS = 420;
+const INTRO_WRITE_MS = 240;  // 단어 하나 쓰는 시간
+const INTRO_HOLD_MS = 80;    // 다 쓴 단어가 머무는 시간
 function playIntro(root) {
   const slot = root.querySelector(".intro-slot");
   const hadaBox = root.querySelector(".intro-hada");
@@ -66,19 +68,19 @@ function playIntro(root) {
     const hada = inkWord("하다");
     hadaBox.appendChild(hada.svg);
     root.classList.add("play");
-    await word.write({ delay: 250 });
+    await word.write({ delay: 40, duration: INTRO_WRITE_MS });
     if (!alive) return;
-    await hada.write();
+    await hada.write({ duration: 200 });
     for (const w of INTRO_WORDS.slice(1)) {
       await sleep(INTRO_HOLD_MS);
       if (!alive) return;
       erase(word.svg);
       word = place(w);
-      await word.write({ delay: 60 });
+      await word.write({ delay: 40, duration: INTRO_WRITE_MS });
       if (!alive) return;
     }
     root.classList.add("named");
-    word.highlight();
+    word.highlight({ duration: 200 });
   })();
   return () => { alive = false; };
 }

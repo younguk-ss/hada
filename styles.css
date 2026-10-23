@@ -129,7 +129,7 @@ input, select, textarea { font-family: inherit; }
 .bracket > span {
   grid-area: 1 / 1;
   text-align: center;
-  transition: opacity .5s ease, transform .7s cubic-bezier(.2,.7,.2,1), filter .5s ease;
+  transition: opacity .2s ease, transform .25s cubic-bezier(.2,.7,.2,1), filter .2s ease;
 }
 .bracket .rd { opacity: 0; transform: scaleY(.6); filter: blur(4px); }
 .intro-slot { display: inline-grid; justify-items: center; align-items: center; }
@@ -144,8 +144,8 @@ input, select, textarea { font-family: inherit; }
 }
 .ink-highlight { stroke: rgba(253, 224, 71, 0.6); }
 
-.intro-type.play .bracket { animation: introFade .7s ease forwards; }
-.intro-slot > .ink-word.out { animation: inkOut .55s ease forwards; }
+.intro-type.play .bracket { animation: introFade .2s ease forwards; }
+.intro-slot > .ink-word.out { animation: inkOut .14s ease forwards; }
 @keyframes introFade { to { opacity: 1; } }
 /* 물에 풀리듯 번지며 사라짐 */
 @keyframes inkOut {
@@ -156,7 +156,7 @@ input, select, textarea { font-family: inherit; }
 /* '수업'이 다 써지면 앱 이름 강조: [ ] → ( ) 로 바뀌어 (수업)하다 완성 + 형광펜 + 살짝 맺힘 */
 .intro-type.named .bracket .sq { opacity: 0; transform: scaleY(1.25); filter: blur(4px); }
 .intro-type.named .bracket .rd { opacity: 1; transform: none; filter: none; }
-.intro-type.named .intro-slot > .ink-word:not(.out) { animation: namePop .9s cubic-bezier(.2,.7,.2,1); }
+.intro-type.named .intro-slot > .ink-word:not(.out) { animation: namePop .25s cubic-bezier(.2,.7,.2,1); }
 @keyframes namePop { 35% { transform: scale(1.07); } }
 
 @media (prefers-reduced-motion: reduce) {
