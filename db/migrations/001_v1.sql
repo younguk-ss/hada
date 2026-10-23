@@ -1,3 +1,5 @@
+-- ⚠️ 새 Supabase 프로젝트 전용. 기존 DB에 실행 금지 (drop table 포함 → 데이터 삭제).
+-- 순서: 001_v1.sql → 002_v2.sql → 003_v21.sql
 -- (수업)하다 · hada schema v1.6 — text-id 기반 (클라이언트 store.newId() 형식과 호환)
 -- ⚠️ 기존 uuid 기반 테이블이 있다면 DROP 후 재생성합니다 (현재 데이터는 사실상 비어 있어서 안전).
 -- Run in Supabase SQL Editor.
