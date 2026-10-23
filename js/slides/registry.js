@@ -4,20 +4,24 @@
 // def = {
 //   type: 'mcq',                 // 고유 키 (slide.type)
 //   category: 'basic' | 'interact' | 'media' | 'game',
-//   label: '객관식 퀴즈', desc: '한 줄 설명', icon: '<svg viewBox="0 0 24 24" …>',
-//   create()                      → Slide { id, type, title, config, ... }
-//   thumb(slide)                  → HTMLElement  (편집기 레일·자료 카드의 작은 미리보기)
-//   Editor({ slide, lesson, update, ctx })          → { el, destroy? }
+//   label: '객관식', desc: '한 줄 설명(title 속성용)', icon: '<svg viewBox="0 0 24 24" …>',  // 24px stroke SVG
+//   create()                      → Slide { config 기본값 ... }  (id·type·title 은 createSlide 가 채움)
+//   thumb?(slide)                 → HTMLElement  (편집기 레일·자료 카드의 작은 미리보기, 없으면 아이콘+제목)
+//   Editor({ slide, lesson, update, ctx })          → { el, destroy?, inspector?: HTMLElement }
+//       update(patch): 코어가 Object.assign(slide, patch) 얕은 병합 + 300ms 디바운스 저장.
+//       config 를 바꿀 땐 전체 객체로: update({ config: { ...slide.config, question } })
+//       inspector: 코어 인스펙터(제목 아래)에 붙는 타입별 설정 영역 (선택)
 //   Student({ slide, session, me, ctx })             → { el, destroy?, onActivity?, onResponses?, onSession? }
 //   TeacherLive({ slide, session, ctx })             → { el, destroy?, onActivity?, onResponses?, onSession?, panel? }
-//   summary?(slide, responses, session)              → HTMLElement  (기록 화면·인쇄)
+//   summary?(slide, responses, session, ctx)         → HTMLElement  (기록 화면·인쇄, 읽기 전용)
+//   validate?(slide)                                 → string | null  (편집기 경고 문구, 시작 시에도 표시)
 // }
 //
-// 훅 의미:
-//   onActivity(state)   sessions.activity[slide.id] 가 바뀌었을 때 (phase/reveal/타입별 필드)
+// 훅 의미 (host.js 가 호출):
+//   onActivity(state)   session.activity[slide.id] 가 바뀌었을 때 (JSON 비교. phase/reveal/endsAt/타입별 필드)
 //   onResponses(list)   이 슬라이드의 응답 목록이 바뀌었을 때 (전체 목록을 다시 넘김)
-//   onSession(session)  세션 객체가 교체됐을 때 (groups, participants, flow 등)
-// 코어는 (slideId, role, scope) 키가 같으면 el 을 보존하고 훅만 호출한다. 키가 바뀌면 destroy() 후 재마운트.
+//   onSession(session)  그 밖의 모든 세션 변경 (groups, participants, flow 등) — 싸고 멱등이어야 함
+// 코어는 `${slide.id}|${role}` 키가 같으면 el 을 보존하고 훅만 호출한다. 키가 바뀌면 destroy() 후 재마운트.
 
 export const CATEGORIES = [
   { id: "basic", label: "기본" },
@@ -87,6 +91,50 @@ export function fmtMs(ms) {
 }
 export function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// 필기 모드 읽기는 반드시 이 함수로 (수업 중 전환은 activity[slideId].mode, 스냅샷은 불변)
+export function effectiveMode(slide, session) {
+  if (!slide) return "none";
+  return session?.activity?.[slide.id]?.mode ?? slide.mode ?? "none";
+}
+
+// 유튜브 주소 → 영상 id (watch?v=, youtu.be/, shorts/, embed/, live/, 11자 id 단독)
+export function parseYouTubeId(url) {
+  const s = String(url ?? "").trim();
+  if (!s) return null;
+  if (/^[\w-]{11}$/.test(s)) return s;
+  let u;
+  try { u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `https://${s}`); } catch { return null; }
+  const host = u.hostname.replace(/^(www\.|m\.|music\.)/, "");
+  const ok = id => (id && /^[\w-]{11}$/.test(id) ? id : null);
+  if (host === "youtu.be") return ok(u.pathname.split("/")[1]);
+  if (host === "youtube.com" || host === "youtube-nocookie.com") {
+    const v = u.searchParams.get("v");
+    if (v) return ok(v);
+    const m = u.pathname.match(/^\/(?:shorts|embed|live|v|e)\/([\w-]{11})/);
+    return m ? m[1] : null;
+  }
+  return null;
+}
+
+// 랜덤 조 편성: g = ceil(n/max), 앞 n%g 조는 floor(n/g)+1명
+// 7→[4,3], 5→[3,2], 9→[3,3,3], 10→[4,3,3]
+export function groupStudents(ids, maxSize = 4) {
+  const list = shuffle([...new Set((ids || []).filter(Boolean))]);
+  const n = list.length;
+  if (!n) return [];
+  const max = Math.max(1, Math.floor(maxSize) || 4);
+  const g = Math.ceil(n / max);
+  const base = Math.floor(n / g), extra = n % g;
+  const out = [];
+  let i = 0;
+  for (let k = 0; k < g; k++) {
+    const size = base + (k < extra ? 1 : 0);
+    out.push(list.slice(i, i + size));
+    i += size;
+  }
+  return out;
 }
 
 function defaultThumb(slide) {

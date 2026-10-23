@@ -1,1319 +1,1650 @@
-// Teacher dashboard: lessons list, editor, live class, sessions, students, QR
-import { el, mount, template, modal, fmtDate } from "./ui.js";
-import { store, getActiveSession, findLesson, findSession, studentLabel } from "./store.js";
-import { sync } from "./sync.js";
+// 교사 화면 — 대시보드(수업 자료·수업 기록·학생·내 코드), 편집기, 수업 진행, 기록 상세 (docs/ARCHITECTURE.md §7.3, §8, §9.1)
+// export: teacherDashboard(params), editorView({id}), liveView({id}), sessionDetailView({id}) — 모두 cleanup(또는 Promise<cleanup>) 반환.
+// 가정: 'session:hello' 응답은 realtime.js 코어가 자동 처리(교사 채널이면 sessionHelloState로 'session:patch' 송신) → 여기서는 하지 않는다.
+// 가정: 라우트 핸들러 안의 리다이렉트는 setTimeout으로 미룬다(동기 중첩 dispatch가 router의 cleanup 등록을 덮어쓰지 않게).
+// 가정: 대시보드 탭 전환은 history.replaceState로 해시(?tab=)만 바꾼다(재-dispatch 없음).
+// 가정: 로그아웃 = whoTeacher=null → '/'.
+// 가정: 편집기 슬라이드 복제는 bgPath를 비운다(같은 이미지 파일을 두 슬라이드가 소유하면 한쪽 배경 교체 시 다른 쪽 이미지가 지워짐).
+// 가정: 편집기에서 슬라이드를 삭제해도 Storage 이미지는 지우지 않는다(지난 수업 스냅샷이 같은 URL을 참조). 자료 삭제 시 cloud.js가 폴더 정리.
+// 가정: 편집기 상단의 [미리보기]는 이번 범위에서 생략(명세 §9.1 흐름에 없음).
+// 가정: /live/:id 의 세션이 live가 아니면 기록 상세로 보낸다. 다른 곳에서 끝나면 '수업이 끝났어요' 후 기록 상세.
+// 가정: 기록 '학생별'의 필기는 최종 모드(effectiveMode) 우선으로 scope를 고르되, 그 scope에 필기가 없으면 필기가 있는 다른 scope(개별→모둠→전체)를 보여 준다.
+// 가정: 수업 자료 삭제 시 DB cascade로 그 자료의 수업 기록도 지워지므로 확인 문구에 함께 적는다.
+import { store, findLesson, findSession, findStudent, findTeacher, studentLabel, newId } from "./store.js";
 import { go } from "./router.js";
+import { el, mount, template, toast, confirmDialog, promptDialog, modal, sheet, icon, fmtDate, debounce, copyText } from "./ui.js";
+import {
+  cloudReady, cloudCreateLesson, cloudSaveLesson, cloudDeleteLesson, cloudDuplicateLesson, cloudFetchLessonSlides,
+  cloudStartSession, ensureSession, cloudFetchSession, patchSession, cloudEndSession, cloudResumeSession, cloudDeleteSession,
+  subscribeSession,
+} from "./cloud.js";
+import { fileToSlides } from "./storage.js";
+import { joinSessionChannel } from "./realtime.js";
+import { getSlideType, listSlideTypes, createSlide, CATEGORIES, effectiveMode, injectCss, mountSlideHost } from "./slides/index.js";
 import { renderSlide } from "./lesson-view.js";
-import { cloudInsertLesson, cloudUpsertSession } from "./cloud.js";
 
-const TOOLS = [
-  { id: "pen", label: "펜", icon: "M3 17l3.6-1 9.5-9.5a2 2 0 0 0-2.8-2.8L3.8 13.2 3 17z" },
-  { id: "highlight", label: "형광", icon: "M3 17l3.6-1L17 5.6 13.4 2 3 12.4 3 17z" },
-  { id: "eraser", label: "지우개", icon: "M16 4l4 4-9 9H4v-7l12-6z" },
-  { id: "text", label: "텍스트", icon: "M5 5h14M12 5v14" },
-];
-const COLORS = ["#1a1a1a", "#2b6cb0", "#c53030", "#2f7a4d", "#b6612d", "#7c3aed"];
+const TABS = ["lessons", "records", "students", "code"];
+const MODES = [["none", "발표"], ["whole", "전체"], ["individual", "개별"], ["group", "모둠"]];
+const STATUS = { live: ["진행 중", "pill-live"], completed: ["끝남", "pill-ok"], stopped: ["중단", "pill-warn"] };
+const ACCEPT = ".pdf,.png,.jpg,.jpeg,.webp,application/pdf,image/png,image/jpeg,image/webp";
 
-export function teacherDashboard() {
-  const root = template("tpl-teacher-dashboard");
-  mount(root);
-  const t = store.state.teachers.find(x => x.id === store.state.whoTeacher);
-  root.querySelector("#t-who").textContent = t?.name || "—";
-  root.querySelector("#t-logout").onclick = () => { store.set(s => s.whoTeacher = null); go("/"); };
-  const tabs = root.querySelectorAll(".nav-item");
-  tabs.forEach(b => b.onclick = () => {
-    tabs.forEach(x => x.classList.remove("active"));
-    b.classList.add("active");
-    renderTab(root, b.dataset.tab, t);
-  });
-  renderTab(root, "lessons", t);
-  return store.subscribe(() => {
-    const active = root.querySelector(".nav-item.active");
-    if (active) renderTab(root, active.dataset.tab, t);
+// 화면 전용 보조 CSS (styles.css 클래스 위에 최소한만)
+const TEACHER_CSS = `
+.t-paper { position:absolute; inset:0; background:#fff linear-gradient(transparent 23px, var(--line) 24px) 0 12px / 100% 24px; }
+.t-thumb { position:absolute; inset:0; overflow:hidden; background:#fff; }
+.t-thumb > * { width:100%; height:100%; }
+.rail-item { -webkit-touch-callout:none; user-select:none; -webkit-user-select:none; }
+.rail-ghost .rail-more { display:none; }
+.t-menu-pop { padding:0; }
+.menu-item:disabled { opacity:.4; cursor:default; }
+.menu-item .icon { color:var(--muted); }
+.menu-item.danger .icon { color:inherit; }
+.t-strip-pop { padding:6px; }
+.t-strip-pop .thumb-strip > .rail-item { width:128px; }
+.t-warn-list { margin:0; padding-left:18px; display:grid; gap:4px; font-size:14px; color:var(--ink-2); max-height:40vh; overflow:auto; }
+.editor-top .topbar-group { gap:6px; }
+.live-top .topbar-title { flex:1 1 80px; }
+.live-top .seg { flex:none; }
+.live-top .slide-count { min-width:72px; }
+.drawer-head { border-bottom:1px solid var(--line); }
+.drawer-head .tabs { flex:1; min-width:0; border-bottom:0; padding:0; }
+.t-pane { display:grid; gap:12px; align-content:start; min-width:0; }
+.person .pill { height:20px; padding:0 8px; font-size:11px; }
+.t-meta { display:flex; flex-wrap:wrap; align-items:center; gap:6px 14px; margin:-12px 0 20px; color:var(--muted); font-size:13px; }
+.t-detail-bar { margin-bottom:16px; }
+.t-sum-head { display:flex; align-items:center; gap:10px; min-width:0; margin-bottom:14px; }
+.t-sum-head h3 { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:16px; }
+.t-sum-num { flex:none; min-width:26px; height:26px; padding:0 6px; border-radius:7px; background:var(--surface-2); display:grid; place-items:center; font-size:12px; font-weight:700; color:var(--ink-2); font-variant-numeric:tabular-nums; }
+.t-mini { width:min(100%, 560px); }
+.t-mini .slide-frame { width:100%; }
+.t-sum-thumb { position:relative; width:min(100%, 240px); aspect-ratio:16/10; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+.t-loading { min-height:100vh; min-height:100dvh; display:grid; place-items:center; }
+.t-print-only { display:none; }
+@media print { .t-print-only { display:block; } .chips { display:none !important; } }
+`;
+function ensureCss() { injectCss("teacher-views", TEACHER_CSS); }
+
+// ───────────────────────── 공용 헬퍼 ─────────────────────────
+function teacherId() {
+  const w = store.state.whoTeacher;
+  return w && typeof w === "object" ? w.id : (w || null);
+}
+function currentTeacher() {
+  const id = teacherId();
+  return id ? findTeacher(id) : null;
+}
+// 가정: 리다이렉트는 history를 교체(replace) — 뒤로 가기 시 같은 리다이렉트로 되돌아오는 루프 방지.
+function redirect(path) { setTimeout(() => go(path, { replace: true }), 0); }
+
+let viewSeq = 0;
+// 비동기 대기 후에도 같은 화면인지
+function viewGuard() {
+  const tok = ++viewSeq, hash = location.hash;
+  return () => tok === viewSeq && location.hash === hash;
+}
+
+// 교사 확인 후 render(teacher). 부팅 조회 전이면 cloudReady까지 기다린다.
+function withTeacher(render) {
+  if (!teacherId()) { redirect("/teacher-login"); return () => {}; }
+  const t = currentTeacher();
+  if (t) return render(t);
+  const alive = viewGuard();
+  return cloudReady.then(() => {
+    if (!alive()) return () => {};
+    const tid = teacherId();
+    // cloudBootTeacher가 없는 교사면 whoTeacher를 비운다 → 로그인으로
+    if (!tid) { redirect("/teacher-login"); return () => {}; }
+    // 가정: 부팅 조회가 네트워크 오류로 실패해 교사 행이 없으면 최소 객체로 계속(로그인↔대시보드 리다이렉트 루프 방지)
+    return render(currentTeacher() || { id: tid, name: "", joinCode: "" });
   });
 }
 
-function renderTab(root, tab, teacher) {
-  const slot = root.querySelector("#tab-content");
-  slot.innerHTML = "";
-  if (tab === "lessons") slot.appendChild(viewLessons(teacher));
-  if (tab === "live") slot.appendChild(viewLive(teacher));
-  if (tab === "sessions") slot.appendChild(viewSessions(teacher));
-  if (tab === "students") slot.appendChild(viewStudents(teacher));
-  if (tab === "qr") slot.appendChild(viewQR(teacher));
+function logout() {
+  store.set(s => { s.whoTeacher = null; });
+  go("/");
 }
 
-/* ── Lessons ─────────────────────────────────────────── */
+function fmtDay(ts) { const s = fmtDate(ts); return s.length > 10 ? s.slice(0, 10) : s; }
+function dateRange(s) {
+  if (!s.startedAt) return "—";
+  const a = fmtDate(s.startedAt);
+  if (!s.endedAt) return a;
+  const b = fmtDate(s.endedAt);
+  return a.slice(0, 10) === b.slice(0, 10) ? `${a} – ${b.slice(11)}` : `${a} – ${b}`;
+}
+function statusPill(status) {
+  const [label, cls] = STATUS[status] || STATUS.stopped;
+  return el("span", { class: "pill " + cls }, label);
+}
+function joinUrl(code) {
+  return `${location.origin}${location.pathname}#/student/join?c=${encodeURIComponent(code || "")}`;
+}
+function studentsMap() {
+  return new Map((store.state.students || []).map(s => [s.id, s]));
+}
+function cmpStudent(a, b) {
+  if (!a && !b) return 0;
+  if (!a) return 1;
+  if (!b) return -1;
+  return (+a.grade || 0) - (+b.grade || 0) || (+a.classNum || 0) - (+b.classNum || 0) || (+a.num || 0) - (+b.num || 0)
+    || String(a.name || "").localeCompare(String(b.name || ""), "ko");
+}
+function isTypingTarget(t) {
+  if (!t || t.nodeType !== 1) return false;
+  return !!(t.isContentEditable || t.closest("input, textarea, select, [contenteditable='true'], [contenteditable='']"));
+}
+function slideLabel(s) { return (s && s.title) || getSlideType(s?.type).label; }
 
-function viewLessons(teacher) {
-  const wrap = el("div", {});
-  const head = el("div", { class: "main-header" }, [
-    el("h1", {}, "수업 자료"),
-    el("div", { class: "actions" }, [
-      el("button", { class: "btn btn-primary", onClick: () => newLessonDialog(teacher) }, "+ 새 수업"),
-    ]),
+// 타입별 썸네일 (실패해도 기본 썸네일)
+function thumbOf(slide) {
+  const def = getSlideType(slide.type);
+  try {
+    const n = typeof def.thumb === "function" ? def.thumb(slide) : null;
+    if (n instanceof Node) return n;
+  } catch (e) { console.warn("[teacher] thumb 실패", slide.type, e); }
+  return el("div", { class: "thumb-generic" }, [
+    el("span", { class: "thumb-icon", html: def.icon || "" }),
+    el("span", { class: "thumb-title" }, slideLabel(slide)),
   ]);
-  wrap.appendChild(head);
-
-  const lessons = store.state.lessons.filter(l => l.teacherId === teacher.id);
-  if (lessons.length === 0) {
-    wrap.appendChild(el("div", { class: "empty-state" }, [
-      el("h4", {}, "아직 수업 자료가 없습니다"),
-      "+ 새 수업을 눌러 빈 슬라이드로 시작하거나 PDF·이미지를 가져와 만들어 보세요.",
-    ]));
-    return wrap;
-  }
-
-  const grid = el("div", { class: "card-grid" });
-  for (const l of lessons.sort((a,b) => b.createdAt - a.createdAt)) {
-    const card = el("div", { class: "card" }, [
-      el("h3", {}, l.title),
-      el("div", { class: "meta" }, `${l.slides.length}장 · ${fmtDate(l.createdAt)}`),
-      el("div", { class: "actions" }, [
-        el("button", { class: "btn btn-tiny btn-primary", onClick: () => openEditor(l.id) }, "편집"),
-        el("button", { class: "btn btn-tiny", onClick: () => startLessonDialog(l, teacher) }, "수업 시작"),
-        el("button", { class: "btn btn-tiny btn-danger", onClick: () => deleteLesson(l.id) }, "삭제"),
-      ]),
-    ]);
-    grid.appendChild(card);
-  }
-  wrap.appendChild(grid);
-  return wrap;
 }
 
-function createLesson(teacher) {
-  const title = prompt("수업 자료 이름을 입력하세요", "새 수업");
-  if (!title) return;
-  const id = store.newId("lesson");
-  const lesson = { id, teacherId: teacher.id, title, createdAt: Date.now(), slides: [makeBlankSlide()] };
-  store.set(s => { s.lessons.push(lesson); });
-  cloudInsertLesson(lesson).catch(() => {});
-  openEditor(id);
-}
-
-function newLessonDialog(teacher) {
-  const body = el("div", { class: "new-lesson-pick" }, [
-    el("p", { class: "muted" }, "어떻게 시작할까요?"),
-    el("div", { class: "pick-cards" }, [
-      el("button", { class: "pick-card", onClick: () => { close(); createLesson(teacher); } }, [
-        el("div", { class: "pick-icon", html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>' }),
-        el("strong", {}, "빈 수업 만들기"),
-        el("span", { class: "desc" }, "빈 슬라이드 1장으로 시작해 직접 그리거나 입력합니다."),
-      ]),
-      el("button", { class: "pick-card", onClick: () => { close(); importDialog(teacher); } }, [
-        el("div", { class: "pick-icon", html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 8l5-5 5 5M5 21h14"/></svg>' }),
-        el("strong", {}, "파일에서 가져오기"),
-        el("span", { class: "desc" }, "PDF · 이미지 · Google Slides 링크에서 슬라이드를 만듭니다."),
-      ]),
-    ]),
-  ]);
-  let close = () => {};
-  const m = modal({
-    title: "새 수업",
-    body,
-    actions: [{ label: "취소", onClick: (c) => c() }],
+function slideWarnings(slides) {
+  const out = [];
+  (slides || []).forEach((s, i) => {
+    const def = getSlideType(s.type);
+    let msg = null;
+    try { msg = typeof def.validate === "function" ? def.validate(s) : null; } catch (e) { console.warn("[teacher] validate", e); }
+    if (msg) out.push({ i, s, msg });
   });
-  close = m.close;
-}
-function makeBlankSlide(bg = null) {
-  return { id: store.newId("slide"), bg, mode: "none", strokes: [], texts: [] };
-}
-function deleteLesson(id) {
-  if (!confirm("정말 삭제하시겠어요?")) return;
-  store.set(s => { s.lessons = s.lessons.filter(l => l.id !== id); });
+  return out;
 }
 
-function importDialog(teacher) {
-  const body = el("div", { class: "field" }, [
-    el("p", { class: "muted" }, "PDF · PNG · JPG · JPEG · WEBP 파일을 업로드해 즉시 슬라이드로 사용할 수 있습니다."),
-    el("input", { type: "file", id: "imp-file", accept: ".pdf,.png,.jpg,.jpeg,.webp,.pptx,.hwp,.hwpx" }),
-    el("p", { class: "muted", style: { fontSize: "12px" } }, "※ PPTX · HWP · HWPX는 직접 변환이 어려워요. 무료 도구(예: smallpdf.com, ilovepdf.com)에서 PDF로 변환 후 올려주세요."),
-    el("p", { class: "muted" }, "또는 Google Slides 공유 링크를 붙여넣으세요. (게시 모드 임베드)"),
-    el("input", { id: "imp-gs", placeholder: "https://docs.google.com/presentation/.../pub?start=false&loop=false" }),
-  ]);
-  const m = modal({
-    title: "자료 가져오기",
-    body,
-    actions: [
-      { label: "취소", onClick: (close) => close() },
-      { label: "가져오기", primary: true, onClick: async (close) => {
-          const f = body.querySelector("#imp-file").files[0];
-          const gs = body.querySelector("#imp-gs").value.trim();
-          if (gs) {
-            const id = store.newId("lesson");
-            const lesson = {
-              id, teacherId: teacher.id,
-              title: "Google Slides 연동",
-              createdAt: Date.now(),
-              slides: [{ id: store.newId("slide"), bg: null, gsEmbed: gs, mode: "none", strokes: [], texts: [] }],
-            };
-            store.set(s => { s.lessons.push(lesson); });
-            cloudInsertLesson(lesson).catch(() => {});
-            close(); openEditor(id); return;
-          }
-          if (!f) { close(); return; }
-          const slides = await fileToSlides(f);
-          if (!slides) {
-            alert("PPTX · HWP · HWPX는 브라우저에서 직접 변환할 수 없어요.\n\nsmallpdf.com 또는 ilovepdf.com 에서 PDF로 변환 후 다시 올려주세요.\n또는 슬라이드를 이미지(PNG/JPG)로 저장해 올려도 됩니다.");
-            close();
-            return;
-          }
-          const id = store.newId("lesson");
-          store.set(s => {
-            s.lessons.push({
-              id, teacherId: teacher.id,
-              title: f.name.replace(/\.[^.]+$/, ""),
-              createdAt: Date.now(),
-              slides,
-            });
-          });
-          const lesson = store.state.lessons.find(l => l.id === id);
-          if (lesson) cloudInsertLesson(lesson).catch(() => {});
-          close();
-          openEditor(id);
-        } },
-    ],
-  });
+// ── 팝오버(메뉴·썸네일 스트립): 한 번에 하나 ──
+let openPop = null;
+function closePop() {
+  const p = openPop;
+  openPop = null;
+  if (p) p.close();
+}
+function popover(anchor, content, { className = "", align = "end" } = {}) {
+  closePop();
+  const pop = el("div", { class: "popover " + className }, content);
+  Object.assign(pop.style, { position: "fixed", left: "0px", top: "0px", visibility: "hidden" });
+  document.body.appendChild(pop);
+  const r = anchor.getBoundingClientRect();
+  const pw = pop.offsetWidth, ph = pop.offsetHeight, vw = window.innerWidth, vh = window.innerHeight;
+  let left = align === "center" ? r.left + r.width / 2 - pw / 2 : align === "start" ? r.left : r.right - pw;
+  left = Math.max(8, Math.min(left, vw - pw - 8));
+  let top = r.bottom + 6;
+  if (top + ph > vh - 8 && r.top - ph - 6 >= 8) top = r.top - ph - 6;
+  pop.style.left = left + "px";
+  pop.style.top = Math.max(8, top) + "px";
+  pop.style.visibility = "";
+  const onDown = (e) => { if (!pop.contains(e.target) && !anchor.contains(e.target)) closePop(); };
+  const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); closePop(); } };
+  const onScroll = (e) => { if (!pop.contains(e.target)) closePop(); };
+  const onResize = () => closePop();
+  document.addEventListener("pointerdown", onDown, true);
+  document.addEventListener("keydown", onKey, true);
+  window.addEventListener("scroll", onScroll, true);
+  window.addEventListener("resize", onResize);
+  const p = {
+    anchor, el: pop,
+    close() {
+      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", onResize);
+      pop.remove();
+    },
+  };
+  openPop = p;
+  return p;
+}
+// items: [{label, icon, danger, disabled, onClick} | {sep:true} | null]
+function menuPop(anchor, items) {
+  if (openPop && openPop.anchor === anchor) { closePop(); return; }
+  const menu = el("div", { class: "menu", role: "menu" }, items.filter(Boolean).map(it => it.sep
+    ? el("div", { class: "menu-sep" })
+    : el("button", {
+      class: "menu-item" + (it.danger ? " danger" : ""), type: "button", role: "menuitem", disabled: !!it.disabled,
+      onClick: (e) => { e.stopPropagation(); closePop(); if (it.onClick) it.onClick(); },
+    }, [it.icon ? icon(it.icon, 18) : null, it.label])));
+  popover(anchor, menu, { className: "t-menu-pop" });
 }
 
-async function fileToSlides(file) {
-  const ext = file.name.toLowerCase().split(".").pop();
-  if (["png","jpg","jpeg","webp"].includes(ext)) {
-    const url = await fileToDataUrl(file);
-    return [{ id: store.newId("slide"), bg: url, mode: "none", strokes: [], texts: [] }];
-  }
-  if (ext === "pdf") {
-    return await pdfToSlides(file);
-  }
-  // PPTX · HWP · HWPX는 브라우저에서 변환 불가 → 호출부에서 안내
-  return null;
-}
-function fileToDataUrl(f) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = () => res(r.result);
-    r.onerror = rej;
-    r.readAsDataURL(f);
-  });
-}
-
-async function pdfToSlides(file) {
-  const buf = await file.arrayBuffer();
-  // Lazy-load pdf.js
-  const pdfjs = await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.min.mjs");
-  pdfjs.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.worker.min.mjs";
-  const doc = await pdfjs.getDocument({ data: buf }).promise;
-  const slides = [];
-  for (let i = 1; i <= doc.numPages; i++) {
-    const page = await doc.getPage(i);
-    const vp = page.getViewport({ scale: 1.6 });
-    const cv = document.createElement("canvas");
-    cv.width = vp.width; cv.height = vp.height;
-    await page.render({ canvasContext: cv.getContext("2d"), viewport: vp }).promise;
-    slides.push({ id: store.newId("slide"), bg: cv.toDataURL("image/jpeg", 0.85), mode: "none", strokes: [], texts: [] });
-  }
-  return slides;
-}
-
-/* ── Editor ──────────────────────────────────────────── */
-
-function openEditor(lessonId) {
-  go("/editor/" + lessonId);
-}
-
-export function editorView({ id }) {
-  const lesson = findLesson(id);
-  if (!lesson) { go("/teacher"); return; }
-  const teacher = store.state.teachers.find(t => t.id === lesson.teacherId);
-  const root = template("tpl-teacher-dashboard");
-  mount(root);
-  root.querySelector("#t-who").textContent = teacher?.name || "—";
-  root.querySelector("#t-logout").onclick = () => { store.set(s => s.whoTeacher = null); go("/"); };
-  const tabs = root.querySelectorAll(".nav-item");
-  tabs.forEach(b => b.classList.remove("active"));
-  tabs.forEach(b => b.onclick = () => { go("/teacher"); });
-
-  const slot = root.querySelector("#tab-content");
-  let activeIndex = 0;
-  let activeTool = "pen";
-  let activeColor = COLORS[0];
-  let activeSize = 2;
-  let viewer = null;
-
-  function render() {
-    slot.innerHTML = "";
-    const head = el("div", { class: "main-header" }, [
-      el("div", { class: "row-flex" }, [
-        el("button", { class: "btn", onClick: () => go("/teacher") }, "← 목록"),
-        el("input", {
-          id: "title-input",
-          value: lesson.title,
-          style: { fontSize: "20px", fontWeight: "600", border: "none", background: "transparent", outline: "none", letterSpacing: "-0.02em", minWidth: "200px" },
-          onInput: (e) => { lesson.title = e.target.value; store.set(s => s); },
-        }),
-      ]),
-      el("div", { class: "actions" }, [
-        el("button", { class: "btn btn-primary", onClick: () => startLessonDialog(lesson, teacher) }, "수업 시작"),
-      ]),
-    ]);
-    slot.appendChild(head);
-
-    const shell = el("div", { class: "editor-shell" });
-    // rail (with drag-and-drop reorder)
-    const rail = el("div", { class: "slide-rail" });
-    lesson.slides.forEach((s, i) => {
-      const t = el("div", {
-        class: "thumb" + (i === activeIndex ? " active" : ""),
-        draggable: "true",
-        "data-idx": String(i),
-        onClick: () => { activeIndex = i; render(); },
-      }, [
-        el("span", { class: "num" }, String(i + 1)),
-        s.bg ? el("img", { src: s.bg }) : el("div", { style: { padding: "8px", fontSize: "11px", color: "#999" } }, "빈 슬라이드"),
-        el("button", { class: "thumb-up", title: "위로", onClick: (e) => { e.stopPropagation(); moveSlide(i, i - 1); } }, "↑"),
-        el("button", { class: "thumb-down", title: "아래로", onClick: (e) => { e.stopPropagation(); moveSlide(i, i + 1); } }, "↓"),
-        el("button", { class: "del", onClick: (e) => { e.stopPropagation(); if (lesson.slides.length === 1) return; lesson.slides.splice(i, 1); activeIndex = Math.max(0, activeIndex - 1); store.set(s => s); render(); } }, "삭제"),
-      ]);
-      // Drag handlers
-      t.addEventListener("dragstart", (e) => {
-        e.dataTransfer.effectAllowed = "move";
-        e.dataTransfer.setData("text/plain", String(i));
-        t.classList.add("dragging");
-      });
-      t.addEventListener("dragend", () => t.classList.remove("dragging"));
-      t.addEventListener("dragover", (e) => {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = "move";
-        const r = t.getBoundingClientRect();
-        const after = (e.clientY - r.top) > r.height / 2;
-        t.classList.toggle("drop-above", !after);
-        t.classList.toggle("drop-below", after);
-      });
-      t.addEventListener("dragleave", () => { t.classList.remove("drop-above", "drop-below"); });
-      t.addEventListener("drop", (e) => {
-        e.preventDefault();
-        const from = parseInt(e.dataTransfer.getData("text/plain"));
-        const r = t.getBoundingClientRect();
-        const after = (e.clientY - r.top) > r.height / 2;
-        let to = i + (after ? 1 : 0);
-        if (from < to) to -= 1; // 자기 자신 이동 시 인덱스 보정
-        t.classList.remove("drop-above", "drop-below");
-        if (from === to) return;
-        moveSlide(from, to);
-      });
-      rail.appendChild(t);
-    });
-
-    function moveSlide(from, to) {
-      if (to < 0 || to >= lesson.slides.length || from === to) return;
-      const [moved] = lesson.slides.splice(from, 1);
-      lesson.slides.splice(to, 0, moved);
-      // activeIndex 유지: 활성 슬라이드가 함께 따라가도록
-      if (activeIndex === from) activeIndex = to;
-      else if (from < activeIndex && to >= activeIndex) activeIndex -= 1;
-      else if (from > activeIndex && to <= activeIndex) activeIndex += 1;
-      store.set(s => s);
-      render();
+// ── QR ── (index.html이 qrcode를 defer로 불러오므로 준비될 때까지 잠시 재시도)
+function drawQr(box, url) {
+  let timer = 0, stopped = false, tries = 0;
+  const canvas = el("canvas", { role: "img", "aria-label": "QR 코드" });
+  box.replaceChildren(canvas);
+  const fail = (t) => box.replaceChildren(el("div", { class: "muted" }, t));
+  const run = () => {
+    if (stopped) return;
+    const Q = window.QRCode;
+    if (Q && typeof Q.toCanvas === "function") {
+      try {
+        Q.toCanvas(canvas, url, { width: 480, margin: 1, errorCorrectionLevel: "M" }, (err) => {
+          if (err) { fail("QR을 만들지 못했어요"); return; }
+          canvas.style.width = ""; canvas.style.height = ""; // 크기는 CSS(.qr-box)가 정한다
+        });
+      } catch (e) { fail("QR을 만들지 못했어요"); }
+      return;
     }
-    rail.appendChild(el("button", {
-      class: "add-slide",
-      onClick: () => { lesson.slides.push(makeBlankSlide()); activeIndex = lesson.slides.length - 1; store.set(s => s); render(); },
-    }, "+ 빈 슬라이드"));
-    rail.appendChild(el("button", {
-      class: "add-slide",
-      onClick: () => addSlidesFromFile(lesson, activeIndex, (newIdx) => { activeIndex = newIdx; render(); }),
-    }, "+ 파일에서 추가"));
-    shell.appendChild(rail);
+    if (++tries > 40) { fail("QR을 불러오지 못했어요"); return; }
+    timer = setTimeout(run, 250);
+  };
+  run();
+  return () => { stopped = true; clearTimeout(timer); };
+}
 
-    // canvas
-    const canvasArea = el("div", { class: "canvas-area" });
-    const toolbar = el("div", { class: "canvas-toolbar" });
-    TOOLS.forEach(t => {
-      const b = el("button", { class: "tool" + (activeTool === t.id ? " active" : ""), title: t.label, onClick: () => { activeTool = t.id; viewer && viewer.setTool(t.id); render(); } }, [
-        svgIcon(t.icon),
-      ]);
-      toolbar.appendChild(b);
+function openCodeModal(code) {
+  const url = joinUrl(code);
+  const qr = el("div", { class: "qr-box" });
+  const body = el("div", { class: "code-panel", style: { padding: "4px 0 0" } }, [
+    el("div", { class: "code-big" }, code || "——————"),
+    qr,
+    el("div", { class: "code-url" }, url),
+  ]);
+  let stop = null;
+  modal({
+    title: "참여 코드", body,
+    actions: [
+      { label: "링크 복사", icon: "copy", onClick: () => { copyText(url, "링크를 복사했어요"); } },
+      { label: "닫기", primary: true },
+    ],
+    onClose: () => { if (stop) stop(); },
+  });
+  stop = drawQr(qr, url);
+}
+
+// ── 수업 시작 (카드·편집기 공용) ──
+const starting = new Set();
+function setStarting(id, on) {
+  if (on) starting.add(id); else starting.delete(id);
+  document.querySelectorAll("[data-start]").forEach(b => {
+    if (b.dataset.start !== id) return;
+    b.classList.toggle("loading", on);
+    b.disabled = on;
+  });
+}
+async function startLesson(lessonId) {
+  if (starting.has(lessonId)) return;
+  setStarting(lessonId, true);
+  try {
+    let lesson = findLesson(lessonId);
+    if (!lesson) { toast("수업 자료를 찾지 못했어요", { type: "error" }); return; }
+    if (!Array.isArray(lesson.slides)) {
+      try { await cloudFetchLessonSlides(lessonId); } catch (e) { toast("슬라이드를 불러오지 못했어요", { type: "error" }); return; }
+      lesson = findLesson(lessonId);
+      if (!lesson) return;
+    }
+    if (!(lesson.slides || []).length) { toast("슬라이드를 먼저 추가하세요"); return; }
+    const warns = slideWarnings(lesson.slides);
+    if (warns.length) {
+      const list = el("ul", { class: "t-warn-list" }, warns.map(w => el("li", {}, `${w.i + 1}. ${slideLabel(w.s)} — ${w.msg}`)));
+      const ok = await confirmDialog({ title: "확인이 필요한 슬라이드가 있어요", body: list, ok: "그래도 시작" });
+      if (!ok) return;
+    }
+    const res = await cloudStartSession({ lesson: findLesson(lessonId) || lesson, teacher: currentTeacher() });
+    if (!res || res.error) { toast((res && res.error) || "수업을 시작하지 못했어요", { type: "error" }); return; }
+    go("/live/" + res.id);
+  } catch (e) {
+    console.warn("[teacher] 시작 실패", e);
+    toast("수업을 시작하지 못했어요", { type: "error" });
+  } finally {
+    setStarting(lessonId, false);
+  }
+}
+
+function liveSessionOf(tid) {
+  return (store.state.sessions || []).filter(s => s.teacherId === tid && s.status === "live")
+    .sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0))[0] || null;
+}
+function mySessions(tid) {
+  return (store.state.sessions || []).filter(s => s.teacherId === tid)
+    .sort((a, b) => (a.status === "live" ? 0 : 1) - (b.status === "live" ? 0 : 1) || (b.startedAt || 0) - (a.startedAt || 0));
+}
+
+// ───────────────────────── 셸 (사이드바) ─────────────────────────
+function mountShell(teacher, active, onTab) {
+  ensureCss();
+  const root = template("tpl-shell");
+  mount(root);
+  const who = root.querySelector("#t-who");
+  if (who) who.textContent = teacher.name || "";
+  root.querySelector("#t-logout")?.addEventListener("click", logout);
+  const navs = [...root.querySelectorAll("[data-tab]")];
+  const setActive = (tab) => navs.forEach(b => {
+    const on = b.dataset.tab === tab;
+    b.classList.toggle("active", on);
+    if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+  });
+  navs.forEach(b => b.addEventListener("click", () => onTab(b.dataset.tab)));
+  setActive(active);
+  const content = root.querySelector("#tab-content");
+  const banner = el("div", { class: "live-banner", hidden: true });
+  content.before(banner);
+  return { root, content, banner, setActive };
+}
+
+// 진행 중 배너: '진행 중 · 제목 [돌아가기]'
+function bindBanner(banner, teacher) {
+  let sig = null;
+  const update = () => {
+    const s = liveSessionOf(teacher.id);
+    const nsig = s ? `${s.id}|${s.title}` : "";
+    if (nsig === sig) return;
+    sig = nsig;
+    banner.hidden = !s;
+    if (!s) { banner.replaceChildren(); return; }
+    banner.replaceChildren(
+      el("span", { class: "pill pill-live" }, "진행 중"),
+      el("span", { class: "grow" }, s.title || "수업"),
+      el("button", { class: "btn btn-sm btn-primary", type: "button", onClick: () => go("/live/" + s.id) }, "돌아가기"),
+    );
+  };
+  update();
+  return update;
+}
+
+// ───────────────────────── 대시보드 ─────────────────────────
+export function teacherDashboard(params = {}) {
+  return withTeacher((teacher) => {
+    viewGuard();
+    let tab = TABS.includes(params && params.tab) ? params.tab : "lessons";
+    let ctl = null;
+    const shell = mountShell(teacher, tab, (t) => switchTab(t));
+    const updBanner = bindBanner(shell.banner, teacher);
+
+    function switchTab(t) {
+      if (!TABS.includes(t)) t = "lessons";
+      if (ctl && t === tab) return;
+      closePop();
+      try { ctl && ctl.cleanup && ctl.cleanup(); } catch (e) { console.warn(e); }
+      tab = t;
+      shell.setActive(t);
+      const h = t === "lessons" ? "#/teacher" : "#/teacher?tab=" + t;
+      if (location.hash !== h) history.replaceState(null, "", h);
+      shell.content.replaceChildren();
+      ctl = TAB_VIEWS[t](shell.content, teacher) || {};
+      window.scrollTo(0, 0);
+    }
+    switchTab(tab);
+
+    const off = store.subscribe(() => {
+      updBanner();
+      try { ctl && ctl.onStore && ctl.onStore(); } catch (e) { console.error("[teacher] tab onStore", e); }
     });
-    toolbar.appendChild(el("div", { class: "toolbar-divider" }));
-    COLORS.forEach(c => {
-      toolbar.appendChild(el("div", { class: "swatch" + (activeColor === c ? " active" : ""), style: { background: c }, onClick: () => { activeColor = c; viewer && viewer.setColor(c); render(); } }));
-    });
-    toolbar.appendChild(el("div", { class: "toolbar-divider" }));
-    const sizes = [{ id: 1.5, label: "S" }, { id: 2.5, label: "M" }, { id: 4, label: "L" }, { id: 8, label: "XL" }];
-    const sizePick = el("div", { class: "size-pick" });
-    sizes.forEach(s => sizePick.appendChild(el("button", { class: activeSize === s.id ? "active" : "", onClick: () => { activeSize = s.id; viewer && viewer.setSize(s.id); render(); } }, s.label)));
-    toolbar.appendChild(sizePick);
-    toolbar.appendChild(el("div", { class: "toolbar-spacer" }));
-    toolbar.appendChild(el("button", { class: "btn btn-tiny", onClick: () => { lesson.slides[activeIndex].strokes = []; lesson.slides[activeIndex].texts = []; store.set(s => s); render(); } }, "이 슬라이드 지우기"));
-    canvasArea.appendChild(toolbar);
+    return () => {
+      off();
+      closePop();
+      try { ctl && ctl.cleanup && ctl.cleanup(); } catch (e) { console.warn(e); }
+      ctl = null;
+    };
+  });
+}
 
-    const stage = el("div", { class: "canvas-stage" });
-    canvasArea.appendChild(stage);
-    shell.appendChild(canvasArea);
+// ── 수업 자료 탭 ──
+function lessonsTab(box, teacher) {
+  let disposed = false, busy = false, booted = false, sig = null;
+  const fileIn = el("input", { type: "file", accept: ACCEPT, hidden: true });
+  const progress = el("span", { class: "pill", hidden: true });
+  const btnFile = el("button", { class: "btn", type: "button", onClick: () => fileIn.click() }, [icon("file", 18), "PDF·이미지로 만들기"]);
+  const btnNew = el("button", { class: "btn btn-primary", type: "button", onClick: createBlank }, [icon("plus", 18), "새 수업"]);
+  fileIn.addEventListener("change", onFile);
+  const grid = el("div", { class: "card-grid" });
+  box.append(
+    el("div", { class: "page-head" }, [el("h1", {}, "수업 자료"), el("div", { class: "actions" }, [progress, btnFile, btnNew, fileIn])]),
+    grid,
+  );
 
-    // inspector
-    const inspector = el("div", { class: "inspector" }, [
-      el("h4", {}, "슬라이드"),
-      el("div", { class: "field" }, [
-        el("label", {}, "배경 이미지"),
-        el("button", { class: "btn", onClick: () => replaceBg(lesson.slides[activeIndex], render) }, "이미지 교체"),
+  function myLessons() {
+    return (store.state.lessons || []).filter(l => l.teacherId === teacher.id)
+      .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+  }
+  function countOf(l) { return Array.isArray(l.slides) ? l.slides.length : (l.slideCount || 0); }
+  function render() {
+    if (disposed) return;
+    const list = myLessons();
+    const nsig = (booted ? "1" : "0") + list.map(l => [l.id, l.title, countOf(l), l.cover, l.updatedAt].join("|")).join("\n");
+    if (nsig === sig) return;
+    sig = nsig;
+    if (!list.length) {
+      grid.replaceChildren(el("div", { class: "empty empty-box", style: { gridColumn: "1 / -1" } }, booted ? "아직 자료가 없어요" : "불러오는 중…"));
+      return;
+    }
+    grid.replaceChildren(...list.map(lessonCard));
+  }
+  function lessonCard(l) {
+    const cover = el("div", { class: "cover" }, l.cover
+      ? el("img", { src: l.cover, alt: "", loading: "lazy", decoding: "async", onError: (e) => e.target.replaceWith(el("div", { class: "t-paper" })) })
+      : el("div", { class: "t-paper" }));
+    const isStarting = starting.has(l.id);
+    const btnStart = el("button", {
+      class: "btn btn-sm btn-primary" + (isStarting ? " loading" : ""), type: "button", "data-start": l.id, disabled: isStarting,
+      onClick: (e) => { e.stopPropagation(); startLesson(l.id); },
+    }, [icon("play", 16), "시작"]);
+    const btnMore = el("button", {
+      class: "btn btn-sm btn-icon btn-ghost", type: "button", "aria-label": "더보기",
+      onClick: (e) => { e.stopPropagation(); lessonMenu(btnMore, l.id); },
+    }, icon("more", 18));
+    const open = () => go("/editor/" + l.id);
+    const card = el("div", {
+      class: "card lesson-card", role: "button", tabindex: "0", "aria-label": l.title || "수업 자료",
+      onClick: open,
+      onKeydown: (e) => { if ((e.key === "Enter" || e.key === " ") && e.target === card) { e.preventDefault(); open(); } },
+    }, [
+      cover,
+      el("div", { class: "card-body" }, [
+        el("div", { class: "card-title" }, l.title || "제목 없음"),
+        el("div", { class: "card-meta" }, `${countOf(l)}장 · ${fmtDay(l.updatedAt || l.createdAt)}`),
+        el("div", { class: "card-actions" }, [btnStart, el("span", { class: "spacer" }), btnMore]),
       ]),
-      el("h4", {}, "참여 모드"),
-      modePicker(lesson.slides[activeIndex], render),
-      el("p", { class: "muted" }, "수업 중에도 변경할 수 있습니다."),
     ]);
-    shell.appendChild(inspector);
-
-    slot.appendChild(shell);
-
-    // mount slide
-    queueMicrotask(() => {
-      viewer = renderSlide({ root: stage, slide: lesson.slides[activeIndex], lesson, session: null, scope: "edit", readOnly: false });
-      viewer.setTool(activeTool);
-      viewer.setColor(activeColor);
-      viewer.setSize(activeSize);
+    return card;
+  }
+  function lessonMenu(anchor, lessonId) {
+    menuPop(anchor, [
+      { label: "편집", icon: "edit", onClick: () => go("/editor/" + lessonId) },
+      typeof cloudDuplicateLesson === "function" ? { label: "복제", icon: "duplicate", onClick: () => duplicate(lessonId) } : null,
+      { sep: true },
+      { label: "삭제", icon: "trash", danger: true, onClick: () => remove(lessonId) },
+    ]);
+  }
+  async function duplicate(lessonId) {
+    const t = toast("복제하는 중…");
+    let r;
+    try { r = await cloudDuplicateLesson(lessonId); } catch (e) { r = { error: "복제하지 못했어요" }; }
+    t.close();
+    if (!r || r.error) toast((r && r.error) || "복제하지 못했어요", { type: "error" });
+    else toast("복제했어요", { type: "ok" });
+  }
+  async function remove(lessonId) {
+    const l = findLesson(lessonId);
+    if (!l) return;
+    // 가정: 진행 중 수업의 자료는 삭제 막음(cascade로 LIVE 세션이 사라져 학생 화면이 끊김)
+    if ((store.state.sessions || []).some(s => s.lessonId === lessonId && s.status === "live")) {
+      toast("진행 중인 수업을 먼저 종료하세요", { type: "warn" });
+      return;
+    }
+    const nRec = (store.state.sessions || []).filter(s => s.lessonId === lessonId).length;
+    const ok = await confirmDialog({
+      title: "수업 자료를 삭제할까요?",
+      body: nRec ? `${l.title || "제목 없음"} · 수업 기록 ${nRec}개도 함께 삭제돼요` : (l.title || "제목 없음"),
+      ok: "삭제", danger: true,
     });
+    if (!ok) return;
+    let r;
+    try { r = await cloudDeleteLesson(lessonId); } catch (e) { r = { error: "삭제하지 못했어요" }; }
+    if (r && r.error) toast(r.error, { type: "error" });
+    else toast("삭제했어요");
+  }
+  function setBusy(on) {
+    busy = on;
+    btnFile.disabled = on;
+    btnNew.disabled = on;
+  }
+  async function createBlank() {
+    if (busy) return;
+    const title = await promptDialog({ title: "새 수업", placeholder: "수업 제목", ok: "만들기", maxlength: 80 });
+    if (title == null || busy) return;
+    setBusy(true);
+    const lesson = { id: newId("lesson"), teacherId: teacher.id, title: title || "새 수업", slides: [createSlide("ink")] };
+    let r;
+    try { r = await cloudCreateLesson(lesson); } catch (e) { r = { error: "수업 자료를 만들지 못했어요" }; }
+    setBusy(false);
+    if (!r || r.error) { toast((r && r.error) || "수업 자료를 만들지 못했어요", { type: "error" }); return; }
+    if (!disposed) go("/editor/" + lesson.id);
+  }
+  async function onFile() {
+    const f = fileIn.files && fileIn.files[0];
+    fileIn.value = "";
+    if (!f || busy) return;
+    setBusy(true);
+    progress.hidden = false;
+    progress.textContent = "준비 중…";
+    const id = newId("lesson");
+    try {
+      const slides = await fileToSlides(f, id, (d, t) => { progress.textContent = t > 1 ? `만드는 중 ${d}/${t}` : "만드는 중…"; });
+      if (!slides || !slides.length) throw new Error("빈 파일이에요");
+      const title = String(f.name || "").replace(/\.[^.]+$/, "").trim() || "새 수업";
+      const r = await cloudCreateLesson({ id, teacherId: teacher.id, title, slides });
+      if (!r || r.error) throw new Error((r && r.error) || "수업 자료를 만들지 못했어요");
+      if (!disposed) go("/editor/" + id);
+      else toast("수업 자료를 만들었어요", { type: "ok" });
+    } catch (e) {
+      console.warn("[teacher] 파일 변환 실패", e);
+      toast((e && e.message) || "파일을 불러오지 못했어요", { type: "error" });
+    } finally {
+      setBusy(false);
+      progress.hidden = true;
+    }
+  }
+
+  render();
+  cloudReady.then(() => { booted = true; render(); });
+  return { onStore: render, cleanup: () => { disposed = true; } };
+}
+
+// ── 수업 기록 탭 ──
+function sessionRow(s, { onOpen } = {}) {
+  const open = () => (onOpen ? onOpen(s.id) : go("/teacher/session/" + s.id));
+  const row = el("div", {
+    class: "list-row clickable", role: "button", tabindex: "0",
+    onClick: open,
+    onKeydown: (e) => { if (e.key === "Enter" && e.target === row) open(); },
+  }, [
+    el("div", { class: "grow" }, [
+      el("div", { class: "title" }, s.title || "수업"),
+      el("div", { class: "meta" }, `${fmtDate(s.startedAt)} · 참여 ${(s.participants || []).length}`),
+    ]),
+    statusPill(s.status),
+    s.status === "live"
+      ? el("button", { class: "btn btn-sm btn-primary", type: "button", onClick: (e) => { e.stopPropagation(); go("/live/" + s.id); } }, "돌아가기")
+      : null,
+  ]);
+  return row;
+}
+
+function recordsTab(box, teacher) {
+  const list = el("div", { class: "list" });
+  const empty = el("div", { class: "empty empty-box" }, "끝난 수업이 여기 모여요");
+  box.append(el("div", { class: "page-head" }, [el("h1", {}, "수업 기록")]), list, empty);
+  let sig = null;
+  function render() {
+    const ss = mySessions(teacher.id);
+    const nsig = ss.map(s => [s.id, s.title, s.status, s.startedAt, (s.participants || []).length].join("|")).join("\n");
+    if (nsig === sig) return;
+    sig = nsig;
+    list.hidden = !ss.length;
+    empty.hidden = !!ss.length;
+    list.replaceChildren(...ss.map(s => sessionRow(s)));
   }
   render();
+  return { onStore: render };
 }
 
-function modePicker(slide, rerender) {
-  const opts = [
-    { id: "none", t: "PPT 모드", d: "교사 발표만" },
-    { id: "whole", t: "전체", d: "함께 필기" },
-    { id: "individual", t: "개별", d: "각자 학습지" },
-    { id: "group", t: "그룹", d: "모둠 협업" },
-  ];
-  const wrap = el("div", { class: "mode-pick" });
-  opts.forEach(o => wrap.appendChild(
-    el("button", { class: slide.mode === o.id ? "active" : "", onClick: () => { slide.mode = o.id; store.set(s => s); rerender(); } }, [
-      el("strong", {}, o.t),
-      el("span", { class: "desc" }, o.d),
-    ])
-  ));
-  return wrap;
-}
-
-function replaceBg(slide, rerender) {
-  const inp = el("input", { type: "file", accept: ".png,.jpg,.jpeg,.webp,.pdf,.pptx,.hwp,.hwpx" });
-  inp.onchange = async () => {
-    const f = inp.files[0];
-    if (!f) return;
-    const ext = f.name.toLowerCase().split(".").pop();
-    if (["pptx","hwp","hwpx"].includes(ext)) {
-      alert("PPTX · HWP · HWPX는 브라우저에서 직접 변환할 수 없어요.\n\nsmallpdf.com 또는 ilovepdf.com 에서 PDF로 변환 후 다시 올려주세요.\n또는 슬라이드를 이미지(PNG/JPG)로 저장해 올려도 됩니다.");
-      return;
+// ── 학생 탭 ──
+function studentsTab(box, teacher) {
+  const wrap = el("div", {});
+  box.append(el("div", { class: "page-head" }, [el("h1", {}, "학생")]), wrap);
+  let sig = null;
+  function collect() {
+    const by = new Map();
+    for (const s of mySessions(teacher.id)) {
+      for (const sid of s.participants || []) {
+        if (!by.has(sid)) by.set(sid, []);
+        by.get(sid).push(s.id);
+      }
     }
-    if (ext === "pdf") {
-      const slides = await pdfToSlides(f);
-      if (slides && slides.length) slide.bg = slides[0].bg;
-    } else {
-      slide.bg = await fileToDataUrl(f);
-    }
-    store.set(s => s); rerender();
-  };
-  inp.click();
+    return [...by.entries()].map(([id, sessions]) => ({ id, st: findStudent(id), sessions }))
+      .filter(r => r.st).sort((a, b) => cmpStudent(a.st, b.st));
+  }
+  function render() {
+    const rows = collect();
+    const nsig = rows.map(r => `${r.id}:${r.sessions.length}:${r.st.grade}-${r.st.classNum}-${r.st.num}-${r.st.name}`).join(",");
+    if (nsig === sig) return;
+    sig = nsig;
+    if (!rows.length) { wrap.replaceChildren(el("div", { class: "empty empty-box" }, "아직 아무도 없어요")); return; }
+    const head = el("tr", {}, [["학년", "num"], ["반", "num"], ["번호", "num"], ["이름", ""], ["참여", "num"]].map(([h, c]) => el("th", { class: c || null }, h)));
+    const body = el("tbody", {}, rows.map(r => {
+      const tr = el("tr", {
+        class: "clickable", tabindex: "0",
+        onClick: () => openStudent(r.id),
+        onKeydown: (e) => { if (e.key === "Enter") openStudent(r.id); },
+      }, [
+        el("td", { class: "num" }, r.st.grade),
+        el("td", { class: "num" }, r.st.classNum),
+        el("td", { class: "num" }, r.st.num),
+        el("td", {}, r.st.name),
+        el("td", { class: "num" }, `${r.sessions.length}회`),
+      ]);
+      return tr;
+    }));
+    wrap.replaceChildren(el("div", { class: "table-wrap" }, el("table", { class: "table" }, [el("thead", {}, head), body])));
+  }
+  function openStudent(id) {
+    const st = findStudent(id);
+    const ss = mySessions(teacher.id).filter(s => (s.participants || []).includes(id));
+    let sh = null;
+    const body = ss.length
+      ? el("div", { class: "list" }, ss.map(s => sessionRow(s, { onOpen: (sid) => { if (sh) sh.close(); go("/teacher/session/" + sid); } })))
+      : el("div", { class: "empty" }, "끝난 수업이 여기 모여요");
+    sh = sheet({ title: studentLabel(st), body });
+  }
+  render();
+  return { onStore: render };
 }
 
-// 편집 중 현재 슬라이드 뒤에 PDF · 이미지를 한꺼번에 삽입
-function addSlidesFromFile(lesson, afterIndex, onDone) {
-  const inp = el("input", { type: "file", accept: ".pdf,.png,.jpg,.jpeg,.webp,.pptx,.hwp,.hwpx" });
-  inp.onchange = async () => {
-    const f = inp.files[0];
-    if (!f) return;
-    const ext = f.name.toLowerCase().split(".").pop();
-    if (["pptx","hwp","hwpx"].includes(ext)) {
-      alert("PPTX · HWP · HWPX는 브라우저에서 직접 변환할 수 없어요.\n\nsmallpdf.com 또는 ilovepdf.com 에서 PDF로 변환 후 다시 올려주세요.\n또는 슬라이드를 이미지(PNG/JPG)로 저장해 올려도 됩니다.");
-      return;
-    }
-    const newSlides = await fileToSlides(f);
-    if (!newSlides || !newSlides.length) { alert("파일을 슬라이드로 변환하지 못했어요."); return; }
-    lesson.slides.splice(afterIndex + 1, 0, ...newSlides);
-    store.set(s => s);
-    onDone && onDone(afterIndex + 1);
-  };
-  inp.click();
-}
-
-function svgIcon(d) {
-  return el("span", { html: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="${d}"/></svg>` });
-}
-
-/* ── Start lesson / Live class ──────────────────────── */
-
-function startLessonDialog(lesson, teacher) {
-  const body = el("div", {}, [
-    el("p", { class: "muted" }, "수업 흐름을 선택하세요. 시작 후에도 언제든 변경할 수 있습니다."),
-    el("div", { class: "mode-pick" }, [
-      el("button", { class: "active", id: "flow-teacher", onClick: (e) => pick(e, "teacher") }, [
-        el("strong", {}, "교사 흐름"),
-        el("span", { class: "desc" }, "교사가 슬라이드를 넘기면 학생도 함께 이동"),
-      ]),
-      el("button", { id: "flow-student", onClick: (e) => pick(e, "student") }, [
-        el("strong", {}, "학생 흐름"),
-        el("span", { class: "desc" }, "학생이 자율적으로 앞뒤로 이동"),
+// ── 내 코드 탭 ──
+function codeTab(box, teacher) {
+  const t = currentTeacher() || teacher;
+  const code = t.joinCode || "";
+  const url = joinUrl(code);
+  const qr = el("div", { class: "qr-box" });
+  box.append(
+    el("div", { class: "page-head" }, [el("h1", {}, "내 코드")]),
+    el("div", { class: "card code-panel" }, [
+      el("div", { class: "code-big" }, code || "——————"),
+      qr,
+      el("div", { class: "code-url" }, url),
+      el("div", { class: "row" }, [
+        el("button", { class: "btn", type: "button", disabled: !code, onClick: () => copyText(code, "코드를 복사했어요") }, [icon("copy", 18), "코드 복사"]),
+        el("button", { class: "btn", type: "button", disabled: !code, onClick: () => copyText(url, "링크를 복사했어요") }, [icon("link", 18), "링크 복사"]),
       ]),
     ]),
-  ]);
-  let flow = "teacher";
-  function pick(e, f) {
-    flow = f;
-    body.querySelectorAll(".mode-pick button").forEach(b => b.classList.remove("active"));
-    e.currentTarget.classList.add("active");
-  }
-  modal({
-    title: lesson.title + " 시작",
-    body,
-    actions: [
-      { label: "취소", onClick: (close) => close() },
-      { label: "수업 시작", primary: true, onClick: (close) => {
-          // close any other live session for this teacher
-          const newSession = {
-            id: store.newId("sess"),
-            lessonId: lesson.id,
-            teacherId: teacher.id,
-            title: lesson.title,
-            status: "live",
-            flow,
-            currentSlide: 0,
-            startedAt: Date.now(),
-            endedAt: null,
-            participants: [],
-            groups: [],
-            records: {},
-            slidesSnapshot: JSON.parse(JSON.stringify(lesson.slides)),
-          };
-          const stoppedIds = [];
-          store.set(s => {
-            s.sessions.forEach(ss => {
-              if (ss.teacherId === teacher.id && ss.status === "live") {
-                ss.status = "stopped"; ss.endedAt = Date.now();
-                stoppedIds.push(ss.id);
-              }
-            });
-            s.sessions.push(newSession);
-          });
-          // Cloud sync
-          stoppedIds.forEach(sid => {
-            const ss = store.state.sessions.find(x => x.id === sid);
-            if (ss) cloudUpsertSession(ss).catch(() => {});
-          });
-          cloudUpsertSession(newSession).catch(() => {});
-          sync.emit({ type: "session-start" });
-          close();
-          go("/teacher/live");
-        } },
-    ],
+  );
+  const stop = code ? drawQr(qr, url) : null;
+  return { cleanup: () => { if (stop) stop(); } };
+}
+
+const TAB_VIEWS = { lessons: lessonsTab, records: recordsTab, students: studentsTab, code: codeTab };
+
+// ───────────────────────── 편집기 /editor/:id ─────────────────────────
+export function editorView({ id } = {}) {
+  return withTeacher((teacher) => {
+    const alive = viewGuard();
+    if (findLesson(id)) return buildEditor(id, teacher);
+    return cloudReady.then(() => {
+      if (!alive()) return () => {};
+      if (!findLesson(id)) { toast("수업 자료를 찾지 못했어요"); redirect("/teacher"); return () => {}; }
+      return buildEditor(id, teacher);
+    });
   });
 }
 
-function viewLive(teacher) {
-  const wrap = el("div", {});
-  const session = store.state.sessions.find(s => s.teacherId === teacher.id && s.status === "live");
-  if (!session) {
-    wrap.appendChild(el("div", { class: "main-header" }, [el("h1", {}, "진행 중")]));
-    wrap.appendChild(el("div", { class: "empty-state" }, [
-      el("h4", {}, "현재 진행 중인 수업이 없습니다"),
-      "수업 자료에서 [수업 시작]을 눌러 학생 참여를 시작하세요.",
-    ]));
-    return wrap;
+function buildEditor(lessonId, teacher) {
+  ensureCss();
+  let disposed = false;
+  let selId = null;
+  let host = null;
+  let saveSeq = 0;
+  let fileBusy = false;
+  let suppressClick = false;
+  let dragActive = false;
+  let dragAbort = null; // 진행 중 드래그 정리(화면 이탈 시 고스트·window 리스너 제거)
+  let validateEl = null;
+  const L = () => findLesson(lessonId);
+  const slides = () => (L() && Array.isArray(L().slides) ? L().slides : []);
+  const curSlide = () => slides().find(s => s.id === selId) || null;
+
+  // ── 상단 바 ──
+  const titleIn = el("input", { class: "title-input", type: "text", placeholder: "수업 제목", maxlength: "80", "aria-label": "수업 제목", autocomplete: "off" });
+  titleIn.value = (L() && L().title) || "";
+  const savePill = el("span", { class: "pill pill-muted" }, "저장됨");
+  const retryBtn = el("button", { class: "btn btn-tiny", type: "button", hidden: true, onClick: () => doSave() }, "다시");
+  const loadPill = el("span", { class: "pill", hidden: true });
+  const btnStart = el("button", { class: "btn btn-primary", type: "button", "data-start": lessonId, onClick: onStart }, [icon("play", 18), "시작"]);
+  const top = el("header", { class: "topbar editor-top" }, [
+    el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "뒤로", onClick: () => go("/teacher") }, icon("chevron-left")),
+    titleIn,
+    el("span", { class: "topbar-group" }, [savePill, retryBtn, loadPill]),
+    el("span", { class: "topbar-spacer" }),
+    btnStart,
+  ]);
+
+  // ── 본문: 레일 | 스테이지 | 인스펙터 ──
+  const railList = el("div", { class: "rail-list" });
+  const fileIn = el("input", { type: "file", accept: ACCEPT, hidden: true });
+  const btnAdd = el("button", { class: "rail-add", type: "button", onClick: openAddModal }, [icon("plus", 16), "슬라이드"]);
+  const btnFile = el("button", { class: "rail-add", type: "button", onClick: () => fileIn.click() }, [icon("plus", 16), "파일"]);
+  const rail = el("aside", { class: "rail", "aria-label": "슬라이드 목록" }, [railList, el("div", { class: "rail-foot" }, [btnAdd, btnFile, fileIn])]);
+  const stage = el("section", { class: "stage editor-stage" });
+  const insp = el("aside", { class: "inspector" });
+  const root = el("div", { class: "editor" }, [top, el("div", { class: "editor-body" }, [rail, stage, insp])]);
+  mount(root);
+
+  // ── 저장 ──
+  const saveSoon = debounce(() => doSave(), 300);
+  function setSave(state) {
+    savePill.className = "pill" + (state === "error" ? " pill-danger" : state === "saving" ? "" : " pill-muted");
+    savePill.textContent = state === "error" ? "저장 실패" : state === "saving" ? "저장 중…" : "저장됨";
+    retryBtn.hidden = state !== "error";
   }
-  return liveClass(wrap, session, teacher);
-}
+  function markDirty() {
+    const l = L();
+    if (l) l.updatedAt = Date.now();
+    if (!disposed) setSave("saving");
+    saveSoon();
+  }
+  async function doSave() {
+    saveSoon.cancel();
+    const l = L();
+    if (!l) return;
+    const seq = ++saveSeq;
+    if (!disposed) setSave("saving");
+    let r;
+    try { r = await cloudSaveLesson(l); } catch (e) { r = { error: e }; }
+    if (seq !== saveSeq || saveSoon.pending()) return; // 더 최신 저장이 있음
+    if (!disposed) setSave(r && r.error ? "error" : "saved");
+    else if (r && r.error) toast("저장하지 못했어요", { type: "error" });
+  }
+  function showLoad(text) { loadPill.hidden = false; loadPill.textContent = text; }
+  function hideLoad() { loadPill.hidden = true; }
 
-function liveClass(wrap, session, teacher) {
-  const slide = session.slidesSnapshot[session.currentSlide];
-  const lesson = findLesson(session.lessonId);
-  const head = el("div", { class: "main-header" }, [
-    el("div", { class: "row-flex" }, [
-      el("h1", {}, session.title),
-      el("span", { class: "tag live" }, "LIVE"),
-      teacher.joinCode ? el("span", { class: "join-code", title: "학생 입장용 수업 코드 (교사 고유)" }, [
-        el("span", { class: "muted", style: { fontSize: "11px" } }, "수업 코드"),
-        el("strong", {}, teacher.joinCode),
-      ]) : null,
-      el("span", { class: "muted" }, `슬라이드 ${session.currentSlide + 1} / ${session.slidesSnapshot.length}`),
-    ].filter(Boolean)),
-    el("div", { class: "actions" }, [
-      el("button", { class: "btn", onClick: () => enterFocusMode(session, teacher) }, "수업 모드"),
-      el("button", { class: "btn", onClick: () => completeSession(session, "stopped") }, "수업 중지"),
-      el("button", { class: "btn btn-primary", onClick: () => completeSession(session, "completed") }, "수업 완료"),
-    ]),
-  ]);
-  wrap.appendChild(head);
+  // 제목
+  titleIn.addEventListener("input", () => { const l = L(); if (!l) return; l.title = titleIn.value; markDirty(); });
+  titleIn.addEventListener("change", () => {
+    const l = L();
+    if (!l) return;
+    const v = titleIn.value.trim();
+    if (!v) { titleIn.value = l.title = "제목 없음"; markDirty(); }
+    else if (v !== l.title) { l.title = v; markDirty(); }
+  });
+  titleIn.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) titleIn.blur(); });
 
-  const shell = el("div", { class: "live-shell" });
-  // stage
-  const stage = el("div", { class: "live-stage" });
-  const lh = el("div", { class: "live-header" }, [
-    el("span", { class: "pill live" }, "수업 중"),
-    el("span", { class: "muted", style: { fontSize: "13px" } }, `흐름: ${session.flow === "teacher" ? "교사 주도" : "학생 자율"}`),
-    el("span", { class: "muted", style: { fontSize: "13px" } }, `모드: ${modeLabel(slide.mode)}`),
-    el("span", { class: "spacer" }),
-    el("span", { class: "muted", style: { fontSize: "12px" } }, `참여 ${session.participants.length}명`),
-  ]);
-  stage.appendChild(lh);
+  // ── 레일 ──
+  const railMap = new Map(); // slideId → { item, thumb }
+  function renderRail() {
+    railMap.clear();
+    railList.replaceChildren(...slides().map((s, i) => railItem(s, i)));
+  }
+  function railItem(s, i) {
+    const thumb = el("div", { class: "t-thumb" }, thumbOf(s));
+    const more = el("button", {
+      class: "rail-more", type: "button", "aria-label": "슬라이드 메뉴",
+      onClick: (e) => { e.stopPropagation(); slideMenu(more, s.id); },
+    }, icon("more", 16));
+    const item = el("div", {
+      class: "rail-item" + (s.id === selId ? " active" : ""), role: "button", tabindex: "0", "data-id": s.id,
+      "aria-label": `${i + 1}. ${slideLabel(s)}`,
+      onClick: () => { if (!suppressClick) select(s.id); },
+      onKeydown: (e) => { if ((e.key === "Enter" || e.key === " ") && e.target === item) { e.preventDefault(); select(s.id); } },
+      onContextmenu: (e) => { e.preventDefault(); if (!dragActive) slideMenu(more, s.id); },
+    }, [thumb, el("span", { class: "rail-num" }, String(i + 1)), more]);
+    bindDrag(item, s.id);
+    railMap.set(s.id, { item, thumb });
+    return item;
+  }
+  const thumbQ = new Set();
+  const flushThumbs = debounce(() => {
+    for (const id of thumbQ) {
+      const r = railMap.get(id);
+      const s = slides().find(x => x.id === id);
+      if (r && s) r.thumb.replaceChildren(thumbOf(s));
+    }
+    thumbQ.clear();
+  }, 300);
+  function refreshThumb(id) { if (disposed) return; thumbQ.add(id); flushThumbs(); }
 
-  const stageArea = el("div", { class: "canvas-stage", style: { background: "#f4f3f0" } });
-  stage.appendChild(stageArea);
+  // 포인터 드래그 정렬 (HTML5 DnD 금지). 마우스: 6px 이동 시 시작, 터치·펜: 380ms 누르고 있으면 시작
+  function bindDrag(item, sid) {
+    item.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0 || e.target.closest(".rail-more") || slides().length < 2) return;
+      if (dragAbort) dragAbort();
+      const pid = e.pointerId, mouse = e.pointerType === "mouse";
+      const sx = e.clientX, sy = e.clientY;
+      let lx = sx, ly = sy, dragging = false, ghost = null, offX = 0, offY = 0, before, hold = 0, moved = 0;
+      const clearMarks = () => railList.querySelectorAll(".drop-above, .drop-below").forEach(n => n.classList.remove("drop-above", "drop-below"));
+      const place = () => {
+        if (!ghost) return;
+        ghost.style.transform = `translate(${lx - offX}px, ${ly - offY}px) rotate(-1.5deg)`;
+        const horiz = getComputedStyle(railList).flexDirection.startsWith("row");
+        const others = [...railList.children].filter(n => n !== item);
+        clearMarks();
+        before = null;
+        for (const n of others) {
+          const r = n.getBoundingClientRect();
+          const mid = horiz ? r.left + r.width / 2 : r.top + r.height / 2;
+          if ((horiz ? lx : ly) < mid) { before = n; break; }
+        }
+        if (before) before.classList.add("drop-above");
+        else if (others.length) others[others.length - 1].classList.add("drop-below");
+      };
+      const start = () => {
+        if (dragging || disposed || !item.isConnected) return;
+        dragging = dragActive = suppressClick = true;
+        closePop();
+        const r = item.getBoundingClientRect();
+        offX = sx - r.left; offY = sy - r.top;
+        ghost = item.cloneNode(true);
+        ghost.classList.remove("active");
+        ghost.classList.add("rail-ghost");
+        Object.assign(ghost.style, { width: r.width + "px", height: r.height + "px", left: "0px", top: "0px", margin: "0" });
+        document.body.appendChild(ghost);
+        item.classList.add("dragging");
+        try { item.setPointerCapture(pid); } catch (_) {}
+        place();
+      };
+      const onMove = (ev) => {
+        if (ev.pointerId !== pid) return;
+        lx = ev.clientX; ly = ev.clientY;
+        if (!dragging) {
+          const d = Math.hypot(lx - sx, ly - sy);
+          if (mouse && d > 6) start();
+          else if (!mouse && d > 10) finish(false); // 스크롤 의도
+          return;
+        }
+        if (ev.cancelable) ev.preventDefault();
+        moved = Math.max(moved, Math.hypot(lx - sx, ly - sy));
+        place();
+      };
+      const onTouch = (ev) => { if (dragging && ev.cancelable) ev.preventDefault(); };
+      const onUp = (ev) => { if (ev.pointerId === pid) finish(true); };
+      const onCancel = (ev) => { if (ev.pointerId === pid) finish(false); };
+      function finish(commit) {
+        if (dragAbort === abort) dragAbort = null;
+        clearTimeout(hold);
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onCancel);
+        item.removeEventListener("touchmove", onTouch);
+        if (!dragging) return;
+        dragging = false;
+        if (ghost) ghost.remove();
+        ghost = null;
+        item.classList.remove("dragging");
+        clearMarks();
+        try { item.releasePointerCapture(pid); } catch (_) {}
+        setTimeout(() => { suppressClick = false; dragActive = false; }, 0);
+        if (!commit || disposed) return;
+        // 터치 길게 누르기만 하고 놓음 → 슬라이드 메뉴(명세 §9.1 '길게 누르기 = 메뉴')
+        if (!mouse && moved < 8) {
+          const more = item.querySelector(".rail-more");
+          if (more && item.isConnected) slideMenu(more, sid);
+          return;
+        }
+        if (before !== undefined) moveBefore(sid, before ? before.dataset.id : null);
+      }
+      const abort = () => finish(false);
+      dragAbort = abort;
+      window.addEventListener("pointermove", onMove, { passive: false });
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onCancel);
+      item.addEventListener("touchmove", onTouch, { passive: false });
+      if (!mouse) hold = setTimeout(start, 380);
+    });
+  }
+  function moveBefore(sid, beforeId) {
+    if (disposed) return;
+    const list = slides();
+    const from = list.findIndex(s => s.id === sid);
+    if (from < 0) return;
+    const order = list.map(s => s.id).join(",");
+    const [s] = list.splice(from, 1);
+    const to = beforeId ? list.findIndex(x => x.id === beforeId) : list.length;
+    list.splice(to < 0 ? list.length : to, 0, s);
+    if (list.map(x => x.id).join(",") === order) return;
+    afterStructure(sid);
+  }
 
-  // bottom controls
-  const controls = el("div", { class: "live-controls" }, [
-    el("button", { class: "btn btn-tiny", disabled: session.currentSlide === 0, onClick: () => navigate(-1) }, "← 이전"),
-    el("button", { class: "btn btn-tiny", disabled: session.currentSlide === session.slidesSnapshot.length - 1, onClick: () => navigate(1) }, "다음 →"),
-    el("span", { class: "toolbar-divider" }),
-    el("span", { class: "muted", style: { fontSize: "12px" } }, "흐름:"),
-    el("button", { class: "btn btn-tiny" + (session.flow === "teacher" ? " btn-primary" : ""), onClick: () => switchFlow("teacher") }, "교사"),
-    el("button", { class: "btn btn-tiny" + (session.flow === "student" ? " btn-primary" : ""), onClick: () => switchFlow("student") }, "학생"),
-    el("span", { class: "toolbar-divider" }),
-    el("span", { class: "muted", style: { fontSize: "12px" } }, "모드:"),
-    ...["none","whole","individual","group"].map(m =>
-      el("button", { class: "btn btn-tiny" + (slide.mode === m ? " btn-primary" : ""), onClick: () => switchMode(m) }, modeLabel(m))
-    ),
-  ]);
-  stage.appendChild(controls);
-
-  shell.appendChild(stage);
-
-  // progress panel
-  const panel = el("div", { class: "progress-panel" });
-  shell.appendChild(panel);
-
-  wrap.appendChild(shell);
-
-  // 교사 측: PPT/전체 모두 'whole' scope 에 저장 → 도구 변경·새로고침 시에도 필기 보존.
-  // 학생 측은 student.js 가 PPT 모드일 때 scope='ppt' (readOnly)로 분기.
-  let viewer;
+  // ── 선택 · 스테이지 · 인스펙터 ──
+  function select(id) {
+    if (!slides().some(s => s.id === id)) id = (slides()[0] && slides()[0].id) || null;
+    const changed = id !== selId || !host;
+    selId = id;
+    for (const [sid, r] of railMap) r.item.classList.toggle("active", sid === id);
+    const r = railMap.get(id);
+    if (r) r.item.scrollIntoView({ block: "nearest", inline: "nearest" });
+    if (changed) mountStage();
+  }
   function mountStage() {
-    const scope = slide.mode === "individual" ? "individual"
-                : slide.mode === "group" ? "group"
-                : "whole";
-    viewer = renderSlide({ root: stageArea, slide, session, scope, readOnly: false });
-    viewer.setTool("pen");
-    viewer.setColor("#1a1a1a");
-    viewer.setSize(2);
-  }
-  mountStage();
-
-  // progress panel
-  renderProgress();
-  function renderProgress() {
-    panel.innerHTML = "";
-    panel.appendChild(el("h4", {}, "진행 상황"));
-    if (slide.mode === "individual") {
-      panel.appendChild(individualProgress(session, slide));
-    } else if (slide.mode === "group") {
-      panel.appendChild(groupProgress(session, slide));
-    } else if (slide.mode === "whole") {
-      panel.appendChild(el("p", { class: "muted" }, "전체 모드: 교사·학생이 동일 캔버스를 공유합니다."));
-    } else {
-      panel.appendChild(el("p", { class: "muted" }, "PPT 모드: 학생은 슬라이드를 시청합니다."));
+    closePop();
+    if (host) { try { host.destroy(); } catch (e) { console.warn("[editor] host destroy", e); } host = null; }
+    stage.replaceChildren();
+    const s = curSlide();
+    if (!s) {
+      stage.appendChild(el("div", { class: "empty" }, "슬라이드를 추가하세요"));
+      renderInspector();
+      return;
     }
-    panel.appendChild(el("h4", {}, "참여자"));
-    if (session.participants.length === 0) {
-      panel.appendChild(el("p", { class: "muted" }, "아직 입장한 학생이 없습니다."));
-    } else {
-      const list = el("div", { style: { display: "grid", gap: "4px" } });
-      session.participants.forEach(sid => {
-        const stu = store.state.students.find(x => x.id === sid);
-        list.appendChild(el("div", { style: { fontSize: "12px" } }, studentLabel(stu)));
+    const sid = s.id;
+    host = mountSlideHost({
+      role: "editor", root: stage, slide: s, lesson: L(), me: teacher,
+      onEditorUpdate: (patch) => onSlidePatch(sid, patch),
+    });
+    renderInspector();
+  }
+  function onSlidePatch(slideId, patch) {
+    const s = slides().find(x => x.id === slideId);
+    if (s && patch && typeof patch === "object") Object.assign(s, patch);
+    markDirty();
+    refreshThumb(slideId);
+    if (slideId === selId) updateValidate();
+  }
+  function renderInspector() {
+    insp.replaceChildren();
+    validateEl = null;
+    const s = curSlide();
+    if (!s) return;
+    const def = getSlideType(s.type);
+    const sid = s.id;
+    const titleField = el("input", { type: "text", placeholder: def.label, maxlength: "80", autocomplete: "off" });
+    titleField.value = s.title || "";
+    titleField.addEventListener("input", () => {
+      const cs = slides().find(x => x.id === sid);
+      if (!cs) return;
+      cs.title = titleField.value.trim() ? titleField.value : null;
+      markDirty();
+      refreshThumb(sid);
+    });
+    insp.append(
+      el("div", { class: "inspector-title" }, def.label),
+      el("label", { class: "field" }, [el("span", {}, "제목"), titleField]),
+    );
+    const extra = host && host.inspector;
+    if (extra instanceof Node) insp.appendChild(extra);
+    validateEl = el("div", { class: "validate", hidden: true, role: "status" });
+    insp.appendChild(validateEl);
+    updateValidate();
+  }
+  function updateValidate() {
+    if (!validateEl) return;
+    const s = curSlide();
+    const def = s && getSlideType(s.type);
+    let msg = null;
+    try { msg = def && typeof def.validate === "function" ? def.validate(s) : null; } catch (e) { console.warn("[editor] validate", e); }
+    validateEl.hidden = !msg;
+    validateEl.textContent = msg || "";
+  }
+
+  // ── 구조 변경 ──
+  function afterStructure(selectId) {
+    const l = L();
+    if (l) l.slideCount = slides().length;
+    renderRail();
+    select(selectId != null ? selectId : selId);
+    markDirty();
+  }
+  function insertSlides(news) {
+    const l = L();
+    if (!l || !Array.isArray(l.slides) || !news || !news.length) return;
+    const i = l.slides.findIndex(s => s.id === selId);
+    l.slides.splice(i < 0 ? l.slides.length : i + 1, 0, ...news);
+    afterStructure(news[0].id);
+  }
+  function slideMenu(anchor, sid) {
+    const list = slides();
+    const i = list.findIndex(s => s.id === sid);
+    if (i < 0) return;
+    menuPop(anchor, [
+      { label: "복제", icon: "duplicate", onClick: () => duplicateSlide(sid) },
+      { label: "위로", icon: "arrow-up", disabled: i === 0, onClick: () => moveSlide(sid, -1) },
+      { label: "아래로", icon: "arrow-down", disabled: i === list.length - 1, onClick: () => moveSlide(sid, 1) },
+      { sep: true },
+      { label: "삭제", icon: "trash", danger: true, disabled: list.length <= 1, onClick: () => deleteSlide(sid) },
+    ]);
+  }
+  function duplicateSlide(sid) {
+    const list = slides();
+    const i = list.findIndex(s => s.id === sid);
+    if (i < 0) return;
+    let copy;
+    try { copy = JSON.parse(JSON.stringify(list[i])); } catch (e) { toast("복제하지 못했어요", { type: "error" }); return; }
+    copy.id = newId("slide");
+    if (copy.bgPath) copy.bgPath = null; // 가정: 이미지 파일 소유권은 원본에만
+    list.splice(i + 1, 0, copy);
+    afterStructure(copy.id);
+  }
+  function moveSlide(sid, d) {
+    const list = slides();
+    const i = list.findIndex(s => s.id === sid);
+    const j = i + d;
+    if (i < 0 || j < 0 || j >= list.length) return;
+    [list[i], list[j]] = [list[j], list[i]];
+    afterStructure(sid);
+  }
+  async function deleteSlide(sid) {
+    if (slides().length <= 1) { toast("슬라이드가 하나뿐이에요"); return; }
+    const ok = await confirmDialog({ title: "이 슬라이드를 삭제할까요?", ok: "삭제", danger: true });
+    if (!ok || disposed) return;
+    const list = slides();
+    const i = list.findIndex(s => s.id === sid);
+    if (i < 0 || list.length <= 1) return;
+    list.splice(i, 1);
+    const next = sid === selId ? (list[i] || list[i - 1]).id : selId;
+    afterStructure(next);
+  }
+
+  // [+ 슬라이드] 타입 선택 모달
+  function openAddModal() {
+    const types = listSlideTypes();
+    const groups = CATEGORIES.map(c => ({ label: c.label, list: types.filter(d => d.category === c.id) }));
+    const rest = types.filter(d => !CATEGORIES.some(c => c.id === d.category));
+    if (rest.length) groups.push({ label: "기타", list: rest });
+    let m = null;
+    const body = el("div", {}, groups.filter(g => g.list.length).map(g => el("section", { class: "type-section" }, [
+      el("h4", {}, g.label),
+      el("div", { class: "type-grid" }, g.list.map(d => el("button", {
+        class: "type-card", type: "button", title: d.desc || d.label,
+        onClick: () => {
+          if (m) m.close();
+          let s;
+          try { s = createSlide(d.type); } catch (e) { console.warn("[editor] createSlide", e); toast("슬라이드를 만들지 못했어요", { type: "error" }); return; }
+          insertSlides([s]);
+        },
+      }, [el("span", { class: "icon", html: d.icon || "" }), el("span", {}, d.label)]))),
+    ])));
+    m = modal({ title: "슬라이드 추가", body, wide: true });
+  }
+
+  // [+ 파일] PDF·이미지 → ink 여러 장
+  fileIn.addEventListener("change", async () => {
+    const f = fileIn.files && fileIn.files[0];
+    fileIn.value = "";
+    if (!f || fileBusy) return;
+    fileBusy = true;
+    btnFile.disabled = true;
+    showLoad("올리는 중…");
+    try {
+      const news = await fileToSlides(f, lessonId, (d, t) => { if (!disposed) showLoad(t > 1 ? `올리는 중 ${d}/${t}` : "올리는 중…"); });
+      if (!news || !news.length) throw new Error("빈 파일이에요");
+      if (disposed) {
+        // 화면을 떠났어도 올린 슬라이드는 자료 끝에 붙여 저장
+        const l = L();
+        if (l && Array.isArray(l.slides)) { l.slides.push(...news); cloudSaveLesson(l); }
+        return;
+      }
+      insertSlides(news);
+    } catch (e) {
+      console.warn("[editor] 파일 추가 실패", e);
+      toast((e && e.message) || "파일을 불러오지 못했어요", { type: "error" });
+    } finally {
+      fileBusy = false;
+      btnFile.disabled = false;
+      if (!disposed) hideLoad();
+    }
+  });
+
+  async function onStart() {
+    if (saveSoon.pending()) saveSoon.flush();
+    await startLesson(lessonId);
+  }
+
+  // ── 불러오기 ──
+  function setReady(on) {
+    btnStart.disabled = !on || starting.has(lessonId);
+    btnAdd.disabled = !on;
+    btnFile.disabled = !on || fileBusy;
+  }
+  async function load() {
+    const l = L();
+    if (!l) return;
+    if (Array.isArray(l.slides)) { ready(); return; }
+    setReady(false);
+    stage.replaceChildren(el("div", { class: "empty" }, "불러오는 중…"));
+    showLoad("불러오는 중…");
+    try {
+      await cloudFetchLessonSlides(lessonId, (d, t) => { if (!disposed) showLoad(t ? `불러오는 중 ${d}/${t}` : "불러오는 중…"); });
+      if (disposed) return;
+      hideLoad();
+      ready();
+    } catch (e) {
+      if (disposed) return;
+      console.warn("[editor] 슬라이드 불러오기 실패", e);
+      hideLoad();
+      stage.replaceChildren(el("div", { class: "empty" }, [
+        el("div", {}, "슬라이드를 불러오지 못했어요"),
+        el("button", { class: "btn btn-sm", type: "button", style: { marginTop: "12px" }, onClick: load }, [icon("refresh", 16), "다시"]),
+      ]));
+    }
+  }
+  function ready() {
+    setReady(true);
+    renderRail();
+    select((slides()[0] && slides()[0].id) || null);
+  }
+
+  const onHide = () => saveSoon.flush();
+  const onVis = () => { if (document.visibilityState === "hidden") saveSoon.flush(); };
+  window.addEventListener("pagehide", onHide);
+  document.addEventListener("visibilitychange", onVis);
+  load();
+
+  return () => {
+    window.removeEventListener("pagehide", onHide);
+    document.removeEventListener("visibilitychange", onVis);
+    if (dragAbort) dragAbort();
+    closePop();
+    // host를 먼저 정리(입력 중이던 텍스트가 onEditorUpdate로 들어올 수 있음) → 그 뒤 저장 즉시 실행
+    if (host) { try { host.destroy(); } catch (e) { console.warn(e); } host = null; }
+    disposed = true;
+    flushThumbs.cancel();
+    saveSoon.flush();
+  };
+}
+
+// ───────────────────────── 수업 진행 /live/:id ─────────────────────────
+export function liveView({ id } = {}) {
+  return withTeacher(async (teacher) => {
+    ensureCss();
+    const alive = viewGuard();
+    mount(el("div", { class: "t-loading" }, el("span", { class: "spinner", "aria-label": "불러오는 중" })));
+    let s0 = null;
+    try { s0 = await ensureSession(id); } catch (e) { console.warn("[live] ensureSession", e); }
+    if (!alive()) return () => {};
+    if (!s0) { toast("수업을 찾지 못했어요"); redirect("/teacher"); return () => {}; }
+    if (s0.status !== "live") { redirect("/teacher/session/" + id); return () => {}; }
+    return buildLive(id, teacher);
+  });
+}
+
+function buildLive(sessionId, teacher) {
+  let disposed = false, leaving = false, navBusy = false;
+  let host = null, hostSlideId = null;
+  let drawerOpen = window.innerWidth >= 1100;
+  let userTab = "activity";
+  let lastFlow = null, peopleSig = null;
+  const S = () => findSession(sessionId);
+  const curSlide = (s = S()) => (s ? (s.slidesSnapshot || [])[s.currentSlide || 0] || null : null);
+
+  const ch = joinSessionChannel(sessionId, { id: teacher.id, name: teacher.name, role: "teacher" });
+  const unsub = subscribeSession(sessionId, { role: "teacher" });
+
+  // ── 상단 바 ──
+  const code = (currentTeacher() || teacher).joinCode || "";
+  const titleEl = el("div", { class: "topbar-title" });
+  const codeBtn = el("button", { class: "code-pill", type: "button", title: "참여 코드", onClick: () => openCodeModal(code) }, code || "코드");
+  const onlineNum = el("span", {}, "0");
+  const onlineBtn = el("button", {
+    class: "online-pill", type: "button", title: "접속 중",
+    onClick: () => { userTab = "people"; setDrawer(true); renderDrawerTabs(); },
+  }, [el("span", { class: "dot on" }), onlineNum]);
+  const prevBtn = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "이전 슬라이드", onClick: () => step(-1) }, icon("chevron-left"));
+  const nextBtn = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "다음 슬라이드", onClick: () => step(1) }, icon("chevron-right"));
+  const countBtn = el("button", { class: "slide-count", type: "button", title: "슬라이드 이동", onClick: openStrip });
+  const modeSeg = el("div", { class: "seg", role: "group", "aria-label": "모드" },
+    MODES.map(([m, label]) => el("button", { type: "button", "data-mode": m, onClick: () => setMode(m) }, label)));
+  const flowBtn = el("button", { class: "btn btn-sm btn-ghost", type: "button", onClick: toggleFlow });
+  const panelBtn = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "패널", title: "패널", onClick: () => setDrawer(!drawerOpen) }, icon("panel"));
+  const endBtn = el("button", { class: "btn btn-sm btn-danger", type: "button", onClick: endClass }, "종료");
+  const savingPill = el("span", { class: "pill pill-warn", role: "status", hidden: true }, "저장 중…");
+  const top = el("header", { class: "topbar live-top" }, [
+    el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "대시보드", title: "대시보드 (수업은 계속돼요)", onClick: () => go("/teacher") }, icon("arrow-left")),
+    titleEl, codeBtn, onlineBtn,
+    el("div", { class: "slide-nav" }, [prevBtn, countBtn, nextBtn]),
+    modeSeg, flowBtn, panelBtn, savingPill, endBtn,
+  ]);
+
+  // ── 본문: 스테이지 + 드로어 ──
+  const stage = el("section", { class: "stage live-stage" });
+  const tabAct = el("button", { type: "button", onClick: () => { userTab = "activity"; renderDrawerTabs(); } }, "활동");
+  const tabPeople = el("button", { type: "button", onClick: () => { userTab = "people"; renderDrawerTabs(); } }, "참여");
+  const actBox = el("div", { class: "t-pane" });
+  const peopleHead = el("div", { class: "muted" });
+  const peopleList = el("div", { class: "people" });
+  const peopleBox = el("div", { class: "t-pane" }, [peopleHead, peopleList]);
+  const drawer = el("aside", { class: "drawer", "aria-label": "패널" }, [
+    el("div", { class: "drawer-head" }, [
+      el("div", { class: "tabs drawer-tabs" }, [tabAct, tabPeople]),
+      el("button", { class: "btn btn-icon btn-ghost btn-sm", type: "button", "aria-label": "닫기", onClick: () => setDrawer(false) }, icon("x", 18)),
+    ]),
+    el("div", { class: "drawer-body" }, [actBox, peopleBox]),
+  ]);
+  const root = el("div", { class: "live" }, [top, el("div", { class: "live-body" }, [stage, drawer])]);
+  mount(root);
+
+  // ── 동기화 ──
+  function syncHost() {
+    const s = S();
+    const slide = curSlide(s);
+    if (!slide) {
+      if (host) { try { host.destroy(); } catch (e) { console.warn(e); } host = null; }
+      hostSlideId = null;
+      stage.replaceChildren(el("div", { class: "empty" }, "슬라이드가 없어요"));
+      syncPanel();
+      return;
+    }
+    // 같은 슬라이드: DOM 보존, 훅만 (플러그인이 panel을 바꿨을 수도 있어 패널만 가볍게 맞춤)
+    if (host && hostSlideId === slide.id) { host.update({ slide, session: s }); syncPanel(); return; }
+    closePop();
+    if (host) { try { host.destroy(); } catch (e) { console.warn("[live] host destroy", e); } host = null; }
+    stage.replaceChildren();
+    hostSlideId = slide.id;
+    host = mountSlideHost({ role: "teacher", root: stage, slide, session: s, me: teacher });
+    syncPanel();
+  }
+  function syncPanel() {
+    const p = host ? host.panel : null;
+    if (p instanceof Node) { if (actBox.firstChild !== p || actBox.childNodes.length !== 1) actBox.replaceChildren(p); }
+    else if (actBox.firstChild) actBox.replaceChildren();
+    renderDrawerTabs();
+  }
+  function renderDrawerTabs() {
+    const hasPanel = !!actBox.firstChild;
+    tabAct.hidden = !hasPanel;
+    const tab = userTab === "activity" && hasPanel ? "activity" : "people";
+    tabAct.classList.toggle("active", tab === "activity");
+    tabPeople.classList.toggle("active", tab === "people");
+    actBox.hidden = tab !== "activity";
+    peopleBox.hidden = tab !== "people";
+  }
+  function setDrawer(open) {
+    drawerOpen = !!open;
+    drawer.classList.toggle("closed", !drawerOpen);
+    panelBtn.classList.toggle("btn-soft", drawerOpen);
+    panelBtn.setAttribute("aria-pressed", String(drawerOpen));
+  }
+  function syncTop() {
+    const s = S();
+    if (!s) return;
+    const n = (s.slidesSnapshot || []).length;
+    const i = s.currentSlide || 0;
+    const slide = curSlide(s);
+    titleEl.textContent = s.title || "수업";
+    countBtn.textContent = n ? `${i + 1} / ${n}` : "0 / 0";
+    prevBtn.disabled = i <= 0;
+    nextBtn.disabled = i >= n - 1;
+    const isInk = !!slide && slide.type === "ink";
+    modeSeg.hidden = !isInk;
+    if (isInk) {
+      const m = effectiveMode(slide, s);
+      modeSeg.querySelectorAll("button").forEach(b => {
+        const on = b.dataset.mode === m;
+        b.classList.toggle("active", on);
+        b.setAttribute("aria-pressed", String(on));
       });
-      panel.appendChild(list);
+    }
+    const flow = s.flow === "student" ? "student" : "teacher";
+    if (flow !== lastFlow) {
+      lastFlow = flow;
+      const free = flow === "student";
+      flowBtn.replaceChildren(icon(free ? "unlock" : "lock", 18), el("span", { class: "hide-sm" }, free ? "자유 이동" : "교사 진행"));
+      flowBtn.title = free ? "자유 이동 (학생이 직접 넘김)" : "교사 진행";
+      flowBtn.setAttribute("aria-pressed", String(free));
     }
   }
-
-  function navigate(d) {
-    session.currentSlide = Math.max(0, Math.min(session.slidesSnapshot.length - 1, session.currentSlide + d));
-    store.set(s => s);
-    cloudUpsertSession(session).catch(() => {});
-    sync.emit({ type: "slide-change" });
-    rerender();
+  function onlineSet() {
+    try { return new Set(ch.online() || []); } catch (_) { return new Set(); }
   }
-  function switchFlow(f) {
-    session.flow = f;
-    store.set(s => s);
-    cloudUpsertSession(session).catch(() => {});
-    sync.emit({ type: "flow-change" });
-    rerender();
+  function syncOnline() { onlineNum.textContent = String(onlineSet().size); }
+  function syncPeople() {
+    const s = S();
+    if (!s) return;
+    const slide = curSlide(s);
+    const def = slide ? getSlideType(slide.type) : null;
+    const interact = !!def && def.category === "interact";
+    const online = onlineSet();
+    const ids = [...new Set([...(s.participants || []), ...online])];
+    const responded = new Set(interact ? ((s.responses || {})[slide.id] || []).map(r => r.studentId) : []);
+    const groupOf = new Map();
+    (s.groups || []).forEach(g => (g.memberIds || []).forEach(m => groupOf.set(m, g.name || "모둠")));
+    const sig = JSON.stringify([ids, [...online], interact ? [...responded] : 0, [...groupOf], slide && slide.id,
+      ids.map(id => (findStudent(id) ? 1 : 0)).join("")]);
+    if (sig === peopleSig) return;
+    peopleSig = sig;
+    const onCount = ids.filter(x => online.has(x)).length;
+    peopleHead.textContent = `참여 ${ids.length} · 접속 ${onCount}`;
+    if (!ids.length) { peopleList.replaceChildren(el("div", { class: "empty" }, "아직 아무도 없어요")); return; }
+    const rows = ids.map(id => ({ id, st: findStudent(id) })).sort((a, b) => cmpStudent(a.st, b.st));
+    peopleList.replaceChildren(...rows.map(({ id, st }) => {
+      const on = online.has(id);
+      return el("div", { class: "person" + (on ? "" : " offline") }, [
+        el("span", { class: "dot" + (on ? " on" : "") }),
+        el("span", { class: "name" }, st ? studentLabel(st) : "학생"),
+        interact && !responded.has(id) ? el("span", { class: "pending" }, "미제출") : null,
+        groupOf.has(id) ? el("span", { class: "pill pill-muted" }, groupOf.get(id)) : null,
+      ]);
+    }));
   }
-  function switchMode(m) {
-    slide.mode = m;
-    // session.slidesSnapshot 안의 슬라이드 객체이므로, snapshot 자체가 변경됨.
-    // 클라우드의 sessions.slides_snapshot(jsonb) 갱신 → 학생 측 realtime 트리거
-    store.set(s => s);
-    cloudUpsertSession(session).catch(() => {});
-    sync.emit({ type: "mode-change" });
-    rerender();
+
+  // ── 이동 · 모드 · 흐름 · 종료 ──
+  function step(d) { const s = S(); if (s) goTo((s.currentSlide || 0) + d); }
+  async function goTo(idx) {
+    if (navBusy || disposed) return;
+    let s = S();
+    if (!s) return;
+    const n = (s.slidesSnapshot || []).length;
+    if (!n) return;
+    idx = Math.max(0, Math.min(n - 1, idx));
+    if (idx === (s.currentSlide || 0)) return;
+    const cur = curSlide(s);
+    const patch = { currentSlide: idx };
+    if (cur && getSlideType(cur.type).category === "game" && ((s.activity || {})[cur.id] || {}).phase === "running") {
+      navBusy = true;
+      const ok = await confirmDialog({ title: "게임을 종료하고 넘어갈까요?", ok: "종료하고 이동" });
+      navBusy = false;
+      if (!ok || disposed) return;
+      s = S();
+      if (!s) return;
+      const act = s.activity || {};
+      // 가정: 게임 강제 종료 시 endedAt 을 기록해 race 시뮬레이션이 그 시각에서 멈추게 한다(dino 는 endedAt 무시, endsAt 만 정리).
+      patch.activity = { ...act, [cur.id]: { ...(act[cur.id] || {}), phase: "ended", endedAt: Date.now(), endsAt: null } };
+    }
+    patchSession(s, patch);
   }
-  function rerender() {
-    wrap.innerHTML = "";
-    liveClass(wrap, session, teacher);
+  function setMode(m) {
+    const s = S();
+    const slide = curSlide(s);
+    if (!s || !slide || effectiveMode(slide, s) === m) return;
+    const act = s.activity || {};
+    patchSession(s, { activity: { ...act, [slide.id]: { ...(act[slide.id] || {}), mode: m } } });
+    if (m === "group" && !(s.groups || []).length) { userTab = "activity"; setDrawer(true); renderDrawerTabs(); }
+  }
+  function toggleFlow() {
+    const s = S();
+    if (s) patchSession(s, { flow: s.flow === "student" ? "teacher" : "student" });
+  }
+  async function endClass() {
+    const ok = await confirmDialog({ title: "수업을 종료할까요?", ok: "종료", danger: true });
+    if (!ok || disposed) return;
+    const s = S();
+    if (!s) return;
+    leaving = true;
+    endBtn.classList.add("loading");
+    endBtn.disabled = true;
+    let r;
+    try { r = await cloudEndSession(s, "completed"); } catch (e) { r = { error: e }; }
+    if (disposed) return;
+    if (r && r.error) {
+      // 실패: 조용히 떠나지 않고 진행 화면 유지 (cloud.js가 백오프 재시도 중이면 _statusPending → '저장 중…')
+      leaving = false;
+      endBtn.classList.remove("loading");
+      endBtn.disabled = false;
+      const cur = S();
+      savingPill.hidden = !(cur && cur._statusPending);
+      toast("수업 종료를 저장하지 못했어요. 다시 시도해 주세요", { type: "error" });
+      return;
+    }
+    go("/teacher/session/" + sessionId, { replace: true });
   }
 
-  // re-render progress every 1.5s while live
-  const t = setInterval(() => renderProgress(), 1500);
-  // Cleanup on next render
-  setTimeout(() => clearTimeout(t), 60_000_000);
-
-  return wrap;
-}
-
-function modeLabel(m) {
-  return ({ none: "PPT", whole: "전체", individual: "개별", group: "그룹" })[m] || m;
-}
-
-/* ── 수업 모드 (풀스크린 오버레이) ───────────────────── */
-function enterFocusMode(session, teacher) {
-  // 중복 진입 방지
-  if (document.querySelector(".focus-shell")) return;
-
-  let activeTool = "pen";
-  let activeColor = COLORS[0];
-  let activeSize = 2;
-  let viewer = null;
-  let progressTimer = null;
-
-  const shell = el("div", { class: "focus-shell" });
-  document.body.appendChild(shell);
-
-  function currentSlide() { return session.slidesSnapshot[session.currentSlide]; }
-
-  function close() {
-    clearInterval(progressTimer);
-    document.removeEventListener("keydown", onKey);
-    shell.remove();
+  // 썸네일 스트립으로 점프
+  function openStrip() {
+    if (openPop && openPop.anchor === countBtn) { closePop(); return; }
+    const s = S();
+    if (!s) return;
+    const cur = s.currentSlide || 0;
+    const strip = el("div", { class: "thumb-strip" }, (s.slidesSnapshot || []).map((sl, i) => el("button", {
+      class: "rail-item" + (i === cur ? " active" : ""), type: "button", title: slideLabel(sl),
+      onClick: () => { closePop(); goTo(i); },
+    }, [el("div", { class: "t-thumb" }, thumbOf(sl)), el("span", { class: "rail-num" }, String(i + 1))])));
+    popover(countBtn, strip, { className: "t-strip-pop", align: "center" });
+    const a = strip.querySelector(".active");
+    if (a) strip.scrollLeft = Math.max(0, a.offsetLeft - strip.offsetLeft - strip.clientWidth / 2 + a.offsetWidth / 2);
   }
-  function onKey(e) {
-    if (e.key === "Escape") close();
-    else if (e.key === "ArrowRight") nav(1);
-    else if (e.key === "ArrowLeft") nav(-1);
+
+  function toggleFullscreen() {
+    try {
+      if (document.fullscreenElement) document.exitFullscreen?.().catch?.(() => {});
+      else document.documentElement.requestFullscreen?.().catch?.(() => {});
+    } catch (_) {}
   }
+  const onKey = (e) => {
+    if (disposed || e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || e.isComposing) return;
+    if (isTypingTarget(e.target)) return;
+    if (e.key === "ArrowLeft") { e.preventDefault(); step(-1); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); step(1); }
+    else if (e.code === "KeyF" || e.key === "f" || e.key === "F") { e.preventDefault(); toggleFullscreen(); }
+    else if (e.key === "Escape") closePop();
+  };
   document.addEventListener("keydown", onKey);
 
-  // 교사 측 scope 결정: PPT/전체는 모두 'whole'에 저장(교사 필기 보존),
-  // 개별·그룹은 해당 scope 그대로. 학생 측은 student.js 가 PPT 모드일 때 readOnly로 시청만.
-  function teacherScope(slide) {
-    if (slide.mode === "individual") return "individual";
-    if (slide.mode === "group") return "group";
-    return "whole";
-  }
-
-  // 마지막으로 마운트된 (slideId, scope) 추적 — 동일하면 viewer를 보존, 다르면 재마운트
-  let mountedKey = null;
-
-  function nav(d) {
-    session.currentSlide = Math.max(0, Math.min(session.slidesSnapshot.length - 1, session.currentSlide + d));
-    store.set(s => s);
-    cloudUpsertSession(session).catch(() => {});
-    sync.emit({ type: "slide-change" });
-    render();
-  }
-  function switchFlow(f) {
-    session.flow = f;
-    store.set(s => s);
-    cloudUpsertSession(session).catch(() => {});
-    sync.emit({ type: "flow-change" });
-    refreshChrome();
-  }
-  function switchMode(m) {
-    currentSlide().mode = m;
-    store.set(s => s);
-    cloudUpsertSession(session).catch(() => {});
-    sync.emit({ type: "mode-change" });
-    render();
-  }
-  function clearCurrent() {
-    const slide = currentSlide();
-    if (!confirm("이 슬라이드의 필기와 입력 내용을 모두 지울까요?")) return;
-    const scope = teacherScope(slide);
-    if (scope === "whole") {
-      session.records ||= {};
-      session.records.__whole ||= {};
-      session.records.__whole[slide.id] = { strokes: [], texts: [] };
-    } else if (scope === "individual") {
-      // 모든 학생의 해당 슬라이드 기록 초기화
-      Object.values(session.records || {}).forEach(rec => { if (rec && rec[slide.id]) rec[slide.id] = { strokes: [], texts: [] }; });
-    } else if (scope === "group") {
-      session.records ||= {};
-      session.records.__groups ||= {};
-      Object.values(session.records.__groups).forEach(g => { if (g && g[slide.id]) g[slide.id] = { strokes: [], texts: [] }; });
-    }
-    store.set(s => s);
-    sync.emit({ type: "clear-slide" });
-    // 화면 즉시 반영 — 재마운트
-    mountedKey = null;
-    render();
-  }
-
-  // 도구바 / 상단 / 하단 컨트롤만 다시 그림 (viewer 보존)
-  function refreshChrome() {
-    const slide = currentSlide();
-    // 기존 chrome 제거
-    shell.querySelectorAll(".focus-top, .focus-toolbar, .focus-controls").forEach(n => n.remove());
-
-    // 상단
-    const top = el("div", { class: "focus-top" }, [
-      el("span", { class: "tag live" }, "수업 중"),
-      teacher.joinCode ? el("span", { class: "join-code small" }, [
-        el("span", { class: "muted", style: { fontSize: "10px" } }, "코드"),
-        el("strong", {}, teacher.joinCode),
-      ]) : null,
-      el("span", { class: "muted", style: { fontSize: "12px" } }, `${session.flow === "teacher" ? "교사 흐름" : "학생 흐름"} · ${modeLabel(slide.mode)}`),
-      el("span", { class: "spacer" }),
-      el("button", { class: "btn btn-tiny", onClick: () => openProgress() }, "진행상황"),
-      el("button", { class: "btn btn-tiny", onClick: close, title: "수업 모드 종료 (ESC)" }, "✕ 종료"),
-    ].filter(Boolean));
-    shell.appendChild(top);
-
-    // 좌측 떠 있는 도구바 (도구·색·굵기·전체삭제)
-    const tb = el("div", { class: "focus-toolbar" });
-    TOOLS.forEach(t => tb.appendChild(
-      el("button", {
-        class: "tool" + (activeTool === t.id ? " active" : ""),
-        title: t.label,
-        onClick: () => {
-          activeTool = t.id;
-          viewer && viewer.setTool(t.id);
-          refreshChrome(); // 도구바 active 상태만 새로 그림 — viewer는 유지
-        },
-      }, [svgIcon(t.icon)])
-    ));
-    tb.appendChild(el("div", { class: "toolbar-divider" }));
-    COLORS.forEach(c => tb.appendChild(
-      el("div", {
-        class: "swatch" + (activeColor === c ? " active" : ""),
-        style: { background: c },
-        onClick: () => { activeColor = c; viewer && viewer.setColor(c); refreshChrome(); },
-      })
-    ));
-    tb.appendChild(el("div", { class: "toolbar-divider" }));
-    [{ id: 1.5, label: "S" },{ id: 2.5, label: "M" },{ id: 4, label: "L" },{ id: 8, label: "XL" }].forEach(s =>
-      tb.appendChild(el("button", {
-        class: "tool" + (activeSize === s.id ? " active" : ""),
-        style: { width: "auto", padding: "0 10px" },
-        onClick: () => { activeSize = s.id; viewer && viewer.setSize(s.id); refreshChrome(); },
-      }, s.label))
-    );
-    tb.appendChild(el("div", { class: "toolbar-divider" }));
-    tb.appendChild(el("button", {
-      class: "tool clear-all",
-      title: "이 슬라이드 전체 삭제",
-      style: { width: "auto", padding: "0 10px", color: "var(--danger)" },
-      onClick: clearCurrent,
-    }, "전체 삭제"));
-    shell.appendChild(tb);
-
-    // 하단 컨트롤
-    const controls = el("div", { class: "focus-controls" }, [
-      el("button", { class: "btn btn-tiny", disabled: session.currentSlide === 0, onClick: () => nav(-1) }, "← 이전"),
-      el("span", { class: "muted", style: { fontSize: "12px", padding: "0 8px" } }, `${session.currentSlide + 1} / ${session.slidesSnapshot.length}`),
-      el("button", { class: "btn btn-tiny", disabled: session.currentSlide === session.slidesSnapshot.length - 1, onClick: () => nav(1) }, "다음 →"),
-      el("span", { class: "toolbar-divider" }),
-      el("span", { class: "muted", style: { fontSize: "11px" } }, "흐름"),
-      el("button", { class: "btn btn-tiny" + (session.flow === "teacher" ? " btn-primary" : ""), onClick: () => switchFlow("teacher") }, "교사"),
-      el("button", { class: "btn btn-tiny" + (session.flow === "student" ? " btn-primary" : ""), onClick: () => switchFlow("student") }, "학생"),
-      el("span", { class: "toolbar-divider" }),
-      el("span", { class: "muted", style: { fontSize: "11px" } }, "모드"),
-      ...["none","whole","individual","group"].map(m =>
-        el("button", { class: "btn btn-tiny" + (slide.mode === m ? " btn-primary" : ""), onClick: () => switchMode(m) }, modeLabel(m))
-      ),
-    ]);
-    shell.appendChild(controls);
-  }
-
-  function render() {
-    const slide = currentSlide();
-    const scope = teacherScope(slide);
-    const key = `${slide.id}|${scope}`;
-
-    // stage 가 없으면 생성, 있으면 보존
-    let stageArea = shell.querySelector(".focus-stage");
-    if (!stageArea) {
-      stageArea = el("div", { class: "focus-stage" });
-      shell.appendChild(stageArea);
-    }
-
-    refreshChrome();
-
-    // 슬라이드/scope 가 바뀌었거나 첫 마운트일 때만 viewer 재생성
-    if (mountedKey !== key) {
-      stageArea.innerHTML = "";
-      mountedKey = key;
-      queueMicrotask(() => {
-        viewer = renderSlide({ root: stageArea, slide, session, scope, readOnly: false });
-        viewer.setTool(activeTool);
-        viewer.setColor(activeColor);
-        viewer.setSize(activeSize);
-      });
-    }
-  }
-
-  // 진행상황 패널: 토글 (이미 열려있으면 닫음)
-  function openProgress() {
-    const existing = shell.querySelector(".focus-progress-modal");
-    if (existing) {
-      existing.remove();
-      clearInterval(progressTimer);
-      progressTimer = null;
-      return;
-    }
-    const slide = currentSlide();
-    const panel = el("aside", { class: "focus-progress-modal open" }, [
-      el("div", { class: "row-flex", style: { marginBottom: "10px" } }, [
-        el("h4", { style: { margin: 0 } }, "진행 상황"),
-        el("span", { class: "spacer" }),
-        el("button", { class: "btn btn-tiny", onClick: () => { panel.remove(); clearInterval(progressTimer); progressTimer = null; } }, "✕"),
-      ]),
-      el("div", { id: "focus-prog-body" }),
-    ]);
-    shell.appendChild(panel);
-
-    const body = panel.querySelector("#focus-prog-body");
-    function paint() {
-      body.innerHTML = "";
-      if (slide.mode === "individual") body.appendChild(individualProgress(session, slide));
-      else if (slide.mode === "group") body.appendChild(groupProgress(session, slide));
-      else if (slide.mode === "whole") body.appendChild(el("p", { class: "muted" }, "전체 모드: 교사·학생이 동일 캔버스를 공유합니다."));
-      else body.appendChild(el("p", { class: "muted" }, "PPT 모드: 학생은 슬라이드를 시청합니다."));
-      const list = el("div", { style: { marginTop: "12px", display: "grid", gap: "4px" } });
-      list.appendChild(el("h4", { style: { fontSize: "12px", color: "var(--muted)", margin: "8px 0 4px" } }, `참여자 ${session.participants.length}명`));
-      session.participants.forEach(sid => {
-        const stu = store.state.students.find(x => x.id === sid);
-        list.appendChild(el("div", { style: { fontSize: "12px" } }, studentLabel(stu)));
-      });
-      body.appendChild(list);
-    }
-    paint();
-    clearInterval(progressTimer);
-    progressTimer = setInterval(paint, 1500);
-  }
-
-  render();
-}
-
-function individualProgress(session, slide) {
-  const wrap = el("div", { class: "gallery" });
-  const list = session.participants.length ? session.participants : [];
-  if (list.length === 0) {
-    return el("p", { class: "muted" }, "참여자가 없습니다.");
-  }
-  list.forEach(sid => {
-    const stu = store.state.students.find(x => x.id === sid);
-    const tile = el("div", { class: "tile" });
-    tile.appendChild(el("div", { class: "name" }, [
-      el("span", {}, stu ? stu.name : "—"),
-      el("span", { class: "dot online" }),
-    ]));
-    const prev = el("div", { class: "preview" });
-    if (slide.bg) prev.appendChild(el("img", { src: slide.bg }));
-    const cv = el("canvas", {});
-    prev.appendChild(cv);
-    tile.appendChild(prev);
-    wrap.appendChild(tile);
-    queueMicrotask(() => paintMini(cv, session, slide.id, "individual", sid));
-    tile.onclick = () => openLearnerView(session, slide, sid);
+  const offPres = ch.onPresence(() => { if (disposed) return; syncOnline(); syncPeople(); });
+  const offStore = store.subscribe(() => {
+    if (disposed) return;
+    const s = S();
+    savingPill.hidden = !(s && s._statusPending);
+    if (leaving) return;
+    // 다른 곳에서 삭제/종료됨 → 리스너 안에서 바로 dispatch하지 않게 다음 틱에 교체 이동
+    if (!s) { leaving = true; toast("수업을 찾지 못했어요"); redirect("/teacher"); return; }
+    // 종료 저장이 재시도 중(_statusPending)이면 아직 떠나지 않는다 — 성공해 플래그가 풀리면 다음 알림에서 이동
+    if (s.status !== "live" && !s._statusPending) { leaving = true; toast("수업이 끝났어요"); redirect("/teacher/session/" + sessionId); return; }
+    syncHost();
+    syncTop();
+    syncPeople();
   });
-  return wrap;
+
+  setDrawer(drawerOpen);
+  syncTop();
+  syncHost();
+  syncOnline();
+  syncPeople();
+
+  return () => {
+    disposed = true;
+    document.removeEventListener("keydown", onKey);
+    offStore();
+    try { offPres(); } catch (_) {}
+    closePop();
+    if (host) { try { host.destroy(); } catch (e) { console.warn(e); } host = null; }
+    try { unsub(); } catch (_) {}
+    try { ch.leave(); } catch (_) {}
+  };
 }
 
-function groupProgress(session, slide) {
-  const wrap = el("div", {});
-  wrap.appendChild(el("button", {
-    class: "btn btn-tiny",
-    onClick: () => groupBuilderModal(session),
-    style: { marginBottom: "8px" },
-  }, "모둠 편성"));
-  if (!session.groups.length) {
-    wrap.appendChild(el("p", { class: "muted" }, "아직 모둠이 없습니다."));
-    return wrap;
+// ───────────────────────── 기록 상세 /teacher/session/:id ─────────────────────────
+// summary용 ctx (읽기 전용 — 쓰기 함수는 no-op)
+function recordCtx(session, teacher, slide, timers, extra = {}) {
+  const sess = () => findSession(session.id) || session;
+  return {
+    role: "teacher", isTeacher: true, me: teacher, slide, lesson: null,
+    session: sess,
+    students: studentsMap,
+    participants: () => (sess().participants || []).slice(),
+    online: () => new Set(),
+    activity: () => ((sess().activity || {})[slide.id]) || { phase: "idle" },
+    setActivity() {},
+    responses: () => ((sess().responses || {})[slide.id]) || [],
+    myResponse: () => null,
+    submit: async () => null,
+    removeResponse: async () => {},
+    clearResponses: async () => {},
+    send() {},
+    on: () => () => {},
+    groups: () => sess().groups || [],
+    myGroup: () => null,
+    toast,
+    confirm: (msg, { ok = "확인", danger = false } = {}) => confirmDialog({ title: msg, ok, danger }),
+    modal,
+    injectCss,
+    timeout(fn, ms) { const t = setTimeout(() => { timers.delete(t); fn(); }, ms); timers.set(t, "t"); return t; },
+    interval(fn, ms) { const t = setInterval(fn, ms); timers.set(t, "i"); return t; },
+    clearTimer(t) { if (timers.get(t) === "i") clearInterval(t); else clearTimeout(t); timers.delete(t); },
+    ...extra,
+  };
+}
+
+function summaryEl(session, slide, responses, ctx) {
+  const def = getSlideType(slide.type);
+  if (typeof def.summary !== "function") return el("div", { class: "t-sum-thumb" }, el("div", { class: "t-thumb" }, thumbOf(slide)));
+  try {
+    const n = def.summary(slide, responses, session, ctx);
+    if (n instanceof Node) return n;
+  } catch (e) {
+    console.warn("[detail] summary 실패", slide.type, e);
+    return el("div", { class: "muted" }, "이 슬라이드를 불러오지 못했어요");
   }
-  const gal = el("div", { class: "gallery" });
-  session.groups.forEach(g => {
-    const tile = el("div", { class: "tile" });
-    tile.appendChild(el("div", { class: "name" }, [
-      el("span", {}, g.name + ` (${g.memberIds.length})`),
-    ]));
-    const prev = el("div", { class: "preview" });
-    if (slide.bg) prev.appendChild(el("img", { src: slide.bg }));
-    const cv = el("canvas", {});
-    prev.appendChild(cv);
-    tile.appendChild(prev);
-    gal.appendChild(tile);
-    queueMicrotask(() => paintMini(cv, session, slide.id, "group", g.id));
-    tile.onclick = () => openGroupView(session, slide, g.id);
-  });
-  wrap.appendChild(gal);
-  return wrap;
+  return el("div", { class: "muted" }, "기록이 없어요");
 }
 
-function openGroupView(session, slide, gid) {
-  const g = session.groups.find(x => x.id === gid);
-  const body = el("div", {});
-  const stage = el("div", { class: "canvas-stage", style: { padding: 0, height: "60vh" } });
-  body.appendChild(stage);
-  modal({
-    title: `${g ? g.name : "모둠"} · ${session.title}`,
-    body,
-    actions: [{ label: "닫기", primary: true, onClick: (close) => close() }],
-  });
-  setTimeout(() => {
-    renderSlide({ root: stage, slide, session, scope: "group", scopeId: gid, readOnly: true });
-  }, 30);
-}
-
-function paintMini(canvas, session, slideId, scope, scopeId) {
-  const r = canvas.parentElement.getBoundingClientRect();
-  canvas.width = r.width * (window.devicePixelRatio||1);
-  canvas.height = r.height * (window.devicePixelRatio||1);
-  const ctx = canvas.getContext("2d");
-  ctx.clearRect(0,0,canvas.width,canvas.height);
-  const path = scope === "individual"
-    ? session.records?.[scopeId]?.[slideId]
-    : session.records?.__groups?.[scopeId]?.[slideId];
-  if (!path) return;
-  for (const s of path.strokes || []) {
-    ctx.save();
-    ctx.globalAlpha = s.tool === "highlight" ? .32 : 1;
-    ctx.lineCap = "round"; ctx.lineJoin = "round";
-    ctx.strokeStyle = s.color || "#1a1a1a";
-    ctx.lineWidth = (s.size||2);
-    ctx.beginPath();
-    s.points.forEach((p, i) => {
-      const x = p.x * canvas.width, y = p.y * canvas.height;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    });
-    ctx.stroke();
-    ctx.restore();
-  }
-}
-
-function openLearnerView(session, slide, sid) {
-  const stu = store.state.students.find(x => x.id === sid);
-  const body = el("div", {});
-  const stage = el("div", { class: "canvas-stage", style: { padding: 0, height: "60vh" } });
-  body.appendChild(stage);
-  modal({
-    title: `${studentLabel(stu)} · ${session.title}`,
-    body,
-    actions: [{ label: "닫기", primary: true, onClick: (close) => close() }],
-  });
-  setTimeout(() => {
-    renderSlide({ root: stage, slide, session, scope: "individual", scopeId: sid, readOnly: true });
-  }, 30);
-}
-
-function groupBuilderModal(session) {
-  const body = el("div", {});
-  const top = el("div", { class: "row-flex" }, [
-    el("button", { class: "btn btn-tiny", onClick: () => addGroup() }, "+ 모둠 추가"),
-    el("button", { class: "btn btn-tiny", onClick: () => randomize() }, "랜덤 배정"),
-    el("input", { id: "ng", type: "number", min: "2", max: "10", value: "4", placeholder: "모둠 수", style: { width: "70px" } }),
-  ]);
-  body.appendChild(top);
-  const pool = el("div", { class: "group-builder" });
-  body.appendChild(pool);
-
-  function render() {
-    pool.innerHTML = "";
-    // Unassigned
-    const assigned = new Set(session.groups.flatMap(g => g.memberIds));
-    const unassigned = session.participants.filter(p => !assigned.has(p));
-    const un = el("div", { class: "group", style: { background: "#fff", border: "1px dashed var(--line)" } }, [
-      el("div", { class: "gname" }, "미배정"),
-      ...buildChips(unassigned, null),
-    ]);
-    pool.appendChild(un);
-    session.groups.forEach(g => {
-      const gd = el("div", { class: "group" }, [
-        el("div", { class: "gname" }, [
-          el("span", {}, g.name),
-          el("button", { class: "btn-link", onClick: () => { session.groups = session.groups.filter(x => x.id !== g.id); store.set(s => s); render(); } }, "삭제"),
-        ]),
-        ...buildChips(g.memberIds, g.id),
-      ]);
-      pool.appendChild(gd);
-    });
-  }
-  function buildChips(ids, gid) {
-    const wrap = el("div", { class: "chips" });
-    ids.forEach(id => {
-      const stu = store.state.students.find(x => x.id === id);
-      const chip = el("div", { class: "chip", draggable: "true" }, [stu?.name || id, el("span", { class: "x", onClick: () => { moveTo(id, null); } }, "×")]);
-      chip.ondragstart = (e) => { e.dataTransfer.setData("text/plain", JSON.stringify({ id, from: gid })); };
-      wrap.appendChild(chip);
-    });
-    wrap.ondragover = (e) => e.preventDefault();
-    wrap.ondrop = (e) => {
-      e.preventDefault();
-      const { id, from } = JSON.parse(e.dataTransfer.getData("text/plain"));
-      moveTo(id, gid);
-    };
-    return [wrap];
-  }
-  function moveTo(studentId, groupId) {
-    session.groups.forEach(g => g.memberIds = g.memberIds.filter(x => x !== studentId));
-    if (groupId) {
-      const g = session.groups.find(x => x.id === groupId);
-      if (g) g.memberIds.push(studentId);
-    }
-    store.set(s => s); render();
-  }
-  function addGroup() {
-    const n = session.groups.length + 1;
-    session.groups.push({ id: store.newId("g"), name: `${n}모둠`, memberIds: [] });
-    store.set(s => s); render();
-  }
-  function randomize() {
-    const n = parseInt(body.querySelector("#ng").value || "4");
-    session.groups = Array.from({ length: n }, (_, i) => ({ id: store.newId("g"), name: `${i+1}모둠`, memberIds: [] }));
-    const ids = [...session.participants];
-    for (let i = ids.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [ids[i], ids[j]] = [ids[j], ids[i]]; }
-    ids.forEach((id, i) => session.groups[i % n].memberIds.push(id));
-    store.set(s => s); render();
-  }
-  render();
-  modal({
-    title: "모둠 편성",
-    body,
-    actions: [{ label: "완료", primary: true, onClick: (close) => close() }],
-  });
-}
-
-function completeSession(session, status) {
-  if (!confirm(status === "completed" ? "수업을 완료하고 세션으로 저장할까요?" : "수업을 중지할까요?")) return;
-  session.status = status;
-  session.endedAt = Date.now();
-  store.set(s => s);
-  cloudUpsertSession(session).catch(() => {});
-  sync.emit({ type: "session-end" });
-}
-
-/* ── Sessions archive ────────────────────────────────── */
-
-function viewSessions(teacher) {
-  const wrap = el("div", {});
-  wrap.appendChild(el("div", { class: "main-header" }, [el("h1", {}, "수업 세션")]));
-  const all = store.state.sessions.filter(s => s.teacherId === teacher.id).sort((a,b) => (b.startedAt - a.startedAt));
-  const stopped = all.filter(s => s.status === "stopped");
-  const completed = all.filter(s => s.status === "completed");
-
-  if (!stopped.length && !completed.length) {
-    wrap.appendChild(el("div", { class: "empty-state" }, [el("h4", {}, "아직 수업 세션이 없습니다"), "수업이 끝나면 자동으로 보관됩니다."]));
-    return wrap;
-  }
-
-  if (stopped.length) {
-    wrap.appendChild(el("div", { class: "session-section" }, [
-      el("h2", {}, `이어서 진행할 수업 (${stopped.length})`),
-      buildSessionList(stopped, teacher, true),
-    ]));
-  }
-  if (completed.length) {
-    wrap.appendChild(el("div", { class: "session-section" }, [
-      el("h2", {}, `완료된 수업 (${completed.length})`),
-      buildSessionList(completed, teacher, false),
-    ]));
-  }
-  return wrap;
-}
-
-function buildSessionList(sessions, teacher, canResume) {
-  const list = el("div", { class: "record-list" });
-  sessions.forEach(s => {
-    const row = el("div", { class: "record-row" }, [
-      el("div", { style: { flex: 1, cursor: "pointer" }, onClick: () => openSessionDetail(s) }, [
-        el("div", { style: { fontWeight: 600 } }, s.title),
-        el("div", { class: "meta" }, `${fmtDate(s.startedAt)} · 참여 ${s.participants.length}명 · 슬라이드 ${(s.currentSlide ?? 0) + 1}/${s.slidesSnapshot.length}`),
-      ]),
-      el("div", { class: "row-flex", style: { gap: "6px" } }, [
-        el("span", { class: `tag ${s.status}` }, ({ completed: "완료", stopped: "중지" })[s.status]),
-        canResume ? el("button", { class: "btn btn-tiny btn-primary", onClick: (e) => { e.stopPropagation(); restartSession(s); } }, "이어서 시작") : null,
-        el("button", { class: "btn btn-tiny btn-danger", onClick: (e) => { e.stopPropagation(); deleteSession(s.id); } }, "삭제"),
-      ].filter(Boolean)),
-    ]);
-    list.appendChild(row);
-  });
-  return list;
-}
-
-function restartSession(session) {
-  if (!confirm(`"${session.title}" 수업을 ${session.currentSlide + 1}번 슬라이드부터 이어서 진행할까요?`)) return;
-  store.set(s => {
-    // 다른 LIVE 세션은 자동으로 중지 처리
-    s.sessions.forEach(ss => {
-      if (ss.teacherId === session.teacherId && ss.status === "live" && ss.id !== session.id) {
-        ss.status = "stopped";
-        ss.endedAt = Date.now();
-      }
-    });
-    const target = s.sessions.find(x => x.id === session.id);
-    if (target) {
-      target.status = "live";
-      target.endedAt = null;
-    }
-  });
-  // Cloud sync
-  store.state.sessions.filter(ss => ss.teacherId === session.teacherId).forEach(ss => {
-    cloudUpsertSession(ss).catch(() => {});
-  });
-  sync.emit({ type: "session-restart" });
-  go("/teacher/live");
-}
-
-function deleteSession(sessionId) {
-  if (!confirm("이 세션과 모든 학생 기록을 영구 삭제할까요?")) return;
-  store.set(s => { s.sessions = s.sessions.filter(x => x.id !== sessionId); });
-  sync.emit({ type: "session-deleted" });
-}
-
-function openSessionDetail(session) {
-  const body = el("div", {});
-  const head = el("div", { class: "row-flex", style: { marginBottom: "10px" } }, [
-    el("span", { class: "muted" }, `${fmtDate(session.startedAt)} ~ ${fmtDate(session.endedAt)}`),
-    el("span", { class: "spacer" }),
-    el("button", { class: "btn btn-tiny", onClick: () => printRecords(session, [...selected]) }, "선택 출력"),
-    el("button", { class: "btn btn-tiny btn-primary", onClick: () => printRecords(session, session.participants) }, "전체 출력"),
-  ]);
-  body.appendChild(head);
-  const list = el("div", { class: "record-list" });
-  const selected = new Set();
-  session.participants.forEach(sid => {
-    const stu = store.state.students.find(x => x.id === sid);
-    const row = el("label", { class: "record-row" }, [
-      el("div", { class: "row-flex" }, [
-        el("input", { type: "checkbox", onChange: (e) => { e.target.checked ? selected.add(sid) : selected.delete(sid); } }),
-        el("div", {}, [
-          el("div", { style: { fontWeight: 600 } }, studentLabel(stu)),
-          el("div", { class: "meta" }, `슬라이드 ${session.slidesSnapshot.length}장 기록`),
-        ]),
-      ]),
-      el("button", { class: "btn btn-tiny", onClick: (e) => { e.preventDefault(); openStudentSession(session, sid); } }, "기록 보기"),
-    ]);
-    list.appendChild(row);
-  });
-  body.appendChild(list);
-  modal({ title: session.title, body, actions: [{ label: "닫기", primary: true, onClick: (close) => close() }] });
-}
-
-function openStudentSession(session, sid) {
-  const stu = store.state.students.find(x => x.id === sid);
-  const body = el("div", {});
-  session.slidesSnapshot.forEach((slide, i) => {
-    body.appendChild(el("h4", {}, `슬라이드 ${i+1} · ${modeLabel(slide.mode)}`));
-    const stage = el("div", { class: "canvas-stage", style: { padding: 0, minHeight: "300px", marginBottom: "12px" } });
-    body.appendChild(stage);
-    const scope = slide.mode === "individual" ? "individual" :
-                  slide.mode === "group" ? "group" :
-                  slide.mode === "whole" ? "whole" : "ppt";
-    let scopeId = sid;
-    if (scope === "group") {
-      const g = session.groups.find(g => g.memberIds.includes(sid));
-      scopeId = g?.id;
-    }
-    setTimeout(() => renderSlide({ root: stage, slide, session, scope, scopeId, readOnly: true }), 30);
-  });
-  modal({
-    title: `${studentLabel(stu)} · ${session.title}`,
-    body,
-    actions: [{ label: "닫기", primary: true, onClick: (close) => close() }],
-  });
-}
-
-function printRecords(session, sids) {
-  if (!sids.length) { alert("출력할 학생을 선택하세요."); return; }
-  const w = window.open("", "_blank");
-  w.document.write(`<!doctype html><html><head><title>${session.title} 기록</title>
-    <link rel="stylesheet" href="${location.origin}${location.pathname.replace(/[^/]*$/, "")}styles.css"></head><body>`);
-  sids.forEach(sid => {
-    const stu = store.state.students.find(x => x.id === sid);
-    w.document.write(`<div class="print-slide"><h2>${session.title}</h2><h3>${studentLabel(stu)}</h3>`);
-    session.slidesSnapshot.forEach((slide, i) => {
-      const path = slide.mode === "individual" ? session.records?.[sid]?.[slide.id]
-                  : slide.mode === "group" ? session.records?.__groups?.[(session.groups.find(g => g.memberIds.includes(sid))||{}).id]?.[slide.id]
-                  : session.records?.__whole?.[slide.id];
-      w.document.write(`<div style="margin-bottom:24px"><h4>슬라이드 ${i+1}</h4>`);
-      if (slide.bg) w.document.write(`<img src="${slide.bg}" style="max-width:100%;border:1px solid #ccc"/>`);
-      if (path?.texts?.length) {
-        w.document.write(`<p><b>입력:</b> ${path.texts.map(t => t.value).join(" / ")}</p>`);
-      }
-      w.document.write(`</div>`);
-    });
-    w.document.write(`</div>`);
-  });
-  w.document.write("</body></html>");
-  w.document.close();
-  setTimeout(() => w.print(), 600);
-}
-
-/* ── Students archive ────────────────────────────────── */
-
-function viewStudents(teacher) {
-  const wrap = el("div", {});
-  wrap.appendChild(el("div", { class: "main-header" }, [el("h1", {}, "학생 명단")]));
-  const all = store.state.students;
-  if (!all.length) {
-    wrap.appendChild(el("div", { class: "empty-state" }, [el("h4", {}, "등록된 학생이 없습니다"), "학생이 수업에 입장하면 자동으로 추가됩니다."]));
-    return wrap;
-  }
-  const tbl = el("table", { class: "table" });
-  tbl.innerHTML = `<thead><tr><th>학생</th><th>참여 세션</th><th></th></tr></thead>`;
-  const tb = el("tbody");
-  all.forEach(stu => {
-    const sessions = store.state.sessions.filter(s => s.teacherId === teacher.id && s.participants.includes(stu.id));
-    const tr = el("tr", { onClick: () => openStudentArchive(stu, teacher) }, []);
-    tr.innerHTML = `<td><b>${studentLabel(stu)}</b></td><td>${sessions.length}회</td><td style="text-align:right"><span class="muted">기록 보기 →</span></td>`;
-    tb.appendChild(tr);
-  });
-  tbl.appendChild(tb);
-  wrap.appendChild(tbl);
-  return wrap;
-}
-
-function openStudentArchive(stu, teacher) {
-  const sessions = store.state.sessions.filter(s => s.teacherId === teacher.id && s.participants.includes(stu.id));
-  const body = el("div", {});
-  if (!sessions.length) body.appendChild(el("p", { class: "muted" }, "참여한 세션이 없습니다."));
-  sessions.forEach(s => {
-    const row = el("div", { class: "record-row", onClick: () => openStudentSession(s, stu.id) }, [
-      el("div", {}, [el("div", { style: { fontWeight: 600 } }, s.title), el("div", { class: "meta" }, fmtDate(s.startedAt))]),
-      el("span", { class: `tag ${s.status}` }, ({ completed: "완료", stopped: "중지", live: "LIVE" })[s.status]),
-    ]);
-    body.appendChild(row);
-  });
-  modal({ title: studentLabel(stu), body, actions: [{ label: "닫기", primary: true, onClick: close => close() }] });
-}
-
-/* ── QR ─────────────────────────────────────────────── */
-
-function viewQR(teacher) {
-  const wrap = el("div", {});
-  wrap.appendChild(el("div", { class: "main-header" }, [el("h1", {}, "수업 접속 QR")]));
-
-  // 교사 고유 코드가 없으면 발급(레거시 보호)
-  if (!teacher.joinCode) {
-    store.set(s => { const t = s.teachers.find(x => x.id === teacher.id); if (t && !t.joinCode) t.joinCode = store.newJoinCode(); });
-    teacher = store.state.teachers.find(x => x.id === teacher.id);
-  }
-
-  const live = store.state.sessions.find(s => s.teacherId === teacher.id && s.status === "live");
-  const url = `${location.origin}${location.pathname}#/student/join?c=${encodeURIComponent(teacher.joinCode || "")}`;
-  const statusLine = live
-    ? `${teacher.name} 선생님 · 진행 중: ${live.title}`
-    : `${teacher.name} 선생님 · 진행 중인 수업 없음 (코드는 항상 유효)`;
-  const card = el("div", { class: "qr-card" }, [
-    el("div", { style: { fontSize: "13px", color: "var(--muted)" } }, statusLine),
-    el("div", { class: "code-display" }, teacher.joinCode || "—"),
-    el("div", { class: "muted", style: { fontSize: "12px" } }, "학생들이 이 코드를 입력하거나 QR을 스캔하면, 현재 진행 중인 수업에 자동 입장합니다."),
-    el("canvas", { id: "qr" }),
-    el("div", { class: "url" }, url),
-    el("div", { class: "row-flex", style: { gap: "6px" } }, [
-      el("button", { class: "btn btn-tiny", onClick: () => { navigator.clipboard.writeText(teacher.joinCode || ""); alert("수업 코드를 복사했어요."); } }, "코드 복사"),
-      el("button", { class: "btn btn-tiny", onClick: () => { navigator.clipboard.writeText(url); alert("접속 URL을 복사했어요."); } }, "URL 복사"),
+function slideSection(slide, i, body) {
+  const def = getSlideType(slide.type);
+  return el("section", { class: "card print-slide" }, [
+    el("div", { class: "t-sum-head" }, [
+      el("span", { class: "t-sum-num" }, String(i + 1)),
+      el("h3", {}, slideLabel(slide)),
+      el("span", { class: "pill pill-muted" }, def.label),
     ]),
+    body,
   ]);
-  wrap.appendChild(card);
-  setTimeout(() => {
-    if (window.QRCode) QRCode.toCanvas(card.querySelector("#qr"), url, { width: 260, margin: 1, color: { dark: "#1a1a1a", light: "#ffffff" } });
-  }, 30);
-  return wrap;
+}
+
+export function sessionDetailView({ id } = {}) {
+  return withTeacher((teacher) => {
+    viewGuard();
+    let disposed = false;
+    let mode = "slides";
+    let picked = null;
+    let frames = [];
+    const timers = new Map();
+    const shell = mountShell(teacher, "records", (t) => go(t === "lessons" ? "/teacher" : "/teacher?tab=" + t));
+    const updBanner = bindBanner(shell.banner, teacher);
+    const offStore = store.subscribe(() => { if (!disposed) updBanner(); });
+    const box = shell.content;
+    const content = el("div", { class: "stack-lg" });
+    const backBtn = () => el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "수업 기록", onClick: () => go("/teacher?tab=records") }, icon("arrow-left"));
+    box.replaceChildren(el("div", { class: "empty" }, "불러오는 중…"));
+
+    function clearFrames() {
+      frames.forEach(v => { try { v.destroy(); } catch (_) {} });
+      frames = [];
+      for (const [t, k] of timers) { if (k === "i") clearInterval(t); else clearTimeout(t); }
+      timers.clear();
+    }
+    function participantsOf(s) {
+      const responders = Object.values(s.responses || {}).flat().map(r => r && r.studentId).filter(Boolean);
+      return [...new Set([...(s.participants || []), ...responders])]
+        .map(sid => ({ id: sid, st: findStudent(sid) }))
+        .sort((a, b) => cmpStudent(a.st, b.st));
+    }
+    function abtn(label, { cls = "btn", ic, onClick, title } = {}) {
+      const b = el("button", { class: cls, type: "button", title: title || null }, [ic ? icon(ic, 18) : null, label]);
+      b.addEventListener("click", async () => {
+        if (b.classList.contains("loading")) return;
+        b.classList.add("loading");
+        try { await onClick(); } finally { if (b.isConnected) b.classList.remove("loading"); }
+      });
+      return b;
+    }
+
+    async function resume() {
+      const s = findSession(id);
+      if (!s) return;
+      let r;
+      try { r = await cloudResumeSession(s); } catch (e) { r = { error: "다시 시작하지 못했어요" }; }
+      if (!r || r.error) { toast((r && r.error) || "다시 시작하지 못했어요", { type: "error" }); return; }
+      if (!disposed) go("/live/" + id);
+    }
+    async function remove() {
+      const cur = findSession(id);
+      const ok = await confirmDialog({
+        title: "이 기록을 삭제할까요?", body: cur && cur.status === "live" ? "진행 중인 수업도 함께 끝나요" : undefined,
+        ok: "삭제", danger: true,
+      });
+      if (!ok || disposed) return;
+      let r;
+      try {
+        // LIVE면 먼저 종료(학생 화면이 sessions 행 변경으로 '수업이 끝났어요' 처리) 후 삭제
+        const live = findSession(id);
+        if (live && live.status === "live") await cloudEndSession(live, "stopped");
+        r = await cloudDeleteSession(id);
+      } catch (e) { r = { error: "삭제하지 못했어요" }; }
+      if (r && r.error) { toast(r.error, { type: "error" }); return; }
+      toast("삭제했어요");
+      if (!disposed) go("/teacher?tab=records", { replace: true });
+    }
+
+    function render() {
+      const s = findSession(id);
+      if (!s || disposed) return;
+      const slides = s.slidesSnapshot || [];
+      const parts = participantsOf(s);
+      const head = el("div", { class: "page-head" }, [
+        backBtn(),
+        el("h1", {}, s.title || "수업"),
+        el("div", { class: "actions" }, [
+          s.status === "live"
+            ? el("button", { class: "btn btn-primary", type: "button", onClick: () => go("/live/" + id) }, "돌아가기")
+            : abtn("이어서", { cls: "btn btn-primary", ic: "play", onClick: resume }),
+          el("button", { class: "btn", type: "button", onClick: () => window.print() }, [icon("print", 18), "인쇄"]),
+          abtn("삭제", { cls: "btn btn-danger", ic: "trash", onClick: remove }),
+        ]),
+      ]);
+      const meta = el("div", { class: "t-meta" }, [
+        statusPill(s.status),
+        el("span", {}, dateRange(s)),
+        el("span", {}, `참여 ${parts.length}명`),
+        el("span", {}, `슬라이드 ${slides.length}장`),
+      ]);
+      const segBtn = (m, label) => el("button", {
+        type: "button", class: mode === m ? "active" : null, "aria-pressed": String(mode === m),
+        onClick: (e) => {
+          if (mode === m) return;
+          mode = m;
+          e.currentTarget.parentNode.querySelectorAll("button").forEach(b => {
+            const on = b === e.currentTarget;
+            b.classList.toggle("active", on);
+            b.setAttribute("aria-pressed", String(on));
+          });
+          renderContent();
+        },
+      }, label);
+      const seg = el("div", { class: "seg", role: "group" }, [segBtn("slides", "슬라이드별"), segBtn("students", "학생별")]);
+      box.replaceChildren(head, meta, el("div", { class: "t-detail-bar" }, seg), content);
+      renderContent();
+    }
+
+    function renderContent() {
+      clearFrames();
+      const s = findSession(id);
+      if (!s) return;
+      const slides = s.slidesSnapshot || [];
+      if (!slides.length) { content.replaceChildren(el("div", { class: "empty empty-box" }, "슬라이드가 없어요")); return; }
+      if (mode === "slides") {
+        content.replaceChildren(...slides.map((sl, i) => slideSection(sl, i,
+          summaryEl(s, sl, (s.responses || {})[sl.id] || [], recordCtx(s, teacher, sl, timers)))));
+        return;
+      }
+      // 학생별
+      const parts = participantsOf(s);
+      if (!parts.length) { content.replaceChildren(el("div", { class: "empty empty-box" }, "아직 아무도 없어요")); return; }
+      if (!picked || !parts.some(p => p.id === picked)) picked = parts[0].id;
+      const chips = el("div", { class: "chips no-print" }, parts.map(p => el("button", {
+        class: "chip" + (p.id === picked ? " active" : ""), type: "button",
+        onClick: () => { if (picked !== p.id) { picked = p.id; renderContent(); } },
+      }, p.st ? studentLabel(p.st) : "학생")));
+      const st = findStudent(picked);
+      const sections = slides.map((sl, i) => {
+        let body;
+        if (sl.type === "ink") body = inkFor(s, sl, picked);
+        else {
+          const rs = ((s.responses || {})[sl.id] || []).filter(r => r.studentId === picked);
+          // 가정: 학생별 보기는 학생 '내 기록'과 같은 계약(isTeacher:false, me=그 학생, 그 학생 응답만) → race 등은 개인 결과만 표시
+          body = summaryEl(s, sl, rs, recordCtx(s, teacher, sl, timers, {
+            isTeacher: false, me: st || { id: picked }, studentId: picked,
+            responses: () => rs,
+            myResponse: (itemKey = "") => rs.find(r => (r.itemKey || "") === (itemKey || "")) || null,
+            myGroup: () => (s.groups || []).find(g => (g.memberIds || []).includes(picked)) || null,
+          }));
+        }
+        return slideSection(sl, i, body);
+      });
+      content.replaceChildren(chips, el("h2", { class: "t-print-only" }, st ? studentLabel(st) : "학생"), ...sections);
+    }
+
+    // 학생 한 명의 필기(읽기 전용)
+    function inkFor(s, slide, studentId) {
+      const R = s.records || {};
+      const has = (rec) => !!rec && (((rec.strokes || []).length) || ((rec.texts || []).length));
+      const g = (s.groups || []).find(x => (x.memberIds || []).includes(studentId));
+      const ind = { scope: "individual", scopeId: studentId, rec: (R[studentId] || {})[slide.id] };
+      const grp = g ? { scope: "group", scopeId: g.id, rec: ((R.__groups || {})[g.id] || {})[slide.id] } : null;
+      const whole = { scope: "whole", scopeId: s.id, rec: (R.__whole || {})[slide.id] };
+      const m = effectiveMode(slide, s);
+      const order = (m === "individual" ? [ind, grp, whole] : m === "group" ? [grp, ind, whole] : [whole, ind, grp]).filter(Boolean);
+      const pick = order.find(c => has(c.rec)) || order[0];
+      const frame = el("div", { class: "t-mini" });
+      try {
+        const v = renderSlide({ root: frame, slide, session: s, scope: pick.scope, scopeId: pick.scopeId, readOnly: true });
+        if (v) frames.push(v);
+      } catch (e) {
+        console.warn("[detail] 필기 표시 실패", e);
+        frame.replaceChildren(el("div", { class: "muted" }, "이 슬라이드를 불러오지 못했어요"));
+      }
+      return frame;
+    }
+
+    (async () => {
+      let s = null;
+      try { s = await cloudFetchSession(id); } catch (e) { console.warn("[detail] fetch", e); }
+      if (disposed) return;
+      if (!s) {
+        box.replaceChildren(
+          el("div", { class: "page-head" }, [backBtn(), el("h1", {}, "수업 기록")]),
+          el("div", { class: "empty empty-box" }, "기록을 찾지 못했어요"),
+        );
+        return;
+      }
+      render();
+    })();
+
+    return () => {
+      disposed = true;
+      offStore();
+      closePop();
+      clearFrames();
+    };
+  });
 }

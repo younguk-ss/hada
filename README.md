@@ -1,86 +1,62 @@
-# (수업)하다 · hada v1.0
+# (수업)하다 · hada v2
 
-<!-- deploy pipeline test: 2026-05-18 -->
+학생과 필기를 공유하고 소통하며 함께 수업하는 실시간 인터랙티브 수업 웹앱 (Lumio·Nearpod 방식).
 
-미니멀하고 감각적인 인터랙티브 에듀테크. 굿노트급 잉크 + 루미오/니어팟/클래스킥의 라이브 수업.
+- 교사마다 **고정 6자리 코드** — 학생은 코드만 입력하면 진행 중인 수업으로 바로 들어가고, 수업 전이면 기다렸다가 자동 입장
+- 교사는 수업 자료에서 **시작**만 누르면 됨
+- 필기 슬라이드: 발표 · 전체 · 개별 · 모둠 모드를 수업 중 1탭 전환, 개별/모둠 실시간 갤러리
+- 상호작용: 객관식, 주관식·서술형, 빈칸 채우기, 워드클라우드, 분류하기(드래그앤드롭), 담벼락
+- 미디어: 웹 링크, 임베드, 동영상(YouTube·mp4), 동영상 퀴즈(시점별 문제)
+- 게임: 공룡 점프(정확도+시간 순위), 레이싱 퀴즈(최대 4명 랜덤 조, 정답 부스터·오답 미끄러짐, 2바퀴, 조별 랩타임)
+- 수업 기록: 슬라이드별/학생별, 인쇄
 
-## 기능 요약
-
-- 교사 대시보드 — 수업 자료(PPT/PDF/이미지/Google Slides) 만들기·편집, 라이브 수업, 세션 아카이브, 학생별 기록, QR 접속
-- 학생 대시보드 — 라이브 수업 참여, 본인 기록 확인
-- 4모드 — PPT(시청만), 전체(루미오 whole-class), 개별(개인 학습지), 그룹(모둠)
-- 2흐름 — 교사 흐름 / 학생 흐름(수업 중 토글 가능)
-- 진행 상황 갤러리 — 클래스킥 스타일 실시간 썸네일
-- 그룹 — 랜덤 배정 + 드래그앤드롭, 실시간 수정/삭제/추가
-- 굿노트급 잉크 — Pointer Events + 압력감지 + 베지어 스무딩
-- QR — 교사 1인 1QR, 스캔 즉시 진행 중인 수업으로 합류
-- 인쇄 — 세션 학생 기록 전체/선택 출력
+설계 문서: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## 로컬 실행
+
 ```bash
-python3 -m http.server 5173
-# → http://localhost:5173
+python3 tools/devserver.py 5173
 ```
-환경변수 미설정 상태에서는 단일 브라우저(BroadcastChannel + localStorage)로 작동하는 데모 모드입니다.
 
-## 배포 (무료 스택)
+http://localhost:5173 — 캐시를 끈 정적 서버입니다(ES 모듈이 옛 버전으로 남지 않게). `env.js`에 Supabase 키가 없으면 단일 브라우저 데모 모드로 동작합니다.
 
-**선정**: Supabase(DB/Realtime/Storage) + Vercel(정적 호스팅)
-- Supabase 무료: 500MB DB, 1GB Storage, Realtime 200 동접, 50K MAU
-- Vercel 무료: 100GB 대역폭/월, 무제한 정적 배포
+## Supabase 셋업 (새 프로젝트)
 
-### 1) Supabase 셋업
-1. https://supabase.com → New project (DB password 기록)
-2. SQL Editor → `db/schema.sql` 전체 붙여넣기 → Run
-3. Storage → New bucket: `slides` (public)
-4. Project Settings → API → `Project URL`, `anon public` key 복사
+1. https://supabase.com → New project
+2. SQL Editor에서 순서대로 실행: `db/migrations/001_v1.sql` → `002_v2.sql` → `003_v21.sql`
+   - ⚠️ `001_v1.sql`은 `drop table`을 포함하므로 **새 프로젝트에서만** 실행하세요. 기존 프로젝트는 002, 003만.
+   - 002가 Storage 버킷 `slides`(public)와 정책까지 만듭니다.
+3. Project Settings → API → Project URL, publishable key를 `env.js`에 넣기:
 
-### 2) 클라이언트에 키 주입
-`env.js` 편집:
 ```js
 window.HADA_SUPABASE_URL = "https://xxx.supabase.co";
-window.HADA_SUPABASE_ANON = "eyJ...";
+window.HADA_SUPABASE_ANON = "sb_publishable_...";
 ```
-이 값이 채워지면 자동으로 클라우드 모드로 전환, 다중 디바이스 실시간 동기화.
 
-### 3) Vercel 배포
+예전(v1) 방식으로 저장된 슬라이드 이미지(base64)는 교사가 그 수업 자료를 처음 열 때 자동으로 Storage로 옮겨집니다.
+
+## 배포
+
+`main`에 push하면 Vercel이 자동 배포합니다(Vercel ↔ GitHub 연결). 수동 배포:
+
 ```bash
-npx vercel --yes        # 처음이면 로그인 안내 → 이후 자동 배포
-# 또는
 npx vercel deploy --prod --yes
 ```
-대안: 폴더를 https://app.netlify.com/drop 에 드래그하면 즉시 배포.
-또는 Cloudflare Pages: `npx wrangler pages deploy . --project-name hada`
-
-## 무료 DB 플랫폼 비교
-
-| 플랫폼 | DB | 실시간 | 저장소 | 적합도 |
-|---|---|---|---|---|
-| **Supabase** ★ | Postgres 500MB | Broadcast/Presence/CDC | 1GB | ★★★★★ |
-| Firebase Spark | Firestore 1GB | 자체 | 1GB | ★★★★ |
-| Neon | Postgres 0.5GB | 없음 | — | ★★ |
-| PlanetScale | MySQL 5GB | 없음 | — | ★★ |
-| Cloudflare D1+DO | SQLite 5GB | Durable Objects | R2 별도 | ★★★★ |
-
-선정 사유: 관계형 세션 모델 + 실시간 필기 + 슬라이드 이미지 저장이 한 플랫폼에서 해결되며 무료 한도가 학교 단위 사용에 충분.
 
 ## 디렉터리
+
 ```
-.
-├─ index.html            앱 셸 + 템플릿
-├─ env.js                Supabase 키 (편집)
-├─ styles.css            디자인
-├─ js/
-│   ├─ app.js            라우터 + 부트
-│   ├─ store.js          반응형 스토어 + localStorage
-│   ├─ sync.js           BroadcastChannel 동기화 (로컬 모드)
-│   ├─ cloud.js          Supabase 어댑터 (클라우드 모드)
-│   ├─ canvas.js         압력감지 잉크 캔버스
-│   ├─ lesson-view.js    슬라이드 프레임 (배경/잉크/텍스트)
-│   ├─ teacher.js        교사 대시보드
-│   ├─ student.js        학생 대시보드
-│   ├─ router.js, ui.js  유틸
-├─ db/schema.sql         Supabase 스키마
-├─ vercel.json           Vercel 설정
-└─ package.json
+index.html, styles.css, env.js
+js/
+  app.js            라우트·부트·로그인
+  router.js, ui.js  라우터, UI 헬퍼(toast·dialog·sheet·icon)
+  store.js, sync.js 상태(슬림 영속), 로컬 모드 탭 동기화
+  cloud.js          Supabase 어댑터(증분 구독, rev, 병합)
+  storage.js        슬라이드 이미지 업로드·썸네일·PDF 변환
+  realtime.js       세션 채널(broadcast·presence)
+  canvas.js, lesson-view.js   필기 캔버스·슬라이드 프레임
+  teacher.js, student.js      교사·학생 화면
+  slides/           슬라이드 타입 플러그인(registry·host·common + 13개 타입)
+db/migrations/      SQL 마이그레이션
+tools/devserver.py  로컬 개발 서버
 ```

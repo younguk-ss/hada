@@ -3,26 +3,32 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#f7f6f2" />
+  <meta name="color-scheme" content="light" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <title>(수업)하다 — hada</title>
-  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/variable/pretendardvariable-dynamic-subset.min.css" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nanum+Brush+Script&display=swap" />
-  <link rel="stylesheet" href="./styles.css?v=1.9.3" />
-  <script src="./env.js?v=1.9.3"></script>
-  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+  <link rel="stylesheet" href="./styles.css?v=2.0.0" />
+  <link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4/+esm" crossorigin />
+  <script src="./env.js?v=2.0.0"></script>
+  <!-- QR: window.QRCode.toCanvas (1.5.x에는 build/ 번들이 없음 → 1.4.4) -->
+  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.4.4/build/qrcode.min.js" defer></script>
 </head>
 <body>
   <div id="app"></div>
 
+  <!-- 랜딩 (인트로 유지) -->
   <template id="tpl-landing">
     <main class="landing">
       <header class="landing-top">
         <div class="brand" aria-label="(수업)하다">
           <span class="paren">(</span><span class="brush">수업</span><span class="paren">)</span><span class="brush">하다</span>
         </div>
-        <span class="brand-tag">인터랙티브 에듀테크</span>
       </header>
       <section class="landing-hero">
         <h1 class="intro-type" aria-label="필기하다, 공유하다, 소통하다, 수업하다">
@@ -30,91 +36,77 @@
         </h1>
         <p>학생들과 필기를 공유하고, 소통하며 함께 수업합니다.</p>
         <div class="landing-cta">
-          <button class="btn btn-primary" data-go="teacher-login">교사로 시작</button>
-          <button class="btn btn-ghost" data-go="student-login">학생으로 참여</button>
+          <button class="btn btn-primary" type="button" data-go="teacher-login">교사로 시작</button>
+          <button class="btn btn-ghost" type="button" data-go="student-login">학생으로 참여</button>
         </div>
       </section>
-      <footer class="landing-foot">v0.1 draft · 로컬 동기화 데모</footer>
     </main>
   </template>
 
+  <!-- 교사 로그인 -->
   <template id="tpl-teacher-login">
     <main class="auth">
-      <button class="back" data-go="landing">← 처음으로</button>
+      <button class="back" type="button" data-go=""><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>처음으로</button>
       <div class="auth-card">
         <h2>교사 로그인</h2>
-        <p class="muted">이름과 비밀번호를 입력하세요. 처음이라면 자동으로 등록됩니다.</p>
-        <label>이름<input id="t-name" placeholder="예) 김선생" autocomplete="off" /></label>
-        <label>비밀번호<input id="t-pw" type="password" placeholder="••••••" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="latin" /></label>
-        <button class="btn btn-primary" id="t-submit">입장</button>
-        <p class="error" id="t-err"></p>
+        <label class="field"><span>이름</span><input id="t-name" class="input" placeholder="김선생" autocomplete="username" autocapitalize="off" spellcheck="false" /></label>
+        <label class="field"><span>비밀번호</span><input id="t-pw" class="input" type="password" placeholder="••••••" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" /></label>
+        <button class="btn btn-primary btn-block" type="button" id="t-submit">입장</button>
+        <p class="auth-note">처음이면 자동으로 만들어져요</p>
+        <p class="error" id="t-err" role="alert"></p>
       </div>
     </main>
   </template>
 
+  <!-- 학생 입장 (§8). #s-remembered: 기억된 학생 큰 버튼 영역, #s-form: 입력 폼 -->
   <template id="tpl-student-login">
     <main class="auth">
-      <button class="back" data-go="landing">← 처음으로</button>
+      <button class="back" type="button" data-go=""><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>처음으로</button>
       <div class="auth-card">
         <h2>학생 입장</h2>
-        <p class="muted">선생님이 알려준 6자리 수업 코드와 본인 정보를 입력하세요.</p>
-        <label class="code-field">수업 코드<input id="s-code" placeholder="ABC123" autocapitalize="characters" autocomplete="off" spellcheck="false" maxlength="6" /></label>
-        <div class="row">
-          <label>학년<input id="s-grade" type="number" min="1" max="12" placeholder="6" /></label>
-          <label>반<input id="s-class" type="number" min="1" placeholder="2" /></label>
-          <label>번호<input id="s-num" type="number" min="1" placeholder="14" /></label>
+        <div id="s-remembered" class="remembered" hidden>
+          <button class="remembered-btn" type="button" id="s-again"></button>
+          <button class="btn-link" type="button" id="s-other">다른 사람이에요</button>
         </div>
-        <label>이름<input id="s-name" placeholder="홍길동" /></label>
-        <button class="btn btn-primary" id="s-submit">수업 입장</button>
-        <p class="error" id="s-err"></p>
+        <div id="s-form" class="auth-form">
+          <label class="field code-field"><span>수업 코드</span><input id="s-code" class="input code-input" placeholder="ABC123" maxlength="6" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="next" /></label>
+          <div class="row">
+            <label class="field"><span>학년</span><input id="s-grade" class="input" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" placeholder="6" autocomplete="off" /></label>
+            <label class="field"><span>반</span><input id="s-class" class="input" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" placeholder="2" autocomplete="off" /></label>
+            <label class="field"><span>번호</span><input id="s-num" class="input" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" placeholder="14" autocomplete="off" /></label>
+          </div>
+          <label class="field"><span>이름</span><input id="s-name" class="input" placeholder="홍길동" autocomplete="off" enterkeyhint="go" /></label>
+          <button class="btn btn-primary btn-block" type="button" id="s-submit">입장</button>
+        </div>
+        <p class="error" id="s-err" role="alert"></p>
       </div>
     </main>
   </template>
 
-  <template id="tpl-teacher-dashboard">
+  <!-- 교사 셸: 사이드바(≤768px 하단 탭바) + #tab-content -->
+  <template id="tpl-shell">
     <div class="shell">
       <aside class="side">
         <div class="brand small" aria-label="(수업)하다">
           <span class="paren">(</span><span class="brush">수업</span><span class="paren">)</span><span class="brush">하다</span>
         </div>
-        <nav>
-          <button data-tab="lessons" class="nav-item active">수업 자료</button>
-          <button data-tab="live" class="nav-item">진행 중</button>
-          <button data-tab="sessions" class="nav-item">수업 세션</button>
-          <button data-tab="students" class="nav-item">학생 명단</button>
-          <button data-tab="qr" class="nav-item">접속 QR</button>
+        <nav class="side-nav" aria-label="메뉴">
+          <button class="nav-item active" type="button" data-tab="lessons"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 4h6a4 4 0 0 1 4 4v13a3 3 0 0 0-3-3H2z"/><path d="M22 4h-6a4 4 0 0 0-4 4v13a3 3 0 0 1 3-3h7z"/></svg><span>수업 자료</span></button>
+          <button class="nav-item" type="button" data-tab="records"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg><span>수업 기록</span></button>
+          <button class="nav-item" type="button" data-tab="students"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg><span>학생</span></button>
+          <button class="nav-item" type="button" data-tab="code"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3"/><path d="M21 14v.01"/><path d="M17 21h4v-4"/><path d="M14 18v3"/></svg><span>내 코드</span></button>
         </nav>
         <div class="side-foot">
           <div class="me" id="t-who"></div>
-          <button class="btn-link" id="t-logout">로그아웃</button>
+          <button class="btn-link" type="button" id="t-logout">로그아웃</button>
         </div>
       </aside>
-      <section class="main">
+      <main class="main">
         <div id="tab-content"></div>
-      </section>
+      </main>
     </div>
   </template>
 
-  <template id="tpl-student-dashboard">
-    <div class="shell">
-      <aside class="side">
-        <div class="brand small" aria-label="(수업)하다">
-          <span class="paren">(</span><span class="brush">수업</span><span class="paren">)</span><span class="brush">하다</span>
-        </div>
-        <nav>
-          <button data-tab="join" class="nav-item active">수업 하기</button>
-          <button data-tab="records" class="nav-item">수업 기록</button>
-        </nav>
-        <div class="side-foot">
-          <div class="me" id="s-who"></div>
-          <button class="btn-link" id="s-logout">로그아웃</button>
-        </div>
-      </aside>
-      <section class="main">
-        <div id="tab-content"></div>
-      </section>
-    </div>
-  </template>
-  <script type="module" src="./js/app.js?v=1.9.3"></script>
+  <script type="module" src="./js/app.js?v=2.0.0"></script>
 </body>
 </html>
