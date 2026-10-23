@@ -1,5 +1,6 @@
 // Local persistence + simple reactive store
-const KEY = "inkclass:v1";
+export const KEY = "hada:v1";
+const LEGACY_KEY = "inkclass:v1"; // 이전 앱 이름(Inkclass) 시절 키 — 최초 1회 이전
 
 const initial = {
   teachers: [], // {id, name, password}
@@ -13,7 +14,11 @@ const initial = {
 
 function load() {
   try {
-    const raw = localStorage.getItem(KEY);
+    let raw = localStorage.getItem(KEY);
+    if (!raw) {
+      raw = localStorage.getItem(LEGACY_KEY);
+      if (raw) { localStorage.setItem(KEY, raw); localStorage.removeItem(LEGACY_KEY); }
+    }
     if (!raw) return structuredClone(initial);
     return { ...structuredClone(initial), ...JSON.parse(raw) };
   } catch (e) { return structuredClone(initial); }

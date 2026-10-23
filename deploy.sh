@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Inkclass one-shot deploy helper.
+# hada one-shot deploy helper.
 # Picks the first available CLI (vercel > netlify > wrangler > surge) and deploys.
 set -e
 cd "$(dirname "$0")"
@@ -16,7 +16,7 @@ if command -v netlify >/dev/null; then
 fi
 if command -v wrangler >/dev/null; then
   echo "→ Deploying to Cloudflare Pages…"
-  wrangler pages deploy . --project-name inkclass
+  wrangler pages deploy . --project-name hada
   exit 0
 fi
 echo "No deploy CLI found. Try: npx vercel@latest"

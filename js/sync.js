@@ -1,8 +1,8 @@
 // Cross-tab realtime sync via BroadcastChannel.
 // All teacher/student tabs in the same browser stay in sync.
-import { store } from "./store.js";
+import { store, KEY } from "./store.js";
 
-const ch = new BroadcastChannel("inkclass-sync");
+const ch = new BroadcastChannel("hada-sync");
 
 const listeners = new Set();
 
@@ -21,7 +21,7 @@ ch.onmessage = (ev) => {
 
 // localStorage `storage` event also re-syncs across tabs automatically
 window.addEventListener("storage", (e) => {
-  if (e.key === "inkclass:v1" && e.newValue) {
+  if (e.key === KEY && e.newValue) {
     try {
       const parsed = JSON.parse(e.newValue);
       Object.assign(store.state, parsed);

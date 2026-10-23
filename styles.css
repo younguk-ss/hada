@@ -17,6 +17,11 @@
   --shadow-1: 0 1px 2px rgba(20, 20, 20, 0.04), 0 4px 12px rgba(20, 20, 20, 0.04);
   --shadow-2: 0 8px 32px rgba(20, 20, 20, 0.08);
   --font: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  /* 붓글씨 로고타입: 먹물 차콜 + 살짝 넓힌 자간 */
+  --font-brush: "Nanum Brush Script", "Gowun Batang", serif;
+  --ink-brush: #1E293B;
+  --ink-brush-soft: rgba(30, 41, 59, 0.28);
+  --brush-tracking: 0.06em;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; }
@@ -75,24 +80,89 @@ input, select, textarea { font-family: inherit; }
 .landing-top {
   display: flex; align-items: center; justify-content: space-between;
 }
-.brand { display: flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: -0.02em; font-size: 18px; }
-.brand.small { font-size: 15px; }
-.brand-mark {
-  width: 14px; height: 14px;
-  background: linear-gradient(135deg, var(--ink) 0%, var(--accent) 100%);
-  border-radius: 4px;
-  transform: rotate(-12deg);
+/* 로고 (수업)하다 — 괄호는 얇은 산세리프(디지털), 단어는 붓글씨(아날로그) */
+.brand {
+  display: flex; align-items: baseline;
+  font-size: 18px; line-height: 1;
+  color: var(--ink-brush);
 }
+.brand.small { font-size: 15px; }
+.brand .paren {
+  font-family: var(--font);
+  font-weight: 200;
+  color: var(--ink-2);
+  padding: 0 0.08em;
+}
+.brand .brush {
+  font-family: var(--font-brush);
+  font-size: 1.62em;
+  letter-spacing: var(--brush-tracking);
+  text-shadow: 0 0 0.6px var(--ink-brush-soft);
+}
+.brand .paren:first-child + .brush { padding-left: var(--brush-tracking); }
 .brand-tag { color: var(--muted); font-size: 13px; }
 .landing-hero {
   display: grid; place-content: center; gap: 28px; text-align: center;
 }
-.landing-hero h1 {
-  font-size: clamp(36px, 6vw, 72px);
-  letter-spacing: -0.04em;
-  line-height: 1.05;
-  font-weight: 600;
+
+/* Intro typography: [필기]하다 → [공유]하다 → [소통]하다 → [수업]하다
+   단어와 '하다'는 붓글씨 SVG(js/handwriting.js)가 획순대로 써 내려가고, 괄호는 얇은 산세리프 */
+.intro-type {
   margin: 0;
+  font-weight: 400;
+  font-size: clamp(60px, 12vw, 148px);
+  line-height: 1;
+  color: var(--ink-brush);
+}
+.intro-line { display: inline-flex; align-items: center; }
+.intro-type .bracket {
+  display: inline-grid;
+  font-family: var(--font);
+  font-weight: 100;
+  font-size: 0.62em;
+  line-height: 1;
+  color: var(--ink-2);
+  padding: 0 0.12em;
+  transform: translateY(-0.06em);
+  opacity: 0;
+}
+.bracket > span {
+  grid-area: 1 / 1;
+  text-align: center;
+  transition: opacity .5s ease, transform .7s cubic-bezier(.2,.7,.2,1), filter .5s ease;
+}
+.bracket .rd { opacity: 0; transform: scaleY(.6); filter: blur(4px); }
+.intro-slot { display: inline-grid; justify-items: center; align-items: center; }
+.intro-slot > .ink-word { grid-area: 1 / 1; }
+.intro-hada { display: inline-flex; margin-left: -0.02em; }
+.ink-word {
+  display: block;
+  overflow: visible;
+  fill: var(--ink-brush);
+  /* 획 끝이 번지듯 맺히는 먹물 느낌 */
+  filter: drop-shadow(0 0 0.6px var(--ink-brush-soft));
+}
+.ink-highlight { stroke: rgba(253, 224, 71, 0.6); }
+
+.intro-type.play .bracket { animation: introFade .7s ease forwards; }
+.intro-slot > .ink-word.out { animation: inkOut .55s ease forwards; }
+@keyframes introFade { to { opacity: 1; } }
+/* 물에 풀리듯 번지며 사라짐 */
+@keyframes inkOut {
+  from { opacity: 1; filter: blur(0); transform: scale(1); }
+  to   { opacity: 0; filter: blur(8px); transform: scale(1.06); }
+}
+
+/* '수업'이 다 써지면 앱 이름 강조: [ ] → ( ) 로 바뀌어 (수업)하다 완성 + 형광펜 + 살짝 맺힘 */
+.intro-type.named .bracket .sq { opacity: 0; transform: scaleY(1.25); filter: blur(4px); }
+.intro-type.named .bracket .rd { opacity: 1; transform: none; filter: none; }
+.intro-type.named .intro-slot > .ink-word:not(.out) { animation: namePop .9s cubic-bezier(.2,.7,.2,1); }
+@keyframes namePop { 35% { transform: scale(1.07); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .intro-type.play .bracket { opacity: 1; animation: none; }
+  .intro-type .bracket > span { transition: none; }
+  .intro-type.named .intro-slot > .ink-word:not(.out) { animation: none; }
 }
 .landing-hero p { color: var(--muted); font-size: 17px; margin: 0; }
 .landing-cta { display: flex; gap: 10px; justify-content: center; margin-top: 12px; }

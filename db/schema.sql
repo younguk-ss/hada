@@ -1,4 +1,4 @@
--- Inkclass schema v1.6 — text-id 기반 (클라이언트 store.newId() 형식과 호환)
+-- (수업)하다 · hada schema v1.6 — text-id 기반 (클라이언트 store.newId() 형식과 호환)
 -- ⚠️ 기존 uuid 기반 테이블이 있다면 DROP 후 재생성합니다 (현재 데이터는 사실상 비어 있어서 안전).
 -- Run in Supabase SQL Editor.
 

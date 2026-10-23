@@ -168,7 +168,10 @@ export function studentLive({ id }) {
     session = getSession() || session;
     const status = session.status;
     bar.innerHTML = "";
-    bar.appendChild(el("div", { class: "brand small" }, [el("div", { class: "brand-mark" }), el("span", {}, "Inkclass")]));
+    bar.appendChild(el("div", { class: "brand small", "aria-label": "(수업)하다" }, [
+      el("span", { class: "paren" }, "("), el("span", { class: "brush" }, "수업"),
+      el("span", { class: "paren" }, ")"), el("span", { class: "brush" }, "하다"),
+    ]));
     bar.appendChild(el("span", { class: "who" }, studentLabel(me)));
     bar.appendChild(el("span", { class: "muted" }, "·"));
     bar.appendChild(el("span", { class: "muted" }, session.title));

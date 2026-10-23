@@ -1,5 +1,5 @@
 // Optional Supabase cloud adapter.
-// Activated when window.INKCLASS_SUPABASE_URL & ANON_KEY are present (set in /env.js).
+// Activated when window.HADA_SUPABASE_URL & ANON_KEY are present (set in /env.js).
 // Otherwise the app gracefully falls back to localStorage + BroadcastChannel only,
 // so the deployed app is fully functional in single-browser demo mode out of the box.
 
@@ -12,10 +12,10 @@ let isCloud = false;
 // 🆔 이 클라이언트의 고유 식별자 (탭 단위로 유지). 자기 자신의 echo 무시용.
 const CLIENT_ID = (() => {
   try {
-    let id = sessionStorage.getItem("inkclass:cid");
+    let id = sessionStorage.getItem("hada:cid");
     if (!id) {
       id = "cli_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-      sessionStorage.setItem("inkclass:cid", id);
+      sessionStorage.setItem("hada:cid", id);
     }
     return id;
   } catch (_) {
@@ -27,8 +27,8 @@ export function clientId() { return CLIENT_ID; }
 export function cloudEnabled() { return isCloud; }
 
 export async function initCloud() {
-  const url = window.INKCLASS_SUPABASE_URL;
-  const key = window.INKCLASS_SUPABASE_ANON;
+  const url = window.HADA_SUPABASE_URL;
+  const key = window.HADA_SUPABASE_ANON;
   if (!url || !key || url.includes("YOUR_")) return false;
   try {
     const mod = await import("https://esm.sh/@supabase/supabase-js@2");
@@ -100,7 +100,7 @@ async function pullSnapshot() {
   if (cloudEmpty && localHasData) {
     // 🛡️ 안전장치: 클라우드가 비어있는데 로컬에 데이터가 있다 = 첫 클라우드 활성화.
     // 로컬을 보존하고 오히려 클라우드로 푸시 (마이그레이션).
-    console.info("Inkclass: cloud is empty, migrating local data to cloud…");
+    console.info("hada: cloud is empty, migrating local data to cloud…");
     await migrateLocalToCloud();
     subscribeRealtime();
     return;
@@ -159,7 +159,7 @@ async function migrateLocalToCloud() {
       }
     }
   }
-  console.info("Inkclass: migration complete.");
+  console.info("hada: migration complete.");
 }
 
 let _subscribed = false;
@@ -299,11 +299,11 @@ export async function cloudInsertLesson(l) {
 }
 // 일부 컬럼(last_writer)이 DB에 없을 수도 있으므로 동적으로 시도 후 fallback.
 // 한 번 fail 하면 localStorage에 결과 캐시 → 새로고침해도 첫 시도부터 우회.
-let _sessionsHasLastWriter = localStorage.getItem("inkclass:lw_sessions") !== "no";
-let _recordsHasLastWriter = localStorage.getItem("inkclass:lw_records") !== "no";
+let _sessionsHasLastWriter = localStorage.getItem("hada:lw_sessions") !== "no";
+let _recordsHasLastWriter = localStorage.getItem("hada:lw_records") !== "no";
 function markNoLW(which) {
-  if (which === "sessions") { _sessionsHasLastWriter = false; try { localStorage.setItem("inkclass:lw_sessions", "no"); } catch (_) {} }
-  if (which === "records") { _recordsHasLastWriter = false; try { localStorage.setItem("inkclass:lw_records", "no"); } catch (_) {} }
+  if (which === "sessions") { _sessionsHasLastWriter = false; try { localStorage.setItem("hada:lw_sessions", "no"); } catch (_) {} }
+  if (which === "records") { _recordsHasLastWriter = false; try { localStorage.setItem("hada:lw_records", "no"); } catch (_) {} }
 }
 
 export async function cloudUpsertSession(ss) {

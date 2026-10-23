@@ -1,4 +1,4 @@
-# Inkclass v1.0
+# (수업)하다 · hada v1.0
 
 <!-- deploy pipeline test: 2026-05-18 -->
 
@@ -38,8 +38,8 @@ python3 -m http.server 5173
 ### 2) 클라이언트에 키 주입
 `env.js` 편집:
 ```js
-window.INKCLASS_SUPABASE_URL = "https://xxx.supabase.co";
-window.INKCLASS_SUPABASE_ANON = "eyJ...";
+window.HADA_SUPABASE_URL = "https://xxx.supabase.co";
+window.HADA_SUPABASE_ANON = "eyJ...";
 ```
 이 값이 채워지면 자동으로 클라우드 모드로 전환, 다중 디바이스 실시간 동기화.
 
@@ -50,7 +50,7 @@ npx vercel --yes        # 처음이면 로그인 안내 → 이후 자동 배포
 npx vercel deploy --prod --yes
 ```
 대안: 폴더를 https://app.netlify.com/drop 에 드래그하면 즉시 배포.
-또는 Cloudflare Pages: `npx wrangler pages deploy . --project-name inkclass`
+또는 Cloudflare Pages: `npx wrangler pages deploy . --project-name hada`
 
 ## 무료 DB 플랫폼 비교
 

@@ -1,6 +1,7 @@
 // Bootstrap: routes, auth, dispatch.
 import { route, start, go } from "./router.js";
 import { mount, template, $, $$ } from "./ui.js";
+import { inkWord, inkWidth } from "./handwriting.js";
 import { store } from "./store.js";
 import { teacherDashboard, editorView } from "./teacher.js";
 import { studentDashboard, studentLive } from "./student.js";
@@ -8,8 +9,8 @@ import { initCloud, cloudEnabled, cloudUpsertTeacher, cloudUpsertStudent, cloudA
 
 // Kick off cloud sync (no-op if env not configured)
 initCloud().then(ok => {
-  if (ok) console.info("Inkclass: cloud sync via Supabase enabled");
-  else console.info("Inkclass: local mode (Supabase not configured)");
+  if (ok) console.info("hada: cloud sync via Supabase enabled");
+  else console.info("hada: local mode (Supabase not configured)");
 });
 
 // 마이그레이션: 기존 교사 중 joinCode 없는 사람에게 영구 코드 발급
@@ -26,7 +27,61 @@ route("/", () => {
   const v = template("tpl-landing");
   mount(v);
   v.querySelectorAll("[data-go]").forEach(b => b.addEventListener("click", () => go("/" + b.dataset.go)));
+  return playIntro(v.querySelector(".intro-type"));
 });
+
+// 인트로 타이포: [필기]하다 → [공유]하다 → [소통]하다 → [수업]하다
+// 각 단어는 획순대로 펜으로 쓰듯 그려지고, 마지막 '수업'이 써지면 앱 이름 (수업)하다로 강조.
+const INTRO_WORDS = ["필기", "공유", "소통", "수업"];
+const INTRO_HOLD_MS = 420;
+function playIntro(root) {
+  const slot = root.querySelector(".intro-slot");
+  const hadaBox = root.querySelector(".intro-hada");
+  let alive = true;
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  // 괄호 폭을 가장 넓은 단어에 맞춰 고정 — 단어가 바뀔 때 괄호가 흔들리지 않게
+  slot.style.width = Math.max(...INTRO_WORDS.map(inkWidth)) + "em";
+  const place = (w, opts) => {
+    const word = inkWord(w, opts);
+    slot.appendChild(word.svg);
+    return word;
+  };
+  const erase = (svg) => {
+    slot.querySelectorAll(".ink-word.out").forEach(n => n.remove());
+    svg.classList.add("out");
+    svg.addEventListener("animationend", () => svg.remove(), { once: true });
+  };
+
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    hadaBox.appendChild(inkWord("하다", { written: true }).svg);
+    place(INTRO_WORDS.at(-1), { written: true }).highlight({ written: true });
+    root.classList.add("play", "named");
+    return;
+  }
+  (async () => {
+    // 백그라운드 탭으로 열렸다면 화면에 보일 때 재생
+    if (document.hidden) await new Promise(r => document.addEventListener("visibilitychange", r, { once: true }));
+    if (!alive) return;
+    let word = place(INTRO_WORDS[0]);
+    const hada = inkWord("하다");
+    hadaBox.appendChild(hada.svg);
+    root.classList.add("play");
+    await word.write({ delay: 250 });
+    if (!alive) return;
+    await hada.write();
+    for (const w of INTRO_WORDS.slice(1)) {
+      await sleep(INTRO_HOLD_MS);
+      if (!alive) return;
+      erase(word.svg);
+      word = place(w);
+      await word.write({ delay: 60 });
+      if (!alive) return;
+    }
+    root.classList.add("named");
+    word.highlight();
+  })();
+  return () => { alive = false; };
+}
 
 // Teacher login
 route("/teacher-login", () => {
@@ -90,7 +145,7 @@ route("/student-login", (params) => {
 
   const codeInput = v.querySelector("#s-code");
   // QR로 진입 시 코드 자동 채움 (URL 파라미터 c 또는 sessionStorage 인계)
-  const presetCode = (params && params.c) ? params.c : sessionStorage.getItem("inkclass:joinCode");
+  const presetCode = (params && params.c) ? params.c : sessionStorage.getItem("hada:joinCode");
   if (presetCode) codeInput.value = presetCode.toUpperCase();
   // 입력은 항상 대문자로 정규화
   codeInput.addEventListener("input", () => { codeInput.value = codeInput.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6); });
@@ -123,7 +178,7 @@ route("/student-login", (params) => {
       if (ss && !ss.participants.includes(me.id)) ss.participants.push(me.id);
     });
     cloudAddParticipant(target.id, me.id).catch(() => {});
-    sessionStorage.removeItem("inkclass:joinCode");
+    sessionStorage.removeItem("hada:joinCode");
     go("/student/live/" + target.id);
   };
 });
@@ -139,7 +194,7 @@ route("/student/join", (params) => {
 
   const me = store.state.students.find(x => x.id === store.state.whoStudent);
   if (!me) {
-    if (code) sessionStorage.setItem("inkclass:joinCode", code);
+    if (code) sessionStorage.setItem("hada:joinCode", code);
     go("/student-login");
     return;
   }
