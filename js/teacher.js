@@ -13,6 +13,7 @@
 // 가정: 복습 코드(수업마다, 학습지 QR)는 수업 진행의 코드 창 아래 줄과 기록 상세의 [복습 코드]에서 본다. 코드는 처음 열 때 만들어진다.
 // 가정: 수업 중 [상호작용 추가](패널 활동 탭 아래)는 정답 없는 상호작용·미디어만. 그 타입의 편집기를 창에 띄워 내용을 넣고
 //       [추가하고 이동] → 이 수업 스냅샷의 현재 슬라이드 다음에 끼워 넣고 바로 그 슬라이드로(수업 자료에는 저장하지 않음).
+//       맨 앞 [빈 슬라이드]는 채울 내용이 없어 창 없이 바로 — 흰 필기 슬라이드(모드 '전체', 수업 중 모드 seg로 바꿈).
 import { store, findLesson, findSession, findStudent, findTeacher, studentLabel, newId } from "./store.js";
 import { go } from "./router.js";
 import { el, mount, template, toast, confirmDialog, promptDialog, modal, sheet, icon, fmtDate, debounce, copyText } from "./ui.js";
@@ -30,6 +31,7 @@ import { openStudentPrint, openBlankPrint, printStudents, printRecordView, revie
 const TABS = ["lessons", "records", "students", "code"];
 // 수업 중 바로 추가할 수 있는 타입 (정답 없는 상호작용 · 미디어)
 const QUICK_TYPES = ["wall", "short", "wordcloud", "poll", "link", "embed", "video"];
+const BLANK_ICON = '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/></svg>';
 const MODES = [["none", "발표"], ["whole", "전체"], ["individual", "개별"], ["group", "모둠"]];
 const STATUS = { live: ["진행 중", "pill-live"], completed: ["끝남", "pill-ok"], stopped: ["중단", "pill-warn"] };
 const ACCEPT = ".pdf,.png,.jpg,.jpeg,.webp,application/pdf,image/png,image/jpeg,image/webp";
@@ -1234,10 +1236,15 @@ function buildLive(sessionId, teacher) {
   const pluginBox = el("div", { class: "t-plugin-panel", hidden: true });
   const quickBox = el("section", { class: "t-quick", "aria-label": "상호작용 추가" }, [
     el("div", { class: "t-quick-head" }, "상호작용 추가"),
-    el("div", { class: "t-quick-grid" }, QUICK_TYPES.map(t => getSlideType(t)).filter((d, i) => d && d.type === QUICK_TYPES[i])
-      .map(d => el("button", { class: "t-quick-btn", type: "button", title: d.desc || d.label, onClick: () => openQuickAdd(d.type) }, [
-        el("span", { class: "icon", html: d.icon || "" }), el("span", {}, d.label),
-      ]))),
+    el("div", { class: "t-quick-grid" }, [
+      el("button", { class: "t-quick-btn", type: "button", title: "흰 필기 슬라이드를 바로 추가", onClick: addBlank }, [
+        el("span", { class: "icon", html: BLANK_ICON }), el("span", {}, "빈 슬라이드"),
+      ]),
+      ...QUICK_TYPES.map(t => getSlideType(t)).filter((d, i) => d && d.type === QUICK_TYPES[i])
+        .map(d => el("button", { class: "t-quick-btn", type: "button", title: d.desc || d.label, onClick: () => openQuickAdd(d.type) }, [
+          el("span", { class: "icon", html: d.icon || "" }), el("span", {}, d.label),
+        ])),
+    ]),
   ]);
   const actBox = el("div", { class: "t-pane" }, [pluginBox, quickBox]);
   const peopleHead = el("div", { class: "muted" });
@@ -1418,7 +1425,33 @@ function buildLive(sessionId, teacher) {
     go("/teacher/session/" + sessionId, { replace: true });
   }
 
-  // ── 수업 중 상호작용 추가: 편집기 창 → 현재 다음에 끼워 넣고 그 슬라이드로 ──
+  // ── 수업 중 상호작용 추가: 현재 다음에 끼워 넣고 그 슬라이드로 → 성공 여부 ──
+  async function insertNext(draft) {
+    let s = S();
+    if (!s || disposed) return false;
+    // 진행 중인 게임에서 떠날 때는 이동과 같은 확인
+    const cur = curSlide(s);
+    if (cur && getSlideType(cur.type).category === "game" && ((s.activity || {})[cur.id] || {}).phase === "running") {
+      const ok = await confirmDialog({ title: "게임을 종료하고 넘어갈까요?", ok: "종료하고 이동" });
+      if (!ok || disposed) return false;
+      s = S();
+      const act = s.activity || {};
+      patchSession(s, { activity: { ...act, [cur.id]: { ...(act[cur.id] || {}), phase: "ended", endedAt: Date.now(), endsAt: null } } });
+    }
+    const r = await cloudInsertSessionSlide(s, draft, (s.currentSlide || 0) + 1);
+    if (!r || r.error) { toast((r && r.error) || "슬라이드를 추가하지 못했어요", { type: "error" }); return false; }
+    return true;
+  }
+  // 빈 슬라이드: 채울 내용이 없으니 창 없이 바로 (두 번 눌러도 한 장만 — 끝난 뒤 0.7초 더 잠금)
+  let blankBusy = false;
+  async function addBlank() {
+    if (blankBusy) return;
+    blankBusy = true;
+    try { await insertNext(createSlide("ink", { title: "빈 슬라이드" })); }
+    catch (e) { console.warn("[live] 빈 슬라이드", e); toast("슬라이드를 추가하지 못했어요", { type: "error" }); }
+    finally { setTimeout(() => { blankBusy = false; }, 700); }
+  }
+  // 편집기 창 → [추가하고 이동]
   function openQuickAdd(type) {
     const def = getSlideType(type);
     let draft;
@@ -1432,20 +1465,7 @@ function buildLive(sessionId, teacher) {
         { label: "추가하고 이동", primary: true, icon: "plus", onClick: async (close) => {
           const msg = typeof def.validate === "function" ? def.validate(draft) : null;
           if (msg) { toast(msg); return; }
-          let s = S();
-          if (!s || disposed) return;
-          // 진행 중인 게임에서 떠날 때는 이동과 같은 확인
-          const cur = curSlide(s);
-          if (cur && getSlideType(cur.type).category === "game" && ((s.activity || {})[cur.id] || {}).phase === "running") {
-            const ok = await confirmDialog({ title: "게임을 종료하고 넘어갈까요?", ok: "종료하고 이동" });
-            if (!ok || disposed) return;
-            s = S();
-            const act = s.activity || {};
-            patchSession(s, { activity: { ...act, [cur.id]: { ...(act[cur.id] || {}), phase: "ended", endedAt: Date.now(), endsAt: null } } });
-          }
-          const r = await cloudInsertSessionSlide(s, draft, (s.currentSlide || 0) + 1);
-          if (!r || r.error) { toast((r && r.error) || "슬라이드를 추가하지 못했어요", { type: "error" }); return; }
-          close();
+          if (await insertNext(draft)) close();
         } },
       ],
       onClose: () => { try { ed && ed.destroy(); } catch (_) {} },
