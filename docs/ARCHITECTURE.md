@@ -466,7 +466,7 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 | `/teacher/session/:id` | B | 기록 상세 |
 
 - 레거시 경로 `/teacher/live` → 진행 중 세션이 있으면 `/live/:id`, 없으면 `/teacher`.
-- 제작자 배너(js/brand-banner.js, app.js에서 `initBrandBanner()`): 모든 화면 위에 왼쪽 인스타 `sun_sunseng`, 오른쪽 `영욱T 제작` + `assets/print-mark.png`. 라우트 진입 시 위에서 내려와 4.2초 뒤 올라가며 사라짐(교사/학생 각각 20초 쿨다운, 링크 외 클릭 통과, 인쇄 시 숨김). 인스타 링크는 교사 전용 경로(`/teacher*` `/editor/` `/live/`)에서만 — `/`·학생 화면은 아이디 텍스트만.
+- 제작자 워터마크(js/brand-banner.js, app.js에서 `initBrandBanner()`): 왼쪽 인스타 `sun_sunseng`, 오른쪽 `영욱T 제작` + `assets/print-mark.png`. 자리는 `--bb-h`(34px, ≤600px 30px) — `--sat = --sat0(기기 안전 영역) + --bb-h` 이고 모든 화면이 위쪽 여백에 `--sat`를 쓰므로 내용을 가리지 않는다(모달 뒤판은 `--sat0`, `.slide-frame` 폭 계산은 `--bb-h`를 뺀다, 모바일 sticky 상단 바는 `top: -bb-h`). 스크롤로 내용이 그 줄 아래로 지나가면 유리(반투명+blur)로 바뀌고 2.6초 뒤 위로 사라짐, 맨 위로 오면 제자리. 링크는 교사 전용 경로(`/teacher*` `/editor/` `/live/`)에서만 — `/`·학생 화면은 아이디 텍스트만. 인쇄 시 숨김.
 - 라우트 등록은 app.js(C)가 한다. teacher.js(B)는 `teacherDashboard(params)`, `editorView({id})`, `liveView({id})`, `sessionDetailView({id})` 를 export하고 각각 **cleanup을 반환**.
 - student.js(C)는 `studentWaitView()`, `studentLiveView({id})`, `studentRecordsView()` export.
 

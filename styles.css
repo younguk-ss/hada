@@ -35,8 +35,11 @@
   --ink-brush: #1E293B;
   --ink-brush-soft: rgba(30, 41, 59, 0.28);
   --brush-tracking: 0.06em;
-  /* 안전 영역 */
-  --sat: env(safe-area-inset-top, 0px);
+  /* 안전 영역. --sat = 기기 안전 영역 + 상단 제작자 워터마크 자리(--bb-h, js/brand-banner.js).
+     모든 화면이 위쪽 여백에 --sat를 쓰므로 워터마크는 내용을 가리지 않는 빈 줄에 놓인다. */
+  --sat0: env(safe-area-inset-top, 0px);
+  --bb-h: 34px;
+  --sat: calc(var(--sat0) + var(--bb-h));
   --sab: env(safe-area-inset-bottom, 0px);
   --sal: env(safe-area-inset-left, 0px);
   --sar: env(safe-area-inset-right, 0px);
@@ -46,6 +49,8 @@
   --tabbar-h: 60px;
   color-scheme: light;
 }
+@media (max-width: 600px) { :root { --bb-h: 30px; } }
+@media print { :root { --bb-h: 0px; } }
 
 /* ───────────────────────── 2. 기본 ───────────────────────── */
 *, *::before, *::after { box-sizing: border-box; }
@@ -502,7 +507,7 @@ button.pill { cursor: pointer; }
   position: fixed; inset: 0; z-index: 400;
   background: rgba(24, 22, 30, .36);
   display: grid; place-items: center;
-  padding: max(16px, var(--sat)) max(16px, var(--sar)) max(16px, var(--sab)) max(16px, var(--sal));
+  padding: max(16px, var(--sat0)) max(16px, var(--sar)) max(16px, var(--sab)) max(16px, var(--sal));
   animation: fadeIn .16s ease;
   overscroll-behavior: contain;
 }
@@ -877,7 +882,7 @@ body:has(.float-toolbar, .stu-toolbar, .ink-float) .toast-stack { bottom: calc(8
 @media (max-width: 768px) {
   .shell { display: block; }
   .side {
-    position: sticky; top: 0; z-index: 100;
+    position: sticky; top: calc(-1 * var(--bb-h)); z-index: 100; /* 스크롤하면 워터마크 줄만큼 올라감 */
     height: auto;
     flex-direction: row; align-items: center; gap: 8px;
     padding: calc(10px + var(--sat)) max(16px, var(--sar)) 10px max(16px, var(--sal));
@@ -982,8 +987,8 @@ body:has(.float-toolbar, .stu-toolbar, .ink-float) .toast-stack { bottom: calc(8
   --frame-offset: 120px;
   position: relative;
   flex: none;
-  width: min(100%, calc((100vh - var(--frame-offset)) * 1.6));
-  width: min(100%, calc((100dvh - var(--frame-offset)) * 1.6));
+  width: min(100%, calc((100vh - var(--frame-offset) - var(--bb-h)) * 1.6));
+  width: min(100%, calc((100dvh - var(--frame-offset) - var(--bb-h)) * 1.6));
   aspect-ratio: 16 / 10;
   margin-inline: auto;
   background: #fff;
@@ -1178,7 +1183,7 @@ body:has(.float-toolbar, .stu-toolbar, .ink-float) .toast-stack { bottom: calc(8
   .rail-add { width: 72px; height: 32px; font-size: 12px; }
   .editor-body > .stage, .editor-stage { height: calc((100vw - 32px) / 1.6 + 32px); padding: 16px; overflow: hidden; }
   .inspector, .editor-inspector { overflow: visible; padding-bottom: calc(32px + var(--sab)); }
-  .editor .topbar, .editor-top, .editor-bar { position: sticky; top: 0; }
+  .editor .topbar, .editor-top, .editor-bar { position: sticky; top: calc(-1 * var(--bb-h)); }
 }
 
 /* ───────────────────────── 17. 수업 진행 (.live) ───────────────────────── */
