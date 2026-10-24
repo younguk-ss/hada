@@ -21,6 +21,28 @@ let penSeen = false;          // 이 기기에서 펜을 쓴 적이 있으면 �
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const FULL = { x0: 0, y0: 0, x1: 1, y1: 1 };
+const rw = (r) => (r.x1 - r.x0), rh = (r) => (r.y1 - r.y0);
+// 배경 비율(가로/세로) → 16:10 슬라이드 안의 종이 영역(contain)
+function paperFor(a) {
+  if (!a) return FULL;
+  return a < ASPECT ? { x0: (1 - a / ASPECT) / 2, y0: 0, x1: (1 + a / ASPECT) / 2, y1: 1 }
+    : { x0: 0, y0: (1 - ASPECT / a) / 2, x1: 1, y1: (1 + ASPECT / a) / 2 };
+}
+// 이미지 정규화 내용 영역 → 슬라이드 정규화
+function mapFocus(paper, b) {
+  return b ? { x0: paper.x0 + b.x0 * rw(paper), x1: paper.x0 + b.x1 * rw(paper), y0: paper.y0 + b.y0 * rh(paper), y1: paper.y0 + b.y1 * rh(paper) } : paper;
+}
+
+// 갤러리 등에서 쓰는 종이·내용 영역(슬라이드 정규화). 배경이 없거나 못 읽으면 전체.
+const inspectCache = new Map(); // 주소 → Promise<{ a, b }>
+export function pageRectFor(src) {
+  if (!src) return Promise.resolve({ paper: FULL, focus: FULL });
+  if (!inspectCache.has(src)) inspectCache.set(src, analyzeContent(src).then(r => { if (r.a <= 1.25) focusCache.set(src, r.b); return r; }));
+  return inspectCache.get(src).then(({ a, b }) => {
+    const paper = paperFor(a);
+    return { paper, focus: a && a <= 1.25 ? mapFocus(paper, b) : paper };
+  });
+}
 
 export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
   let VW = 0, VH = 0;
@@ -121,13 +143,9 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
     const nw = img && img.naturalWidth, nh = img && img.naturalHeight;
     if (!nw || !nh) { paper = FULL; focus = FULL; return; }
     const a = nw / nh;
-    paper = a < ASPECT ? { x0: (1 - a / ASPECT) / 2, y0: 0, x1: (1 + a / ASPECT) / 2, y1: 1 }
-      : { x0: 0, y0: (1 - ASPECT / a) / 2, x1: 1, y1: (1 + ASPECT / a) / 2 };
+    paper = paperFor(a);
     const b = a <= 1.25 ? focusCache.get(analyzeSrc || img.currentSrc || img.src) : null;
-    focus = b ? {
-      x0: paper.x0 + b.x0 * rectW(paper), x1: paper.x0 + b.x1 * rectW(paper),
-      y0: paper.y0 + b.y0 * rectH(paper), y1: paper.y0 + b.y1 * rectH(paper),
-    } : paper;
+    focus = mapFocus(paper, b);
   }
   function pageChanged() {
     updatePaper();
@@ -138,9 +156,8 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
     const key = analyzeSrc || img.currentSrc || img.src;
     const a = img.naturalWidth / (img.naturalHeight || 1);
     if (key && img.naturalWidth && a <= 1.25 && !focusCache.has(key)) {
-      analyzeContent(key).then(b => {
-        focusCache.set(key, b);
-        if (!destroyed && b) pageChanged();
+      pageRectFor(key).then(() => {
+        if (!destroyed && focusCache.get(key)) pageChanged();
       });
     }
   }
@@ -347,14 +364,17 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
   };
 }
 
-// 흰 여백을 뺀 내용 영역(이미지 정규화 0..1). 읽을 수 없거나 너무 작으면 null
+// { a: 이미지 비율(가로/세로) | 0, b: 흰 여백을 뺀 내용 영역(이미지 정규화 0..1) | null(읽을 수 없거나 너무 작음) }
 function analyzeContent(url) {
-  return new Promise((resolve) => {
+  return new Promise((done) => {
     const im = new Image();
+    let a = 0;
+    const resolve = (b) => done({ a, b });
     im.crossOrigin = "anonymous";
     im.decoding = "async";
     im.onerror = () => resolve(null);
     im.onload = () => {
+      a = im.naturalWidth / (im.naturalHeight || 1);
       try {
         const W = 160, H = Math.max(1, Math.round(W * im.naturalHeight / (im.naturalWidth || 1)));
         const c = document.createElement("canvas");

@@ -5,6 +5,8 @@
 //       { close } 를 반환한다. 닫힘은 onClose 외에 body가 DOM에서 빠지는 것으로도 감지한다.
 // 가정: 프레임 크기는 스테이지 크기에 맞춰 JS로 contain(16:10) 맞춤(ResizeObserver).
 // 가정: 도구 상태(도구·색·굵기)는 모듈 단위로 기억(슬라이드를 넘겨도 유지).
+// 교사 갤러리: 학생 수와 화면 크기에 맞춰 칸 크기를 계산(한 명이면 화면 가득, 많으면 최소 200px 후 스크롤).
+//       칸은 학습지의 내용 영역만 보이게 잘라 보여 주고, 필기는 칸의 실제 크기 × dpr로 그린다(선명).
 // 확대: 필기 화면(편집기·교사 전체·학생·학생 필기 크게 보기)은 renderSlide({ zoom:true }) — 두 손가락·휠·도구바 [− 100% +].
 //       학생 화면은 스테이지 전체가 보기 영역이고, 도구바가 덮는 만큼만 맞춤에서 비운다(이동하면 도구바 뒤로도 보임).
 //       가로로 남는 화면이면 도구바를 왼쪽 세로 2열로 옮겨 슬라이드를 키운다(어느 쪽이 더 크게 보이는지 계산해 선택).
@@ -17,6 +19,7 @@ import * as storeMod from "../store.js";
 import { registerSlideType, effectiveMode, groupStudents, newId, injectCss } from "./registry.js";
 import { renderSlide } from "../lesson-view.js";
 import { paintStrokes } from "../canvas.js";
+import { pageRectFor } from "../zoom-view.js";
 
 const { el } = ui;
 
@@ -112,6 +115,11 @@ const CSS = `
 .ink-mini { position:relative; aspect-ratio:16/10; background:#fff; border-radius:6px; overflow:hidden; box-shadow:inset 0 0 0 1px var(--line); }
 .ink-mini img, .ink-mini canvas { position:absolute; inset:0; width:100%; height:100%; }
 .ink-mini img { object-fit:contain; pointer-events:none; }
+/* 갤러리 칸: 내용 영역만 보이게 자름(안쪽 16:10 상자를 키워서 옮김) */
+.ink-mini.crop { aspect-ratio:var(--pa, 1.6); }
+.ink-mini-in { position:absolute; left:0; top:0; width:100%; height:100%; }
+.ink-gallery { scrollbar-gutter:stable; }
+.ink-gallery .ink-tiles.fit { justify-content:center; }
 .ink-tile-name { display:flex; align-items:center; gap:6px; font-size:13px; color:var(--ink-2); min-width:0; padding:0 2px; }
 .ink-tile-name span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .ink-tile-name .dot { flex:none; width:8px; height:8px; border-radius:50%; background:var(--line-strong); }
@@ -309,16 +317,35 @@ function openModal(ctx, { title, body, actions = [], onClose }) {
 }
 
 // 미니 프레임(배경 + 필기). 반환 el에 .paint(rec) 메서드
-function miniFrame(slide, { big = false } = {}) {
+// crop: true → 내용 영역(setPage)만 보이게 자르고, setPx(칸 폭)로 캔버스 해상도를 칸 크기에 맞춤
+function miniFrame(slide, { big = false, crop = false } = {}) {
   injectCss("ink", CSS);
-  const box = el("div", { class: "ink-mini" + (big ? " big" : "") });
-  if (slide.bg) box.appendChild(el("img", { src: slide.bg, alt: "", loading: "lazy", decoding: "async" }));
+  const box = el("div", { class: "ink-mini" + (big ? " big" : "") + (crop ? " crop" : "") });
+  const inner = crop ? el("div", { class: "ink-mini-in" }) : box;
+  if (crop) box.appendChild(inner);
+  if (slide.bg) inner.appendChild(el("img", { src: slide.bg, alt: "", loading: "lazy", decoding: "async" }));
   const cv = el("canvas", { width: big ? 960 : 480, height: big ? 600 : 300 });
-  box.appendChild(cv);
+  inner.appendChild(cv);
+  let page = { x0: 0, y0: 0, x1: 1, y1: 1 }, lastRec = null;
+  box.setPage = (r) => {
+    page = r;
+    const pw = r.x1 - r.x0, ph = r.y1 - r.y0;
+    box.style.setProperty("--pa", String((pw * 1.6) / ph));
+    Object.assign(inner.style, { width: (100 / pw) + "%", height: (100 / ph) + "%", left: (-r.x0 / pw * 100) + "%", top: (-r.y0 / ph * 100) + "%" });
+  };
+  box.setPx = (w) => {
+    const dpr = window.devicePixelRatio || 1;
+    const W = Math.max(160, Math.min(2400, Math.round(w / (page.x1 - page.x0) * dpr)));
+    if (Math.abs(cv.width - W) < 8) return;
+    cv.width = W; cv.height = Math.round(W / 1.6);
+    sig = null;
+    box.paint(lastRec);
+  };
   const baseS = Array.isArray(slide.strokes) ? slide.strokes : [];
   const baseT = Array.isArray(slide.texts) ? slide.texts : [];
   let sig = null;
   box.paint = (rec) => {
+    lastRec = rec;
     const r = rec || {};
     const st = r.strokes || [];
     // cloud.js가 레코드 변경마다 올리는 _v(비열거) + 개수·마지막 id (개별 원격 교체 시 개수가 같아도 감지)
@@ -559,10 +586,47 @@ function TeacherLive({ slide, session, ctx }) {
   // 학생/모둠 갤러리
   function makeGallery(kind) {
     const root = el("div", { class: "ink-gallery" });
-    const grid = el("div", { class: "ink-tiles" });
+    const grid = el("div", { class: "ink-tiles fit" });
     const emptyBox = el("div", { class: "ink-stage" });
     let emptyViewer = null, emptyFit = null;
     const tiles = new Map(); // id → { node, mini, dot, name, cnt }
+    let focus = { x0: 0, y0: 0, x1: 1, y1: 1 }, raf = 0, lastKey = "", curW = 0;
+    pageRectFor(slide.thumb || slide.bg).then(p => {
+      focus = p.focus;
+      for (const t of tiles.values()) t.mini.setPage(focus);
+      lastKey = ""; schedule();
+    });
+
+    // 칸 크기: 모두 한 화면에 들어오는 배치 중 가장 큰 칸. 최소 폭(200px)보다 작아지면 그 폭으로 두고 스크롤.
+    const GAP = 12, EXTRA = 40, MIN_W = 200; // EXTRA = 칸 안쪽 여백 + 이름 줄
+    function layout() {
+      raf = 0;
+      const n = grid.children.length;
+      const W = root.clientWidth - 4, H = root.clientHeight - 4;
+      if (!n || W <= 0 || H <= 0) return;
+      const A = (focus.x1 - focus.x0) * 1.6 / (focus.y1 - focus.y0); // 칸 그림 비율(가로/세로)
+      let best = { cols: 1, w: 0 };
+      for (let cols = 1; cols <= n; cols++) {
+        const rows = Math.ceil(n / cols);
+        const colW = (W - GAP * (cols - 1)) / cols;
+        const w = Math.min(colW, ((H - GAP * (rows - 1)) / rows - EXTRA) * A + 12);
+        if (w > best.w) best = { cols, w };
+        if (colW < MIN_W) break;
+      }
+      if (best.w < MIN_W) {
+        const cols = Math.max(1, Math.floor((W + GAP) / (MIN_W + GAP)));
+        best = { cols, w: (W - GAP * (cols - 1)) / cols };
+      }
+      const w = Math.floor(best.w);
+      const key = `${n}|${best.cols}|${w}`;
+      if (key === lastKey) return;
+      lastKey = key; curW = w;
+      grid.style.gridTemplateColumns = `repeat(${best.cols}, ${w}px)`;
+      for (const t of tiles.values()) t.mini.setPx(w - 12);
+    }
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(layout); };
+    const ro = new ResizeObserver(schedule);
+    ro.observe(root);
 
     function items() {
       const ss = ctx.session() || session;
@@ -603,7 +667,9 @@ function TeacherLive({ slide, session, ctx }) {
         seen.add(it.id);
         let t = tiles.get(it.id);
         if (!t) {
-          const mini = miniFrame(slide);
+          const mini = miniFrame(slide, { crop: true });
+          mini.setPage(focus);
+          if (curW) mini.setPx(curW - 12);
           const dot = el("i", { class: "dot" });
           const name = el("span", {});
           const cnt = el("em", { class: "ink-cnt" });
@@ -619,6 +685,7 @@ function TeacherLive({ slide, session, ctx }) {
         t.mini.paint(it.rec); // 레코드 변경 시만 다시 그림
       });
       for (const [id, t] of tiles) if (!seen.has(id)) { t.node.remove(); tiles.delete(id); }
+      schedule(); // 인원이 바뀌었을 수 있음(같으면 layout이 바로 끝남)
     }
     function updateDots() {
       const online = ctx.online() || new Set();
@@ -630,7 +697,7 @@ function TeacherLive({ slide, session, ctx }) {
     update();
     return {
       el: root, update, updateDots,
-      destroy() { emptyFit?.destroy(); emptyViewer?.destroy(); tiles.clear(); root.remove(); },
+      destroy() { ro.disconnect(); if (raf) cancelAnimationFrame(raf); emptyFit?.destroy(); emptyViewer?.destroy(); tiles.clear(); root.remove(); },
     };
   }
 
