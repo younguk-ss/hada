@@ -9,6 +9,7 @@ import "./slides/index.js"; // 슬라이드 타입 등록 (top-level await — �
 import { route, start, go } from "./router.js";
 import { mount, template, el } from "./ui.js";
 import { inkWord, inkWidth } from "./handwriting.js";
+import { initBrandBanner } from "./brand-banner.js";
 import { store, normCode } from "./store.js";
 import {
   initCloud, cloudReady, cloudLoginTeacher, cloudBootTeacher, cloudFindTeacherByCode, cloudJoinStudent,
@@ -332,3 +333,4 @@ route("/teacher/live", async () => {
 });
 
 start();
+initBrandBanner(); // 상단 제작자 배너 (페이지마다 잠깐 보였다가 사라짐)
