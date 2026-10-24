@@ -10,6 +10,9 @@ const PDFJS = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.min.mjs
 const PDFJS_WORKER = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.worker.min.mjs";
 const THUMB_W = 320;
 const MAX_SIDE = 2400;
+// 세로(학습지) 페이지는 학생이 확대해서 쓰므로 긴 변을 더 크게(A4 ≈ 2120×3000 ≈ 250dpi)
+const MAX_SIDE_PORTRAIT = 3000;
+const maxSideFor = (w, h) => (h > w ? MAX_SIDE_PORTRAIT : MAX_SIDE);
 const MAX_BYTES = 5 * 1024 * 1024 - 16 * 1024;
 const UPLOAD_OPTS = { contentType: "image/jpeg", cacheControl: "31536000", upsert: false };
 
@@ -108,7 +111,7 @@ async function encodeCanvas(cv, quality = 0.85) {
 async function encodeBlob(blob) {
   const bmp = await loadBitmap(blob);
   const w0 = bmp.width || bmp.naturalWidth, h0 = bmp.height || bmp.naturalHeight;
-  const k = Math.min(1, MAX_SIDE / Math.max(w0, h0));
+  const k = Math.min(1, maxSideFor(w0, h0) / Math.max(w0, h0));
   // 이미 적당한 JPEG면 재인코딩하지 않음(화질 보존)
   if (blob.type === "image/jpeg" && k === 1 && blob.size <= MAX_BYTES) {
     const thumb = await canvasToBlob(thumbCanvas(bmp, w0, h0), 0.8);
@@ -260,7 +263,10 @@ export async function fileToSlides(file, lessonId, onProgress) {
     for (let i = 1; i <= total && !failed; i++) {
       // 렌더는 순서대로(메모리), 업로드는 동시 3개까지
       const page = await doc.getPage(i);
-      const vp = page.getViewport({ scale: 1.6 });
+      // 긴 변 기준 해상도(세로 3000px · 가로 2400px), 배율 1.6~4
+      const vp1 = page.getViewport({ scale: 1 });
+      const scale = Math.min(4, Math.max(1.6, maxSideFor(vp1.width, vp1.height) / Math.max(vp1.width, vp1.height)));
+      const vp = page.getViewport({ scale });
       const cv = document.createElement("canvas");
       cv.width = Math.floor(vp.width);
       cv.height = Math.floor(vp.height);

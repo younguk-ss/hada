@@ -15,12 +15,15 @@
 //       기본 획은 지우개로 지우면 그 scope의 removed에만 기록(원본 불변). 전체 지우기는 Rec만 비운다.
 // 가정: id 없는 레거시 기본 획은 '#<i>'(i < 기본 획 수, 순서 불변)로 removed에 기록 가능. Rec 쪽 '#' 키는 불안정해 기록 안 함.
 // 가정: individual/group인데 scopeId가 없으면(구버전 호출) 빈 읽기 전용으로 그린다.
+// zoom: true → root(스테이지)가 확대·이동 뷰포트가 된다(js/zoom-view.js). 캔버스는 프레임 밖에서 뷰포트 전체를 덮고
+//       보기 변환으로 그리며, 프레임(배경·텍스트)은 확대된 실제 크기로 배치된다. 호출 쪽은 fitFrame을 쓰지 않는다.
 
 import { el } from "./ui.js";
 import { InkCanvas, strokeKey } from "./canvas.js";
 import { store } from "./store.js";
 import { cloudWriteRecord } from "./cloud.js";
 import { newId, injectCss } from "./slides/registry.js";
+import { createZoomView } from "./zoom-view.js";
 
 const BASE_CSS = `
 :where(.slide-frame) { position:relative; aspect-ratio:16/10; background:#fff; overflow:hidden; }
@@ -33,6 +36,10 @@ const BASE_CSS = `
 .slide-frame.tool-text .text-block { pointer-events:auto; }
 .slide-frame.tool-text .text-block.is-base { pointer-events:none; }
 .slide-frame.tool-text .text-block:hover, .slide-frame .text-block:focus { border-color:var(--accent); background:rgba(255,255,255,.65); }
+.zoom-view { position:relative; overflow:hidden; display:block !important; padding:0 !important; touch-action:none; -webkit-user-select:none; user-select:none; }
+.zoom-view, .zoom-view * { touch-action:none !important; }
+.zoom-view > .slide-frame { position:absolute; margin:0 !important; max-width:none !important; transform-origin:0 0; }
+.zoom-view > canvas.ink-view { position:absolute; left:0; top:0; width:100%; height:100%; transform-origin:0 0; z-index:1; }
 `;
 
 // 펜 굵기 → 글자 크기(기준 폭 960px)
@@ -40,18 +47,19 @@ function textSizeFor(size) { return size <= 2.5 ? 18 : size <= 4 ? 24 : 32; }
 
 const EMPTY = () => ({ strokes: [], texts: [], removed: [] });
 
-export function renderSlide({ root, slide, session, scope, scopeId, readOnly, authorId, onChange }) {
+export function renderSlide({ root, slide, session, scope, scopeId, readOnly, authorId, onChange, zoom = false }) {
   injectCss("lesson-view", BASE_CSS);
   const noScopeId = (scope === "individual" || scope === "group") && !scopeId;
   const writable = !readOnly && !noScopeId && scope !== "ppt" && scope !== "bg";
   const frame = el("div", { class: "slide-frame" + (writable ? "" : " readonly") });
   let img = null;
-  const canvas = el("canvas", {});
+  const canvas = el("canvas", zoom ? { class: "ink-view" } : {});
   const textLayer = el("div", { class: "text-layer" });
   syncBg();
-  frame.appendChild(canvas);
+  if (!zoom) frame.appendChild(canvas);
   frame.appendChild(textLayer);
   root.replaceChildren(frame);
+  if (zoom) { root.classList.add("zoom-view"); root.appendChild(canvas); }
 
   let textMode = false;
   let textSize = 18;
@@ -73,6 +81,9 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
       if (pendingRefresh) { pendingRefresh = false; setTimeout(() => { if (!destroyed) doRefresh(); }, 16); }
     },
   });
+
+  const zv = zoom ? createZoomView({ viewport: root, frame, canvas, ink, getImg: () => img, src: slide.thumb || slide.bg }) : null;
+  let zvSrc = slide.bg || null;
 
   doRefresh();
 
@@ -294,6 +305,7 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
   function doRefresh() {
     if (destroyed) return;
     syncBg();
+    if (zv && (slide.bg || null) !== zvSrc) { zvSrc = slide.bg || null; zv.setSource(slide.thumb || slide.bg); }
     const rec = pathFor(false);
     ink.setStrokes(baseN ? base.strokes.concat(rec.strokes) : rec.strokes, rec.removed || []);
     renderTexts();
@@ -310,6 +322,7 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
   return {
     ink,
     frame,
+    zoom: zv,
     setTool(t) {
       textMode = t === "text";
       frame.classList.toggle("tool-text", textMode && writable);
@@ -337,9 +350,11 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
       if (destroyed) return;
       if (textTimer) flushPersist(); // 입력 중이던 텍스트 저장
       destroyed = true;
+      zv?.destroy();
       ink.destroy();
       textEls.clear();
       frame.remove();
+      if (zoom) { canvas.remove(); root.classList.remove("zoom-view"); }
     },
   };
 }

@@ -121,6 +121,7 @@ js/storage.js           [A]  이미지 업로드·썸네일·base64 이전
 js/realtime.js          [A]  세션 채널: broadcast + presence (§5.4)
 js/canvas.js            [I]  InkCanvas: stroke id, undo, destroy, 소수 4자리
 js/lesson-view.js       [I]  renderSlide: 병합(tombstone), 디바운스 저장, dispose
+js/zoom-view.js         [I]  필기 화면 확대·이동(핀치·휠·버튼), 내용 영역 맞춤 — renderSlide({ zoom:true })
 js/slides/registry.js   [H]  레지스트리 + 헬퍼(effectiveMode, parseYouTubeId, groupStudents, fmtMs, shuffle, escapeHtml, newId)
 js/slides/common.js     [H]  플러그인 공용 UI: activityBar, choiceBars, countdownPill, loadYouTubeApi, normalizeAnswer, optionLetter
 js/slides/host.js       [H]  mountSlideHost + ctx (§6.2)
@@ -333,6 +334,13 @@ ctx = {
 - **타이머**: `setActivity({ phase:'running', startedAt, endsAt })`. 학생·교사 모두 `countdownPill(endsAt)`(10초 이하 빨강). `endsAt` 도달 시 **교사 클라이언트**가 `setActivity({ phase:'ended' })`, 학생은 로컬로도 잠금.
 - **게임(dino, race)**: `phase:'running'`일 때만 플레이. 교사 `[시작]`(idle→running) / `[종료]`(→ended) / `[다시]`(clearResponses → idle). 결과 `submit(payload, { itemKey:'result', score, correct, timeMs })`. TeacherLive = 리더보드.
 - 교사가 `running` 중인 게임 슬라이드에서 다른 슬라이드로 이동하면 teacher.js가 `confirmDialog('게임을 종료하고 넘어갈까요?')` → 예: `ended`로 만든 뒤 이동(코어 규칙: `def.category==='game' && activity.phase==='running'`).
+
+#### 필기 확대·이동 (v2.4)
+- 필기 화면(편집기 · 교사 전체 · 학생 · 학생 필기 크게 보기)은 `renderSlide({ zoom:true })`. 스테이지가 보기 영역이고 프레임(배경·텍스트)은 확대된 실제 크기로 배치(원본 해상도로 다시 그려 선명), 캔버스는 보기 영역 크기 비트맵 + `InkCanvas.setView({ox,oy,cw,ch,baseW})`(확대해도 선명·메모리 일정). 제스처 중엔 GPU transform 미리보기 → 손을 떼면 확정.
+- 맞춤: 배경이 세로(가로/세로 ≤ 1.25)면 썸네일을 분석해 흰 여백을 뺀 내용 영역이 화면에 꽉 차게(내용이 종이의 25% 미만이거나 읽을 수 없으면 종이 전체). 이동은 종이 안에서만. 회전·크기 변화 시 맞춤 상태면 다시 맞춤.
+- 입력: 펜·마우스 = 필기, 한 손가락 = 필기(이 페이지에서 펜을 한 번 쓰면 손바닥 오인 방지로 한 손가락은 무시), 두 손가락 = 확대·이동, 읽기 전용·텍스트 도구는 한 손가락/마우스 끌기 = 이동, Ctrl(⌘)+휠·트랙패드 핀치 = 확대, 휠 = 이동. 확대 배율 1(16:10 전체) ~ 맞춤×4. 지우개 반경은 확대 배율만큼 줄인다.
+- 학생 화면: 스테이지 여백 0, 도구바가 덮는 만큼만 맞춤에서 비움(이동하면 도구바 뒤로도 보임). 가로로 남는 화면이면 도구바를 왼쪽 세로 2열로(낮은 화면은 40px 버튼). 도구바에 `[− 100% +]`(100% = 맞춤, 누르면 맞춤 ↔ 폭 맞춤). 발표(읽기 전용)·교사 화면은 오른쪽 아래 작은 확대 버튼. 필기 화면에서는 페이지 자체 확대를 막는다(`.stu:has(.zoom-view)`).
+- 가져오기 해상도: PDF·이미지 긴 변 세로 3000px / 가로 2400px(PDF 배율 1.6~4). 이전에 올린 자료(배율 1.6)는 다시 올려야 선명해진다.
 
 ### 6.4 타입별 상세
 

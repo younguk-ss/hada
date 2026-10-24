@@ -10,6 +10,9 @@
 // 가정: id 없는 레거시 획은 원래 배열 인덱스로 '#<i>' 키를 쓴다(지우개 commit의 ids에 그대로 실림).
 // 가정: 압력 p는 소수 2자리로 반올림(x·y는 4자리).
 // 가정: 실시간 캔버스 선 굵기 = size × dpr × clamp(프레임폭/960, 0.7, 1.6). 미니(paintStrokes)는 폭/960 비례.
+// 6) 보기 변환(setView): 확대·이동 화면에서는 캔버스가 보이는 영역(뷰포트) 크기만큼만 비트맵을 갖고,
+//    슬라이드(정규화 0..1)가 그 안에서 놓인 위치·크기 {ox, oy, cw, ch, baseW}(CSS px)로 그린다 → 확대해도 선이 선명하고 메모리 일정.
+//    baseW = 확대 1배일 때 슬라이드 폭(선 굵기 기준). 보기가 없으면 캔버스 전체 = 슬라이드(기존 동작).
 
 import { newId } from "./slides/registry.js";
 
@@ -46,6 +49,8 @@ export class InkCanvas {
     this.cacheValid = false;
     this._raf = 0;
     this._k = this.dpr;
+    this.view = null;            // 보기 변환 (없으면 캔버스 전체)
+    this._cssW = 0; this._cssH = 0;
 
     this._ro = new ResizeObserver(() => this.resize());
     this._ro.observe(canvas);
@@ -79,6 +84,20 @@ export class InkCanvas {
     this._appendToCache(s);
     this._scheduleDraw();
   }
+  // 보기 변환 갱신 → 확정 획 다시 그림. v = { ox, oy, cw, ch, baseW } | null
+  setView(v) {
+    this.view = v ? { ox: v.ox, oy: v.oy, cw: v.cw, ch: v.ch, baseW: v.baseW || v.cw } : null;
+    this._updateK();
+    this.cacheValid = false;
+    this._scheduleDraw();
+  }
+  // 그리던 획 버리기(두 손가락 확대가 시작될 때 등). 저장하지 않음.
+  cancelStroke() {
+    if (!this.current) return;
+    const pid = this._pid;
+    this._cancelCurrent();
+    try { if (pid != null) this.canvas.releasePointerCapture(pid); } catch (_) {}
+  }
   setTool(t) { this.tool = t; }
   setColor(c) { this.color = c; }
   setSize(s) { this.size = s; }
@@ -109,10 +128,13 @@ export class InkCanvas {
     if (this._destroyed) return;
     const { canvas } = this;
     this.dpr = window.devicePixelRatio || 1; // 모니터 이동 시 갱신
+    // 레이아웃 크기(변환 무시) — 확대 중 CSS transform이 걸려 있어도 비트맵 크기가 흔들리지 않게
     const r = canvas.getBoundingClientRect();
-    const w = Math.max(1, Math.round(r.width * this.dpr));
-    const h = Math.max(1, Math.round(r.height * this.dpr));
-    this._k = this.dpr * Math.min(1.6, Math.max(0.7, (r.width || REF_W) / REF_W));
+    this._cssW = canvas.clientWidth || r.width;
+    this._cssH = canvas.clientHeight || r.height;
+    const w = Math.max(1, Math.round(this._cssW * this.dpr));
+    const h = Math.max(1, Math.round(this._cssH * this.dpr));
+    this._updateK();
     if (canvas.width === w && canvas.height === h && this.cache.width === w) return;
     canvas.width = w; canvas.height = h;
     this.cache.width = w; this.cache.height = h;
@@ -133,14 +155,31 @@ export class InkCanvas {
     this.cache.width = this.cache.height = 0;
   }
 
+  // 슬라이드가 캔버스 안에서 차지하는 영역(CSS px)
+  _v() {
+    return this.view || { ox: 0, oy: 0, cw: this._cssW || 1, ch: this._cssH || 1, baseW: this._cssW || REF_W };
+  }
+  _updateK() {
+    const v = this._v();
+    // 기존 규칙(프레임폭/960, 0.7~1.6) × 확대 배율
+    this._k = this.dpr * Math.min(1.6, Math.max(0.7, (v.baseW || REF_W) / REF_W)) * ((v.cw || 1) / (v.baseW || v.cw || 1));
+  }
+  // 이 보기에서 화면 1px이 슬라이드 폭의 몇 배로 커 보이는지(1 = 확대 안 함)
+  zoomFactor() { const v = this._v(); return (v.cw || 1) / (v.baseW || v.cw || 1); }
+
   _toNorm(ev) {
-    const r = this.canvas.getBoundingClientRect();
+    const c = this.canvas;
+    const r = c.getBoundingClientRect();
+    const sx = (c.clientWidth || r.width) / (r.width || 1), sy = (c.clientHeight || r.height) / (r.height || 1);
+    const v = this._v();
     return {
-      x: (ev.clientX - r.left) / (r.width || 1),
-      y: (ev.clientY - r.top) / (r.height || 1),
+      x: ((ev.clientX - r.left) * sx - v.ox) / (v.cw || 1),
+      y: ((ev.clientY - r.top) * sy - v.oy) / (v.ch || 1),
       p: ev.pressure && ev.pressure > 0 ? ev.pressure : 0.5,
     };
   }
+  // 보기 영역 밖(슬라이드 바깥 여백)에서 시작한 획은 받지 않는다
+  _inside(pt) { return !this.view || (pt.x >= 0 && pt.x <= 1 && pt.y >= 0 && pt.y <= 1); }
 
   _cancelCurrent() {
     if (!this.current) return;
@@ -159,9 +198,11 @@ export class InkCanvas {
       if (this.readOnly || this._destroyed) return;
       if (e.pointerType === "mouse" && e.button !== 0) return;
       if (this.current) return; // 멀티터치: 첫 포인터만
-      pid = e.pointerId;
-      try { c.setPointerCapture(pid); } catch (_) {}
       const pt = this._toNorm(e);
+      if (!this._inside(pt)) return;
+      pid = e.pointerId;
+      this._pid = pid;
+      try { c.setPointerCapture(pid); } catch (_) {}
       this.current = {
         tool: this.tool,
         color: this.color,
@@ -195,12 +236,13 @@ export class InkCanvas {
       const s = this.current;
       this.current = null;
       try { c.releasePointerCapture(pid); } catch (_) {}
-      pid = null;
+      pid = null; this._pid = null;
       if (s.tool === "eraser") {
         const ids = [];
         const keepS = [], keepK = [];
+        const zf = this.zoomFactor(); // 확대해서 지우면 화면에서 보이는 만큼만 지움
         this.strokes.forEach((stk, i) => {
-          if (this._intersects(stk, s)) ids.push(this._keys[i]);
+          if (this._intersects(stk, s, zf)) ids.push(this._keys[i]);
           else { keepS.push(stk); keepK.push(this._keys[i]); }
         });
         if (ids.length) {
@@ -236,8 +278,8 @@ export class InkCanvas {
     }
   }
 
-  _intersects(stroke, eraser) {
-    const r = (eraser.size || 12) / 1000 + 0.012;
+  _intersects(stroke, eraser, zf = 1) {
+    const r = ((eraser.size || 12) / 1000 + 0.012) / Math.max(1, zf);
     const r2_ = r * r;
     for (const ep of eraser.points) {
       for (const p of stroke.points) {
@@ -263,19 +305,35 @@ export class InkCanvas {
     if (!this.cacheValid) this._rebuildCache();
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(this.cache, 0, 0);
-    if (this.current) drawStroke(ctx, this.current, canvas.width, canvas.height, this._k);
+    if (this.current) this._paint(ctx, [this.current]);
+  }
+
+  // 보기 변환을 적용해 획 그리기(슬라이드 영역 밖은 잘라냄)
+  _paint(g, list) {
+    if (!this.view) {
+      for (const s of list) drawStroke(g, s, g.canvas.width, g.canvas.height, this._k);
+      return;
+    }
+    const v = this.view, d = g.canvas.width / (this._cssW || 1);
+    g.save();
+    g.beginPath();
+    g.rect(v.ox * d, v.oy * d, v.cw * d, v.ch * d);
+    g.clip();
+    g.translate(v.ox * d, v.oy * d);
+    for (const s of list) drawStroke(g, s, v.cw * d, v.ch * d, this._k);
+    g.restore();
   }
 
   _rebuildCache() {
     const { cache, cacheCtx } = this;
     cacheCtx.clearRect(0, 0, cache.width, cache.height);
-    for (const s of this.strokes) drawStroke(cacheCtx, s, cache.width, cache.height, this._k);
+    this._paint(cacheCtx, this.strokes);
     this.cacheValid = true;
   }
 
   _appendToCache(stroke) {
     if (!this.cacheValid) return; // 다음 _render에서 통째로 rebuild
-    drawStroke(this.cacheCtx, stroke, this.cache.width, this.cache.height, this._k);
+    this._paint(this.cacheCtx, [stroke]);
   }
 
   // 외부에서 강제로 다시 그리고 싶을 때

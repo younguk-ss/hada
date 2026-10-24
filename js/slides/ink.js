@@ -5,6 +5,9 @@
 //       { close } 를 반환한다. 닫힘은 onClose 외에 body가 DOM에서 빠지는 것으로도 감지한다.
 // 가정: 프레임 크기는 스테이지 크기에 맞춰 JS로 contain(16:10) 맞춤(ResizeObserver).
 // 가정: 도구 상태(도구·색·굵기)는 모듈 단위로 기억(슬라이드를 넘겨도 유지).
+// 확대: 필기 화면(편집기·교사 전체·학생·학생 필기 크게 보기)은 renderSlide({ zoom:true }) — 두 손가락·휠·도구바 [− 100% +].
+//       학생 화면은 스테이지 전체가 보기 영역이고, 도구바가 덮는 만큼만 맞춤에서 비운다(이동하면 도구바 뒤로도 보임).
+//       가로로 남는 화면이면 도구바를 왼쪽 세로 2열로 옮겨 슬라이드를 키운다(어느 쪽이 더 크게 보이는지 계산해 선택).
 // 가정: 갤러리 온라인 점은 realtime.currentChannel().onPresence로 갱신(없으면 onSession 때만).
 import * as ui from "../ui.js";
 import * as cloud from "../cloud.js";
@@ -34,12 +37,15 @@ const SVG = {
   eraser: '<path d="M7 20h12"/><path d="M5 15l9-9 5 5-8 8H8z"/><path d="M10 10l5 5"/>',
   text: '<path d="M5 6V4h14v2"/><path d="M12 4v16"/><path d="M9 20h6"/>',
   undo: '<path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 010 12h-3"/>',
+  zoomIn: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.4-4.4"/><path d="M8.2 11h5.6M11 8.2v5.6"/>',
+  zoomOut: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.4-4.4"/><path d="M8.2 11h5.6"/>',
   users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0113 0"/><path d="M16 4.5a3.5 3.5 0 010 7"/><path d="M18 14a6 6 0 013.5 6"/>',
 };
 const PEN_ICON = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${SVG.pen}</svg>`;
 
+const LOCAL_ICONS = new Set(["zoomIn", "zoomOut"]); // 앱 공용 아이콘에 없는 것
 function icon(name) {
-  if (typeof ui.icon === "function") {
+  if (typeof ui.icon === "function" && !LOCAL_ICONS.has(name)) {
     try { const n = ui.icon(name); if (n) return n; } catch (_) {}
   }
   return el("span", { class: "ink-ic", html: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${SVG[name] || ""}</svg>` });
@@ -66,6 +72,30 @@ const CSS = `
 .ink-swatch.active i { box-shadow:0 0 0 2px var(--surface), 0 0 0 4px var(--c); }
 .ink-size i { display:block; border-radius:50%; background:currentColor; }
 .ink-toolbar .btn { margin-left:4px; }
+.ink-zlbl { min-width:52px; height:36px; padding:0 6px; border:0; border-radius:var(--radius-sm); background:transparent; color:var(--ink-2);
+  font:600 12.5px/1 var(--font); font-variant-numeric:tabular-nums; cursor:pointer; flex:none; }
+.ink-zlbl:hover { background:var(--surface-2); }
+.ink-float .ink-zlbl { height:44px; min-width:48px; }
+.ink-float .ink-swatch { width:40px; min-width:40px; } /* 아이패드 세로(810~834px)에서 한 줄에 다 들어가게 */
+.ink-wrap.bar-side .ink-float .ink-swatch { width:44px; }
+/* 낮은 가로 화면(노트북·가로 태블릿 일부): 40px 버튼으로 한 줄에 다 보이게 */
+.ink-wrap.bar-side.bar-compact .ink-float { grid-template-columns:repeat(2, 40px); padding:4px; }
+.ink-wrap.bar-side.bar-compact .ink-float .ink-tool, .ink-wrap.bar-side.bar-compact .ink-float .ink-size,
+.ink-wrap.bar-side.bar-compact .ink-float .ink-swatch { width:40px; height:40px; min-width:40px; min-height:40px; }
+.ink-wrap.bar-side.bar-compact .ink-float .ink-sep { margin:3px 4px; }
+.ink-wrap.bar-side.bar-compact .ink-float .ink-zlbl { height:32px; }
+.ink-wrap .ink-stage.zoom-view { padding:0; }
+/* 학생: 넓은 화면이면 도구바를 왼쪽 세로 2열로(슬라이드가 더 커짐) */
+.ink-wrap.bar-side .ink-float { left:max(8px, env(safe-area-inset-left)); top:50%; bottom:auto; transform:translateY(-50%);
+  display:grid; grid-template-columns:repeat(2, 44px); align-content:start; max-width:none; max-height:calc(100% - 16px);
+  overflow-x:hidden; overflow-y:auto; padding:6px; }
+.ink-wrap.bar-side .ink-float .ink-grp { display:contents; }
+.ink-wrap.bar-side .ink-float .ink-sep { grid-column:1 / -1; width:auto; height:1px; margin:4px 6px; }
+.ink-wrap.bar-side .ink-float .ink-sep.sep-undo { display:none; }
+.ink-wrap.bar-side .ink-float .ink-zlbl { grid-column:1 / -1; order:2; width:auto; }
+/* 읽기 전용(발표): 확대 버튼만 오른쪽 아래에 작게 */
+.ink-float.ink-zoombar { left:auto; right:max(8px, env(safe-area-inset-right)); transform:none; padding:4px; z-index:6;
+  background:rgba(255,255,255,.82); -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px); }
 .ink-float { position:absolute; left:50%; bottom:calc(8px + env(safe-area-inset-bottom)); transform:translateX(-50%); z-index:5;
   flex-wrap:nowrap; overflow-x:auto; max-width:calc(100% - 16px); scrollbar-width:none; box-shadow:var(--shadow-2); }
 .ink-float::-webkit-scrollbar { display:none; }
@@ -165,7 +195,38 @@ function fitFrame(stage) {
 }
 
 // 도구바: 펜·형광·지우개·텍스트 | 색 6 | S/M/L | 되돌리기 (+ extras)
-function makeToolbar(getViewer, { float = false, extras = [] } = {}) {
+// 확대 버튼 [− 100% +] — viewer.zoom이 있을 때. bindZoom(viewer)로 퍼센트 표시를 연결
+function zoomGroup(getViewer) {
+  const lbl = el("button", { type: "button", class: "ink-zlbl", title: "화면에 맞춤 / 폭 맞춤", "aria-label": "확대 비율 · 맞춤",
+    onClick: () => getViewer()?.zoom?.toggleFit() }, "100%");
+  const grp = el("div", { class: "ink-grp ink-zgrp" }, [
+    el("button", { type: "button", class: "ink-tool", title: "축소", "aria-label": "축소", onClick: () => getViewer()?.zoom?.zoomOut() }, [icon("zoomOut")]),
+    lbl,
+    el("button", { type: "button", class: "ink-tool", title: "확대", "aria-label": "확대", onClick: () => getViewer()?.zoom?.zoomIn() }, [icon("zoomIn")]),
+  ]);
+  let off = null;
+  grp.bindZoom = (viewer) => {
+    try { off && off(); } catch (_) {}
+    off = null;
+    const z = viewer?.zoom;
+    grp.hidden = !z;
+    if (!z) return;
+    const show = () => { const t = z.percent() + "%"; if (lbl.textContent !== t) lbl.textContent = t; };
+    off = z.onChange(show);
+    show();
+  };
+  return grp;
+}
+
+// 오른쪽 아래 작은 확대 버튼(교사 화면·학생 발표 모드) — 도구바가 두 줄로 늘어나지 않게 따로 띄운다
+function zoomPill(getViewer) {
+  const zg = zoomGroup(getViewer);
+  const pill = el("div", { class: "ink-toolbar ink-float ink-zoombar" }, [zg]);
+  pill.bindZoom = (v) => zg.bindZoom(v);
+  return pill;
+}
+
+function makeToolbar(getViewer, { float = false, extras = [], zoom = false } = {}) {
   const st = toolState;
   const apply = () => {
     const v = getViewer();
@@ -188,14 +249,16 @@ function makeToolbar(getViewer, { float = false, extras = [] } = {}) {
   // 색 칸에 style 객체의 커스텀 속성 반영(el()은 Object.assign이라 --c가 안 들어감)
   colorBtns.forEach(b => b.style.setProperty("--c", b.dataset.id));
 
+  const zg = zoom ? zoomGroup(getViewer) : null;
   const bar = el("div", { class: "ink-toolbar" + (float ? " ink-float" : "") }, [
     el("div", { class: "ink-grp" }, toolBtns),
     el("span", { class: "ink-sep" }),
     el("div", { class: "ink-grp" }, colorBtns),
     el("span", { class: "ink-sep" }),
     el("div", { class: "ink-grp" }, sizeBtns),
-    el("span", { class: "ink-sep" }),
+    el("span", { class: "ink-sep sep-undo" }),
     undoBtn,
+    ...(zg ? [el("span", { class: "ink-sep" }), zg] : []),
     ...extras,
   ]);
   function sync() {
@@ -206,6 +269,7 @@ function makeToolbar(getViewer, { float = false, extras = [] } = {}) {
   sync();
   bar.sync = sync;
   bar.apply = apply;
+  bar.bindZoom = (viewer) => zg?.bindZoom(viewer);
   return bar;
 }
 
@@ -273,7 +337,7 @@ function Editor({ slide, lesson, update, ctx }) {
   const wrap = el("div", { class: "ink-wrap ink-editor" });
   const stage = el("div", { class: "ink-stage" });
   const viewer = renderSlide({
-    root: stage, slide, session: null, scope: "edit", readOnly: false,
+    root: stage, slide, session: null, scope: "edit", readOnly: false, zoom: true,
     authorId: ctx?.me?.id || lesson?.teacherId || null,
     onChange: () => update({ strokes: slide.strokes, texts: slide.texts }),
   });
@@ -286,9 +350,10 @@ function Editor({ slide, lesson, update, ctx }) {
     },
   }, "전체 지우기");
   const bar = makeToolbar(() => viewer, { extras: [clearBtn] });
-  wrap.append(bar, stage);
+  const zp = zoomPill(() => viewer);
+  wrap.append(bar, stage, zp);
   bar.apply();
-  const fit = fitFrame(stage);
+  zp.bindZoom(viewer);
 
   // 인스펙터: 배경 이미지 · 기본 모드
   const bgBox = el("div", { class: "ink-insp-bg" });
@@ -356,7 +421,7 @@ function Editor({ slide, lesson, update, ctx }) {
   return {
     el: wrap,
     inspector,
-    destroy() { fit.destroy(); viewer.destroy(); },
+    destroy() { viewer.destroy(); },
   };
 }
 
@@ -364,7 +429,7 @@ function Editor({ slide, lesson, update, ctx }) {
 function Student({ slide, session, me, ctx }) {
   ctx.injectCss("ink", CSS);
   const wrap = el("div", { class: "ink-wrap ink-stu" });
-  let viewer = null, bar = null, fit = null, key = null;
+  let viewer = null, bar = null, key = null, stage = null, offPage = null;
 
   function scopeFor() {
     const ss = ctx.session() || session;
@@ -378,30 +443,55 @@ function Student({ slide, session, me, ctx }) {
     return { scope: "whole", scopeId: ss?.id, readOnly: true }; // 발표
   }
   function teardown() {
-    fit?.destroy(); fit = null;
+    try { offPage && offPage(); } catch (_) {}
+    offPage = null;
     viewer?.destroy(); viewer = null;
     bar?.remove(); bar = null;
+    stage = null;
   }
+  // 도구바 위치(아래 가로 / 왼쪽 세로) 중 맞춤 대상이 더 크게 보이는 쪽을 골라 그만큼만 맞춤에서 비운다
+  function placeBar() {
+    const z = viewer?.zoom;
+    if (!z || !stage || !bar) return;
+    const W = stage.clientWidth, H = stage.clientHeight;
+    if (!W || !H) return;
+    if (bar.classList.contains("ink-zoombar")) { z.setInsets({}); return; } // 작은 확대 버튼은 비우지 않음
+    const pa = z.focusAspect() || 1.6;
+    const page = (w, h) => Math.min(w / pa, h);           // 맞춤 대상의 화면 높이
+    const bottomH = page(W - 20, H - 84 - 20);            // 도구바(56) + 아래 여백(8+틈)
+    const sideH = page(W - 120 - 20, H - 20);             // 2열(100) + 왼쪽 여백(8+틈)
+    const side = sideH > bottomH * 1.04 && H >= 280;
+    wrap.classList.toggle("bar-side", side);
+    wrap.classList.toggle("bar-compact", side && H < 540);
+    const sr = stage.getBoundingClientRect(), br = bar.getBoundingClientRect();
+    z.setInsets(side ? { left: Math.max(0, br.right - sr.left) + 2 } : { bottom: Math.max(0, sr.bottom - br.top) + 2 });
+  }
+  const ro = new ResizeObserver(() => placeBar());
+  ro.observe(wrap);
   function mount(s) {
     teardown();
-    wrap.classList.remove("has-float");
+    wrap.classList.remove("has-float", "bar-side", "bar-compact");
     if (!s.scope) {
       wrap.replaceChildren(el("div", { class: "ink-wait" }, [el("div", { class: "empty" }, "모둠을 기다리고 있어요")]));
       return;
     }
-    const stage = el("div", { class: "ink-stage" });
+    stage = el("div", { class: "ink-stage" });
     wrap.replaceChildren(stage);
     viewer = renderSlide({
-      root: stage, slide, session: ctx.session() || session,
+      root: stage, slide, session: ctx.session() || session, zoom: true,
       scope: s.scope, scopeId: s.scopeId, readOnly: s.readOnly, authorId: me?.id || null,
     });
     if (!s.readOnly) {
-      bar = makeToolbar(() => viewer, { float: true });
-      wrap.appendChild(bar);
-      wrap.classList.add("has-float");
+      bar = makeToolbar(() => viewer, { float: true, zoom: true });
       bar.apply();
+    } else {
+      bar = zoomPill(() => viewer); // 발표(읽기 전용): 확대 버튼만
     }
-    fit = fitFrame(stage);
+    wrap.appendChild(bar);
+    wrap.classList.add("has-float");
+    bar.bindZoom(viewer);
+    offPage = viewer.zoom?.onChange((kind) => { if (kind === "page") placeBar(); }) || null;
+    placeBar();
   }
   function check() {
     const s = scopeFor();
@@ -415,7 +505,7 @@ function Student({ slide, session, me, ctx }) {
     el: wrap,
     onActivity: check,
     onSession: check,
-    destroy() { teardown(); },
+    destroy() { ro.disconnect(); teardown(); },
   };
 }
 
@@ -447,7 +537,7 @@ function TeacherLive({ slide, session, ctx }) {
     if (bodyKey === "whole") {
       const stage = el("div", { class: "ink-stage" });
       const ss = ctx.session() || session;
-      viewer = renderSlide({ root: stage, slide, session: ss, scope: "whole", scopeId: ss?.id, readOnly: false, authorId: me?.id || null });
+      viewer = renderSlide({ root: stage, slide, session: ss, scope: "whole", scopeId: ss?.id, readOnly: false, authorId: me?.id || null, zoom: true });
       const clearBtn = el("button", {
         type: "button", class: "btn btn-sm btn-ghost",
         onClick: async () => {
@@ -456,9 +546,10 @@ function TeacherLive({ slide, session, ctx }) {
         },
       }, "전체 지우기");
       bar = makeToolbar(() => viewer, { extras: [clearBtn] });
-      wrap.replaceChildren(bar, stage);
+      const zp = zoomPill(() => viewer);
+      wrap.replaceChildren(bar, stage, zp);
       bar.apply();
-      fit = fitFrame(stage);
+      zp.bindZoom(viewer);
     } else {
       gal = makeGallery(bodyKey);
       wrap.replaceChildren(gal.el);
@@ -553,19 +644,19 @@ function TeacherLive({ slide, session, ctx }) {
     const z = { kind, id, viewer: null, fit: null, modal: null };
     z.viewer = renderSlide({
       root: stage, slide, session: ss, scope: kind === "group" ? "group" : "individual", scopeId: id,
-      readOnly: false, authorId: me?.id || null,
+      readOnly: false, authorId: me?.id || null, zoom: true,
     });
     const zbar = makeToolbar(() => z.viewer);
-    body.append(zbar, stage);
+    const zp = zoomPill(() => z.viewer);
+    body.append(zbar, stage, zp);
     zbar.apply();
-    z.fit = fitFrame(stage);
+    zp.bindZoom(z.viewer);
     zoom = z;
     z.modal = openModal(ctx, {
       title, body,
       actions: [], // 닫기는 모달 X·바깥 탭
       onClose: () => { if (zoom === z) zoom = null; z.fit?.destroy(); z.viewer?.destroy(); },
     });
-    setTimeout(() => z.fit?.fit(), 30);
   }
   function closeZoom() {
     if (!zoom) return;
