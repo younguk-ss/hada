@@ -13,6 +13,7 @@
 // 6) 보기 변환(setView): 확대·이동 화면에서는 캔버스가 보이는 영역(뷰포트) 크기만큼만 비트맵을 갖고,
 //    슬라이드(정규화 0..1)가 그 안에서 놓인 위치·크기 {ox, oy, cw, ch, baseW}(CSS px)로 그린다 → 확대해도 선이 선명하고 메모리 일정.
 //    baseW = 확대 1배일 때 슬라이드 폭(선 굵기 기준). 보기가 없으면 캔버스 전체 = 슬라이드(기존 동작).
+// 7) 확대해서 쓰면 새 획은 배율만큼 가늘게 저장(굿노트 식) → 화면에서 보이는 굵기는 그대로, 슬라이드 위에서는 더 가늘고 작다.
 
 import { newId } from "./slides/registry.js";
 
@@ -206,8 +207,8 @@ export class InkCanvas {
       this.current = {
         tool: this.tool,
         color: this.color,
-        // 형광펜은 굵게
-        size: this.tool === "highlight" ? this.size * 4 : this.size,
+        // 형광펜은 굵게. 확대 중이면 배율만큼 가늘게(화면 굵기 유지)
+        size: Math.max(0.1, r2((this.tool === "highlight" ? this.size * 4 : this.size) / this.zoomFactor())),
         points: [pt],
         ts: Date.now(),
       };
@@ -279,7 +280,8 @@ export class InkCanvas {
   }
 
   _intersects(stroke, eraser, zf = 1) {
-    const r = ((eraser.size || 12) / 1000 + 0.012) / Math.max(1, zf);
+    // 지우개 획 굵기는 이미 배율로 나뉘어 있음 → 고정 여유분만 배율로 줄임
+    const r = (eraser.size || 12) / 1000 + 0.012 / Math.max(1, zf);
     const r2_ = r * r;
     for (const ep of eraser.points) {
       for (const p of stroke.points) {

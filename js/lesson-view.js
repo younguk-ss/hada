@@ -11,6 +11,7 @@
 // 가정: 지운 텍스트 id도 removed에 넣는다(병합 시 되살아나지 않게). 렌더 시 removed의 텍스트도 제외.
 // 가정: 텍스트 글자 크기는 기준 폭 960px 대비 비율(cqw)로 그린다 → 화면 크기와 무관하게 같은 위치·비율.
 // 가정: 텍스트 블록은 텍스트 도구일 때만 탭/편집 가능(펜일 때는 위에 필기 가능).
+// 가정: 확대 중에 만든 텍스트는 배율만큼 작은 글자 크기로 저장(펜 획과 같은 규칙, canvas.js 7).
 // 가정: edit 외 scope에서는 slide.strokes/texts(편집기 기본 필기, 스냅샷에 포함)를 바닥 레이어로 함께 그린다.
 //       기본 획은 지우개로 지우면 그 scope의 removed에만 기록(원본 불변). 전체 지우기는 Rec만 비운다.
 // 가정: id 없는 레거시 기본 획은 '#<i>'(i < 기본 획 수, 순서 불변)로 removed에 기록 가능. Rec 쪽 '#' 키는 불안정해 기록 안 함.
@@ -277,7 +278,8 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
       x: Math.round(Math.min(0.95, Math.max(0, (e.clientX - r.left) / r.width)) * 10000) / 10000,
       y: Math.round(Math.min(0.95, Math.max(0, (e.clientY - r.top) / r.height)) * 10000) / 10000,
       value: "",
-      size: textSize,
+      // 확대 중이면 배율만큼 작게(화면에서 보이는 글자 크기 유지, 굿노트 식)
+      size: Math.max(2, Math.round(textSize / ink.zoomFactor() * 100) / 100),
       color: ink.color,
       ts: Date.now(),
     };
