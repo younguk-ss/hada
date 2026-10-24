@@ -1,20 +1,24 @@
 // 인쇄: 학생 개별 결과(슬라이드·학생 선택) + 기록 화면 인쇄
-// - A4 세로, 여백 최소. 학습지 이미지(특히 A4 세로 PDF)는 16:10 틀의 여백을 잘라 종이 한 장을 꽉 채운다.
+// - A4 세로, 여백 최소(가장자리 5mm — 대부분의 프린터가 찍을 수 있는 안쪽). 학습지 이미지는 16:10 틀의 여백을 잘라내고,
+//   세로 학습지는 PDF 자체의 흰 여백까지 잘라(내용 영역 ∪ 필기 범위) 종이 한 장을 꽉 채운다.
 // - 종이마다 오른쪽 위에 작은 워터마크(assets/print-mark.png), 머리글(수업 이름·학생)은 작게.
 // - 학습지(학생 결과·빈 학습지)는 장마다 머리글에 그 수업의 복습 QR + 코드 → 학생이 찍으면 자기 페이스로 복습(/r/CODE).
 // 가정: 필기 좌표는 16:10 프레임 기준(0..1), 배경은 object-fit: contain → 이미지 영역을 계산해 잘라낸다.
 // 가정: 복습 코드를 못 만들면(열 없는 DB·오프라인) QR 없이 인쇄하고 toast로 알린다.
+// 가정: 내용 영역은 확대 보기와 같은 분석(zoom-view pageRectFor: 썸네일의 흰색 아닌 범위 + 2% 여유, 세로 학습지만)을 쓴다.
+//       못 읽거나 가로 슬라이드면 종이 전체. 필기·텍스트가 내용 영역 밖(학습지 흰 여백)에 있으면 그만큼 넓힌다.
 import { el, modal, toast, icon } from "./ui.js";
 import { findStudent, studentLabel } from "./store.js";
 import { drawStroke, strokeKey } from "./canvas.js";
 import { getSlideType, effectiveMode, injectCss } from "./slides/index.js";
 import { cloudEnsureReviewCode } from "./cloud.js";
+import { pageRectFor } from "./zoom-view.js";
 
 const MARK = "assets/print-mark.png";
 const FRAME = 16 / 10;        // 슬라이드 프레임 비율
 const REF_W = 960;            // canvas.js 의 선 굵기 기준 폭
-const PAGE_W = 196;           // A4 210mm - 좌우 7mm
-const BODY_H = 270;           // A4 297mm - 위 5 - 머리 13 - 아래 7 - 여유 2
+const PAGE_W = 200;           // A4 210mm - 좌우 5mm
+const BODY_H = 272;           // A4 297mm - 위 5 - 머리 13 - 아래 5 - 여유 2
 const GAP = 4;                // 슬라이드 사이(mm)
 const PX_W = 1600;            // 출력 이미지 폭(px) ≈ 200dpi
 
@@ -27,7 +31,7 @@ injectCss("print", `
   html.pp-record .pp-fixed-mark{display:block}
 }
 #print-root,#print-root *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
-.pp-sheet{width:210mm;height:296.5mm;box-sizing:border-box;padding:5mm 7mm 7mm;display:flex;flex-direction:column;break-after:page;page-break-after:always;overflow:hidden;background:#fff;color:#1c1c22}
+.pp-sheet{width:210mm;height:296.5mm;box-sizing:border-box;padding:5mm;display:flex;flex-direction:column;break-after:page;page-break-after:always;overflow:hidden;background:#fff;color:#1c1c22}
 .pp-sheet:last-child{break-after:auto;page-break-after:auto}
 .pp-sheet.flow{height:auto;overflow:visible}
 .pp-head{flex:none;height:13mm;display:flex;align-items:center;gap:3mm;font:500 8.5pt/1.25 "Pretendard Variable",Pretendard,sans-serif;color:#6b6b72}
@@ -113,6 +117,25 @@ function recordFor(session, slide, studentId) {
   return order.find(has) || null;
 }
 
+// 필기·텍스트가 차지하는 범위(16:10 프레임 정규화) | null. 선 굵기·글자 크기만큼 여유를 둔다.
+function inkBounds(strokes, texts, removed) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const add = (ax, ay, bx, by) => { x0 = Math.min(x0, ax); y0 = Math.min(y0, ay); x1 = Math.max(x1, bx); y1 = Math.max(y1, by); };
+  strokes.forEach((s, i) => {
+    if (!s || removed.has(strokeKey(s, i)) || s.tool === "eraser") return;
+    const px = (s.size || 4) / REF_W, py = px * FRAME;
+    for (const p of s.points || []) add(p.x - px, p.y - py, p.x + px, p.y + py);
+  });
+  for (const t of texts) {
+    if (!t || !t.value || (t.id && removed.has(t.id))) continue;
+    const fs = (t.size || 18) / REF_W;
+    const lines = String(t.value).split("\n");
+    const w = Math.max(...lines.map(l => l.length)) * fs * 1.05 + fs;
+    add(t.x, t.y, t.x + w, t.y + (lines.length * 1.3 + 0.6) * fs * FRAME);
+  }
+  return x1 > x0 ? { x0, y0, x1, y1 } : null;
+}
+
 // ── 필기 슬라이드 한 장 → { src(objectURL|dataURL), aspect, framed } ──
 // studentId가 없으면 빈 학습지(편집기 기본 필기만)
 async function renderInk(session, slide, studentId) {
@@ -128,9 +151,20 @@ async function renderInk(session, slide, studentId) {
     if (ra < FRAME) { const w = ra / FRAME; r = { x: (1 - w) / 2, y: 0, w, h: 1 }; }
     else { const h = FRAME / ra; r = { x: 0, y: (1 - h) / 2, w: 1, h }; }
   }
-  // 자를 영역 = 학습지 이미지 영역 그대로 (종이 학습지처럼 A4 한 장을 꽉 채움).
-  // 가정: 학습지 바깥 여백에 쓴 필기는 인쇄하지 않는다(기록 화면 '학생별'에서는 보임).
-  const cx0 = r.x, cy0 = r.y, cx1 = r.x + r.w, cy1 = r.y + r.h;
+  // 자를 영역 = 학습지 내용 영역(흰 여백 제외) ∪ 필기 범위, 학습지 이미지 영역 안으로 (종이 한 장을 꽉 채움).
+  // 가정: 학습지 바깥(16:10 틀의 빈 곳)에 쓴 필기는 인쇄하지 않는다(기록 화면 '학생별'에서는 보임).
+  let f = { x0: r.x, y0: r.y, x1: r.x + r.w, y1: r.y + r.h };
+  if (img) {
+    let focus = null;
+    try { focus = (await pageRectFor(slide.thumb || slide.bg)).focus; } catch (_) { focus = null; }
+    if (focus && focus.x1 > focus.x0 && focus.y1 > focus.y0) {
+      const ink = inkBounds(strokes, texts, removed);
+      const u = ink ? { x0: Math.min(focus.x0, ink.x0), y0: Math.min(focus.y0, ink.y0), x1: Math.max(focus.x1, ink.x1), y1: Math.max(focus.y1, ink.y1) } : focus;
+      f = { x0: Math.max(f.x0, u.x0), y0: Math.max(f.y0, u.y0), x1: Math.min(f.x1, u.x1), y1: Math.min(f.y1, u.y1) };
+      if (!(f.x1 > f.x0 && f.y1 > f.y0)) f = { x0: r.x, y0: r.y, x1: r.x + r.w, y1: r.y + r.h };
+    }
+  }
+  const cx0 = f.x0, cy0 = f.y0, cx1 = f.x1, cy1 = f.y1;
   const cw = cx1 - cx0, ch = cy1 - cy0;
   // 프레임 전체 픽셀 크기: 잘라낸 폭이 PX_W 가 되도록 (세로가 너무 길면 줄임)
   let FW = PX_W / cw;
@@ -342,7 +376,7 @@ export async function printBlank({ session, slideIds, teacher }) {
 export async function printRecordView() {
   let mark = document.querySelector(".pp-fixed-mark");
   if (!mark) { mark = el("img", { class: "pp-fixed-mark", src: MARK, alt: "" }); document.body.appendChild(mark); }
-  const css = `@page { size: A4 portrait; margin: 8mm 8mm 8mm 8mm; }
+  const css = `@page { size: A4 portrait; margin: 5mm; }
 @media print {
   html.pp-record .main { padding: 0 14mm 0 0 !important; }
   html.pp-record .page-head h1 { font-size: 12pt !important; margin: 0 !important; }

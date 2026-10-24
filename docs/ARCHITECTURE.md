@@ -509,7 +509,7 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
   - 키보드: ←/→ 이동, F 전체화면, Esc 팝오버 닫기.
   - 이동/모드/flow = `patchSession`. 이 화면은 store 구독 → host.update만 호출(재마운트 금지). 1초 interval 금지.
   - `[종료]` → confirmDialog → `cloudEndSession(session,'completed')` → `/teacher/session/:id`.
-- **기록 `/teacher/session/:id`**: `cloudFetchSession` → 요약(날짜·참여 n명·슬라이드 n장) + seg `슬라이드별 / 학생별`. 슬라이드별 = 각 슬라이드 `def.summary`. 학생별 = 학생 선택 → 그 학생 ink(읽기 전용) + 응답(정오) 슬라이드 순. `[인쇄]`(슬라이드별 = 화면 그대로, 학생별 = 그 학생 학습지 인쇄) · `[학생 인쇄]`(js/print.js: 1) 슬라이드 선택 2) 학생 선택 → 학생마다 A4 세로, 여백 0 + 시트 안 패딩, 머리글 작게, 오른쪽 위 워터마크 `assets/print-mark.png`. 필기 슬라이드는 16:10 틀에서 학습지 이미지 영역만 잘라 JPEG로 렌더 — A4 세로 학습지는 종이 한 장을 꽉 채움, 가로 슬라이드는 한 장에 2개). `[이어서]`(stopped/completed → `cloudResumeSession` → `/live/:id`) · `[삭제]`.
+- **기록 `/teacher/session/:id`**: `cloudFetchSession` → 요약(날짜·참여 n명·슬라이드 n장) + seg `슬라이드별 / 학생별`. 슬라이드별 = 각 슬라이드 `def.summary`. 학생별 = 학생 선택 → 그 학생 ink(읽기 전용) + 응답(정오) 슬라이드 순. `[인쇄]`(슬라이드별 = 화면 그대로, 학생별 = 그 학생 학습지 인쇄) · `[학생 인쇄]`(js/print.js: 1) 슬라이드 선택 2) 학생 선택 → 학생마다 A4 세로, @page 여백 0 + 시트 안 패딩 5mm(프린터가 찍을 수 있는 안쪽), 머리글 작게, 오른쪽 위 워터마크 `assets/print-mark.png`. 필기 슬라이드는 16:10 틀에서 학습지 이미지 영역만 잘라 JPEG로 렌더 — 세로 학습지는 PDF 자체의 흰 여백도 잘라(zoom-view `pageRectFor` 내용 영역 ∪ 필기 범위) 종이 폭을 꽉 채움, 가로 슬라이드는 한 장에 2개). 기록 화면 그대로 인쇄도 @page 여백 5mm. `[이어서]`(stopped/completed → `cloudResumeSession` → `/live/:id`) · `[삭제]`.
 - **기록 탭**: 세션 목록(제목, 날짜, 참여 n, 상태 pill). 진행 중 세션은 맨 위 `[돌아가기]`.
 - **학생 탭**: 이 교사 세션에 참여한 학생 표(학번순) → 행 탭 → 참여 세션 목록.
 - **내 코드 탭**: 큰 코드 · QR · `[코드 복사]` `[링크 복사]`.
