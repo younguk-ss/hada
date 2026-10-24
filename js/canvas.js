@@ -448,18 +448,23 @@ export function drawStroke(ctx, s, W, H, k = 1) {
 
 // 미니 캔버스(갤러리·썸네일·기록)용 정적 렌더. 캔버스 크기는 그대로 쓰거나 width/height로 지정.
 // texts도 함께 그림(글자 크기는 폭/960 비례). removed id는 제외.
-export function paintStrokes(canvas, strokes, { removed = [], texts = [], width, height } = {}) {
+// region({x0,y0,x1,y1}, 슬라이드 정규화) → 그 영역만 캔버스에 꽉 차게 확대해서 그림. lineK = 선 굵기 배율(기본 폭/960)
+//   확대해도 선 굵기는 lineK 그대로(화면 기준 고정), 글자는 슬라이드와 함께 커짐.
+export function paintStrokes(canvas, strokes, { removed = [], texts = [], width, height, region = null, lineK = null } = {}) {
   if (!canvas) return;
   if (width && canvas.width !== width) canvas.width = width;
   if (height && canvas.height !== height) canvas.height = height;
-  const W = canvas.width, H = canvas.height;
   const ctx = canvas.getContext("2d");
-  ctx.clearRect(0, 0, W, H);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const W = region ? canvas.width / (region.x1 - region.x0) : canvas.width;
+  const H = region ? canvas.height / (region.y1 - region.y0) : canvas.height;
+  ctx.save();
+  if (region) ctx.translate(-region.x0 * W, -region.y0 * H);
   const rm = removed && removed.length ? new Set(removed) : null;
-  const k = W / REF_W;
+  const k = W / REF_W, kl = lineK || k;
   (strokes || []).forEach((s, i) => {
     if (rm && rm.has(strokeKey(s, i))) return;
-    drawStroke(ctx, s, W, H, k);
+    drawStroke(ctx, s, W, H, kl);
   });
   for (const t of texts || []) {
     if (!t || !t.value || (rm && t.id && rm.has(t.id))) continue;
@@ -473,4 +478,5 @@ export function paintStrokes(canvas, strokes, { removed = [], texts = [], width,
     });
     ctx.restore();
   }
+  ctx.restore();
 }
