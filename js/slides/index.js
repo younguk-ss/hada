@@ -5,7 +5,7 @@
 export * from "./registry.js";
 export { mountSlideHost } from "./host.js";
 
-const TYPES = ["ink", "mcq", "short", "blank", "wordcloud", "dragdrop", "wall", "link", "embed", "video", "videoquiz", "dino", "race"];
+const TYPES = ["ink", "mcq", "poll", "short", "blank", "wordcloud", "dragdrop", "wall", "link", "embed", "video", "videoquiz", "dino", "race"];
 
 await Promise.all(TYPES.map(t =>
   import(`./${t}.js`).catch(e => console.error(`[slides] ${t}.js 로드 실패`, e))

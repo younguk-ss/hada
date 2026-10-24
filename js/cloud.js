@@ -10,7 +10,7 @@
 //       남의 항목만 빠졌으면 4~8초(보통 작성자가 먼저 다시 써서 취소됨). 수렴 쓰기는 마감을 늦추지 않는다(스로틀).
 // 가정: patchSession의 DB 쓰기는 항상 세션 전체 meta(PATCH_KEYS)를 쓴다(실패 시 백오프 재시도).
 // 가정: 세션 구독은 첫 SUBSCRIBED 포함 매번 resync(=cloudFetchSession) 한다.
-import { store, setCloudMode, ensureSessionShape, findLesson, findSession, findStudent, newId, newJoinCode, normCode } from "./store.js";
+import { store, setCloudMode, ensureSessionShape, findLesson, findSession, findStudent, findTeacher, newId, newJoinCode, normCode } from "./store.js";
 import { sync } from "./sync.js";
 import { currentChannel } from "./realtime.js";
 import { uploadSlideImage, isDataUrl, removeLessonImages, copySlideImage } from "./storage.js";
@@ -689,6 +689,7 @@ export async function cloudStartSession({ lesson, teacher, title }) {
       if (e3) return await fail("startSession live", e3);
     }
     store.set(s => { s.sessions.unshift(session); });
+    cloudEnsureReviewCode(session); // 복습 코드는 기다리지 않고 미리 만들어 둠(실패해도 수업은 진행)
     if (!isCloud) {
       // 다른 탭이 300ms 디바운스 저장을 기다리지 않고 바로 받도록 세션 전체를 실어 보냄
       let copy = null;
@@ -743,7 +744,9 @@ export async function cloudFetchSession(sessionId, { forStudentId } = {}) {
     if (!row) return null;
     const meta = sessionMeta(row);
     const ex = findSession(sessionId);
-    const needSnap = !ex || !(ex.slidesSnapshot && ex.slidesSnapshot.length) || snapFallback.has(sessionId);
+    // 수업 중 슬라이드 추가로 스냅샷 버전(activity.__snap)이 바뀌었으면 다시 읽는다
+    const verChanged = !!ex && snapVerOf(meta.activity) !== (ex._snapVer || 0);
+    const needSnap = !ex || !(ex.slidesSnapshot && ex.slidesSnapshot.length) || snapFallback.has(sessionId) || verChanged;
     // 학생이면 내 scope만
     const scopeIds = forStudentId ? [forStudentId, sessionId, myGroupId(meta, forStudentId)].filter(Boolean) : null;
     const [snapR, parts, recs, resps] = await Promise.all([
@@ -784,8 +787,9 @@ export async function cloudFetchSession(sessionId, { forStudentId } = {}) {
     }
     // 반영 (in-place)
     const s = mergeSessionMeta(meta);
-    if (snapshot && snapshot.length && (!s.slidesSnapshot || !s.slidesSnapshot.length || snapFallback.has(sessionId))) {
+    if (snapshot && snapshot.length && (!s.slidesSnapshot || !s.slidesSnapshot.length || snapFallback.has(sessionId) || verChanged)) {
       s.slidesSnapshot = snapshot;
+      setSnapVer(s, snapVerOf(meta.activity)); // 행을 먼저 읽고 스냅샷을 읽었으므로 스냅샷은 이 버전 이상
       // 대체 스냅샷이면 다음 조회 때 진짜 스냅샷을 다시 시도
       if (fromFallback) snapFallback.add(sessionId); else snapFallback.delete(sessionId);
     }
@@ -810,6 +814,81 @@ export async function cloudFetchSession(sessionId, { forStudentId } = {}) {
     warn("fetchSession", e);
     return findSession(sessionId) && findSession(sessionId)._full ? findSession(sessionId) : null;
   }
+}
+
+// ── 수업 중 슬라이드 추가 (스냅샷 버전) ──
+// 가정: 스냅샷은 시작 후 불변이 원칙이지만 수업 중 '상호작용 추가'는 예외 — 슬라이드를 끼워 넣고 activity.__snap(버전, ms)을 올린다.
+//       activity의 다른 키는 슬라이드 id라 겹치지 않는다. 버전은 세션 객체의 비열거 속성 _snapVer(저장·복사 안 됨).
+// 가정: 교사는 스냅샷 DB 저장을 기다린 뒤 { activity(__snap), currentSlide } 패치 → 받는 쪽은 버전이 다르면 스냅샷을 다시 읽고 나서 패치 적용.
+//       다시 읽기가 실패해도 패치는 적용한다(다음 이벤트·재연결 resync 때 다시 시도).
+// 가정: 로컬 모드는 DB 대신 sync 'session:snapshot' 메시지로 받는다(패치와 채널이 달라 순서가 바뀔 수 있어 최대 3초 기다림).
+const snapVerOf = (act) => Number((act && act.__snap) || 0);
+function setSnapVer(s, v) {
+  Object.defineProperty(s, "_snapVer", { value: v, writable: true, configurable: true, enumerable: false });
+}
+function needSnapshot(s, act) {
+  const v = snapVerOf(act);
+  return v > 0 && v !== (s._snapVer || 0) && !!(s.slidesSnapshot && s.slidesSnapshot.length);
+}
+const snapLoads = new Map();   // sessionId → Promise
+const localSnaps = new Map();  // 로컬 모드: sessionId → { ver, slides }
+const localSnapWaiters = new Map(); // sessionId → [resolve]
+function refreshSnapshot(s, ver) {
+  if (snapLoads.has(s.id)) return snapLoads.get(s.id);
+  const p = (async () => {
+    let slides = null;
+    if (isCloud) {
+      const { data, error } = await supa.from("session_snapshots").select("slides").eq("session_id", s.id).maybeSingle();
+      if (error) throw error;
+      slides = data && Array.isArray(data.slides) ? data.slides : null;
+    } else {
+      const hit = localSnaps.get(s.id);
+      slides = hit && hit.ver >= ver ? hit.slides : await new Promise(res => {
+        const list = localSnapWaiters.get(s.id) || [];
+        list.push(res);
+        localSnapWaiters.set(s.id, list);
+        setTimeout(() => res(null), 3000);
+      });
+    }
+    if (slides && slides.length) {
+      s.slidesSnapshot = slides.map(normSlide);
+      setSnapVer(s, ver);
+    }
+  })().catch(e => warn("refreshSnapshot", e)).finally(() => snapLoads.delete(s.id));
+  snapLoads.set(s.id, p);
+  return p;
+}
+function applyLocalSnapshot(msg) {
+  if (!msg || !msg.sessionId || !Array.isArray(msg.slides)) return;
+  localSnaps.set(msg.sessionId, { ver: Number(msg.ver || 0), slides: msg.slides });
+  const waiters = localSnapWaiters.get(msg.sessionId) || [];
+  localSnapWaiters.delete(msg.sessionId);
+  if (waiters.length) { waiters.forEach(r => r(msg.slides)); return; } // 기다리던 패치가 반영
+  const s = findSession(msg.sessionId);
+  if (!s || (s._snapVer || 0) >= Number(msg.ver || 0)) return;
+  s.slidesSnapshot = msg.slides.map(normSlide);
+  setSnapVer(s, Number(msg.ver || 0));
+  store.set(st => st);
+}
+
+// 교사: 진행 중인 수업에 슬라이드를 끼워 넣고 그 슬라이드로 이동 → { index } | { error }
+export async function cloudInsertSessionSlide(session, slide, index) {
+  await ready();
+  const s = findSession(session && session.id) || session;
+  if (!s || !slide) return { error: "슬라이드를 추가하지 못했어요" };
+  const list = (s.slidesSnapshot || []).slice();
+  const at = Math.max(0, Math.min(list.length, index ?? list.length));
+  list.splice(at, 0, normSlide(structuredClone(slide)));
+  if (isCloud) {
+    const { error } = await supa.from("session_snapshots").upsert({ session_id: s.id, slides: list }, { onConflict: "session_id" });
+    if (error) { warn("insertSessionSlide", error); return { error: "슬라이드를 추가하지 못했어요" }; }
+  }
+  const ver = Math.max(Date.now(), snapVerOf(s.activity) + 1);
+  s.slidesSnapshot = list;
+  setSnapVer(s, ver);
+  if (!isCloud) sync.emit({ type: "session:snapshot", sessionId: s.id, ver, slides: list, from: CLIENT_ID });
+  patchSession(s, { activity: { ...(s.activity || {}), __snap: ver }, currentSlide: at });
+  return { index: at };
 }
 
 // 세션을 완전한 형태로 (store에 _full이 아니면 서버 조회)
@@ -911,12 +990,17 @@ function flushPatch(sessionId) {
 }
 
 // 수신한 세션 패치 반영 (broadcast/BroadcastChannel). rev가 더 클 때만
-export function applySessionPatch(sessionId, p) {
+export function applySessionPatch(sessionId, p, afterSnap = false) {
   if (!p) return false;
   const s = findSession(p.sessionId || sessionId);
   if (!s) return false;
   const rev = Number(p.rev || 0);
   if (!(rev > (s.rev || 0))) return false;
+  // 슬라이드가 추가된 패치: 새 스냅샷을 받은 뒤에 적용(옛 스냅샷의 다른 슬라이드가 잠깐 보이지 않게)
+  if (!afterSnap && "activity" in p && needSnapshot(s, p.activity)) {
+    refreshSnapshot(s, snapVerOf(p.activity)).then(() => applySessionPatch(sessionId, p, true));
+    return false;
+  }
   for (const k of PATCH_KEYS) if (k in p) s[k] = p[k];
   s.rev = rev;
   store.set(st => st);
@@ -934,7 +1018,7 @@ export function sessionHelloState(sessionId) {
 }
 
 // DB sessions 행 이벤트
-function applySessionRow(row) {
+function applySessionRow(row, afterSnap = false) {
   if (!row || !row.id) return;
   if (row.last_writer && row.last_writer === CLIENT_ID) return;
   const s = findSession(row.id);
@@ -942,6 +1026,10 @@ function applySessionRow(row) {
   const meta = sessionMeta(row);
   const cur = s.rev || 0;
   if (meta.rev < cur) return;
+  if (!afterSnap && needSnapshot(s, meta.activity)) {
+    refreshSnapshot(s, snapVerOf(meta.activity)).then(() => applySessionRow(row, true));
+    return;
+  }
   const { id, lessonId, teacherId, startedAt, rev, ...rest } = meta;
   // 같은 rev: DB 행이 그 rev의 전체 상태 → 놓친 broadcast가 있으면 여기서 보정
   // 키 순서 무관 비교(jsonb 재정렬) + 같은 하위 값은 기존 참조 유지 → broadcast 후 DB echo로 onActivity가 두 번 불리지 않게
@@ -1000,6 +1088,86 @@ export async function cloudListSessionsForStudent(studentId) {
     warn("listSessionsForStudent", e);
     return [];
   }
+}
+
+// ── 복습 코드 (세션마다 6자리 · 학습지 QR) ──
+// 가정: review_code 열(004_review_code.sql)은 SESSION_COLS에 넣지 않고 따로 읽고 쓴다
+//       → 열이 아직 없는 DB에서도 수업은 그대로 되고 복습 코드만 null(호출부가 안내).
+// 가정: 학생 로그인의 코드 칸 하나로 교사 코드·복습 코드를 둘 다 받으므로 교사 코드와 겹치지 않게 만든다(겹치면 교사 코드 우선).
+// 가정: 코드는 처음 필요할 때 채운다(수업 시작 직후·기록·인쇄). 이미 있으면 그대로 — 한 번 정해진 코드는 바뀌지 않는다.
+const reviewCodeQ = new Map(); // sessionId → Promise<code|null> (중복 생성 방지)
+export function cloudEnsureReviewCode(session) {
+  const id = session && session.id;
+  if (!id) return Promise.resolve(null);
+  const s = findSession(id) || session;
+  if (s.reviewCode) return Promise.resolve(s.reviewCode);
+  if (!reviewCodeQ.has(id)) reviewCodeQ.set(id, ensureReviewCode(s).finally(() => reviewCodeQ.delete(id)));
+  return reviewCodeQ.get(id);
+}
+function setReviewCode(s, code) {
+  if (!code) return null;
+  store.set(() => {
+    s.reviewCode = code;
+    const t = findSession(s.id);
+    if (t) t.reviewCode = code;
+  });
+  return code;
+}
+async function ensureReviewCode(s) {
+  await ready();
+  const taken = (c) => (store.state.sessions || []).some(x => x.reviewCode === c) || !!store.findTeacherByCode(c);
+  if (!isCloud) {
+    for (let i = 0; i < 20; i++) { const c = newJoinCode(); if (!taken(c)) return setReviewCode(s, c); }
+    return null;
+  }
+  try {
+    const { data, error } = await supa.from("sessions").select("review_code").eq("id", s.id).maybeSingle();
+    if (error) throw error;
+    if (!data) return null;
+    if (data.review_code) return setReviewCode(s, data.review_code);
+    for (let i = 0; i < 6; i++) {
+      const c = newJoinCode();
+      if (taken(c)) continue;
+      const { data: t, error: te } = await supa.from("teachers").select("id").eq("join_code", c).maybeSingle();
+      if (te) throw te;
+      if (t) continue;
+      // 비어 있을 때만 채움 — 다른 기기가 먼저 채웠으면 그 값을 쓴다
+      const { data: up, error: ue } = await supa.from("sessions").update({ review_code: c })
+        .eq("id", s.id).is("review_code", null).select("review_code");
+      if (ue) { if (ue.code === "23505") continue; throw ue; } // 다른 세션과 겹침 → 다시
+      if (up && up.length) return setReviewCode(s, up[0].review_code);
+      const { data: again } = await supa.from("sessions").select("review_code").eq("id", s.id).maybeSingle();
+      return again && again.review_code ? setReviewCode(s, again.review_code) : null;
+    }
+    return null;
+  } catch (e) {
+    warn("ensureReviewCode", e);
+    return null;
+  }
+}
+
+// 복습 코드 → { id, teacherId, status, title, teacher } | null
+export async function cloudFindSessionByReviewCode(code) {
+  await ready();
+  const c = normCode(code);
+  if (!c) return null;
+  if (!isCloud) {
+    const s = (store.state.sessions || []).find(x => x.reviewCode === c);
+    return s ? { id: s.id, teacherId: s.teacherId, status: s.status, title: s.title, teacher: findTeacher(s.teacherId) } : null;
+  }
+  const { data, error } = await supa.from("sessions").select("id,teacher_id,status,title,teachers(id,name,join_code)")
+    .eq("review_code", c).maybeSingle();
+  if (error) {
+    if (error.code === "42703") return null; // review_code 열이 아직 없는 DB
+    warn("findSessionByReviewCode", error);
+    throw error;
+  }
+  if (!data) return null;
+  const teacher = data.teachers ? upsertById(store.state.teachers, toTeacher(data.teachers, false)) : null;
+  const s = findSession(data.id);
+  if (s && !s.reviewCode) s.reviewCode = c;
+  store.save();
+  return { id: data.id, teacherId: data.teacher_id, status: data.status, title: data.title, teacher };
 }
 
 // ── 참여 ──
@@ -1599,6 +1767,7 @@ sync.on((msg) => {
   if (isCloud || !msg || msg.from === CLIENT_ID) return;
   switch (msg.type) {
     case "session:patch": applySessionPatch(msg.sessionId, msg); break;
+    case "session:snapshot": applyLocalSnapshot(msg); break;
     case "record": {
       const s = findSession(msg.sessionId);
       if (!s) return;

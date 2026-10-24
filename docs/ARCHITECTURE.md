@@ -14,7 +14,7 @@
 - 교사는 **고정 6자리 코드**(`teachers.join_code`, 대문자·숫자, 0/O/1/I 제외)를 가진다.
 - 학생은 코드 + 학년/반/번호/이름으로 입장 → 그 교사의 **현재 LIVE 세션**으로 바로 들어간다. LIVE가 없으면 대기 화면에서 기다리다 교사가 시작하면 **자동 입장**.
 - 교사는 수업 자료 카드의 `시작`만 누르면 된다(모달 없음).
-- 세션 = 수업 1회. 수업 자료(lesson)의 슬라이드 **스냅샷(시작 후 불변)** 을 가진다. 슬라이드는 여러 **타입**(필기·퀴즈·미디어·게임).
+- 세션 = 수업 1회. 수업 자료(lesson)의 슬라이드 **스냅샷(시작 후 불변 — 단, 수업 중 [상호작용 추가]로 끼워 넣기만 예외, §9.1)** 을 가진다. 슬라이드는 여러 **타입**(필기·퀴즈·미디어·게임).
 - 필기(ink) 슬라이드는 모드 `none(발표)`/`whole(전체)`/`individual(개별)`/`group(모둠)`를 가지며 교사가 수업 중 1탭으로 전환한다.
 - 실시간: 교사→학생(슬라이드 이동·모드·활동 상태), 학생→교사(필기·응답·게임 결과). **지연·깜빡임 없어야 한다.**
 
@@ -59,6 +59,7 @@ Slide    = { id, type /*'ink'|'mcq'|…*/, title /*string|null*/, config /*objec
              strokes /*Stroke[] 편집기 기본 필기*/, texts /*Text[]*/ }
 session  = { id, lessonId, teacherId, title, status /*'live'|'stopped'|'completed'*/, flow /*'teacher'|'student'*/,
              currentSlide /*int*/, rev /*number, 단조 증가*/, groups: [{ id, name, memberIds: [] }],
+             reviewCode /*6자리 복습 코드|undefined — 학습지 QR, §9.4*/,
              activity: { [slideId]: ActivityState }, startedAt, endedAt,
              participants: studentId[], slidesSnapshot: Slide[],
              records: { __whole: { [slideId]: Rec }, __groups: { [groupId]: { [slideId]: Rec } }, [studentId]: { [slideId]: Rec } },
@@ -87,7 +88,8 @@ lessons(id pk, teacher_id fk, title, created_at, updated_at)
 slides(id pk, lesson_id fk cascade, position, type default 'ink', title, config jsonb, bg_url, bg_path, thumb_url, gs_embed, mode, base_strokes jsonb, base_texts jsonb,
        unique(lesson_id, position) DEFERRABLE INITIALLY DEFERRED)
 sessions(id pk, lesson_id fk, teacher_id fk, title, status, flow, current_slide, groups jsonb, activity jsonb, rev bigint default 0,
-         slides_snapshot jsonb /*레거시: v2는 '[]'*/, started_at, ended_at, last_writer)
+         slides_snapshot jsonb /*레거시: v2는 '[]'*/, started_at, ended_at, last_writer,
+         review_code text unique /*004: 수업별 복습 코드, NULL 허용 — SESSION_COLS에 넣지 않고 따로 읽고 씀*/)
 session_snapshots(session_id pk fk cascade, slides jsonb)          -- realtime 미발행
 session_participants(session_id, student_id, joined_at, pk(session_id, student_id))
 slide_records(id, session_id fk cascade, slide_id, scope, scope_id NOT NULL /* whole → session_id */, strokes jsonb, texts jsonb, removed jsonb default '[]',
@@ -189,7 +191,13 @@ export function patchSession(session, patch)        // 교사 전용. Object.ass
 export async function cloudEndSession(session, status /*'completed'|'stopped'*/)
 export async function cloudResumeSession(session)   // 다른 LIVE stopped 처리 후 status live
 export async function cloudDeleteSession(sessionId)
+export async function cloudInsertSessionSlide(session, slide, index) → { index } | { error }
+   // 교사: 스냅샷에 끼워 넣고 session_snapshots upsert(await) → patchSession({ activity: {...activity, __snap: ver}, currentSlide: index })
+   // 받는 쪽: 패치·DB 행의 activity.__snap 이 세션의 _snapVer(비열거)와 다르면 스냅샷을 다시 읽은 뒤 그 패치를 적용.
+   //          cloudFetchSession도 버전이 다르면 스냅샷을 다시 읽는다. 로컬 모드는 sync 'session:snapshot' 메시지.
 export async function cloudListSessionsForStudent(studentId) → session[] (meta)   // 내 기록용
+export function cloudEnsureReviewCode(session) → Promise<code|null>   // 없으면 만들어 채움(교사 코드와 겹치지 않게, unique 충돌 시 재시도). 열 없는 DB면 null
+export async function cloudFindSessionByReviewCode(code) → { id, teacherId, status, title, teacher } | null
 
 // 참여·필기·응답
 export async function cloudAddParticipant(sessionId, studentId)
@@ -298,7 +306,8 @@ def = {
 ### 6.2 host.js — `mountSlideHost`
 
 ```js
-mountSlideHost({ role /*'student'|'teacher'|'editor'*/, root, slide, session, me, lesson, onEditorUpdate })
+mountSlideHost({ role /*'student'|'teacher'|'editor'*/, root, slide, session, me, lesson, onEditorUpdate, sessionView? })
+// sessionView(session) → 플러그인에게 보여 줄 세션(학생 복습: 활동 상태·모드만 바꾼 Proxy). 응답·필기 쓰기는 진짜 세션에.
   → { update({ slide, session }), destroy(), panel /*TeacherLive.panel|null*/, ctx }
 ```
 - 키 `${slide.id}|${role}` 가 같으면 DOM 보존: `onActivity(state)`(activity[slide.id]가 바뀌었을 때, JSON 비교), `onResponses(list)`(responses[slide.id] 배열이 바뀌었을 때), `onSession(session)`(그 외 모든 세션 변경 — 싸고 멱등이어야 함)만 호출. 키가 바뀌면 `destroy()` 후 재마운트.
@@ -350,6 +359,7 @@ ctx = {
 |---|---|---|---|
 | ink | 필기 | basic | `mode:'whole', bg:null, strokes:[], texts:[]` (config `{}`) |
 | mcq | 객관식 | interact | `{question:'', options:[{id,text:''}×4], answerIds:[], multiple:false, timerSec:null}` |
+| poll | 설문 | interact | `{question:'', options:[{id,text:''}×4], multiple:false}` (정답 없음) |
 | short | 주관식·서술형 | interact | `{question:'', long:false, maxLen:300}` |
 | blank | 빈칸 채우기 | interact | `{text:'', caseSensitive:false}` |
 | wordcloud | 워드클라우드 | interact | `{prompt:'', maxWords:3}` |
@@ -372,6 +382,8 @@ ctx = {
 - 저장: `cloudWriteRecord`(250ms 디바운스). 병합은 cloud.js `applyRecord`가 담당, ink는 `viewer.refresh()`.
 
 **mcq**: 옵션 2~6. 정답 표시 = `reveal || phase==='ended' || 접속 학생 전원 응답`(전원 응답 시 교사 클라이언트가 `{phase:'ended', reveal:true, autoRevealed:true}`). 교사 화면 = `columnChart`(가로 색상 선지 타일 + 세로 막대, 막대/타일 탭 → `whoSheet` 응답자 목록). 학생: 질문 + 옵션 카드(`.choice`, 최소 56px, 1탭 선택, multiple이면 토글) + `[제출]`. 제출 후 pill '제출함', 마감 전 변경 가능. 채점 `correct = 집합 동일`, `score = correct?1:0`. reveal: 정답 옵션 `--highlight`, 내 선택 ✓/✗. 교사 스테이지: 질문 + `choiceBars`(옵션별 가로 막대, n·%), reveal 전 회색, 후 정답 `--accent`. activityBar(reveal, timer). validate: 정답 미선택 → '정답을 선택하세요'.
+
+**poll (설문)**: 정답 없는 객관식 의견 조사. 편집기 = `questionEditor({ answers:false })` + `하나만·여러 개`. 응답 payload `{answerIds}`(객관식과 같음), score/correct null. 학생: 선택지 카드 + `[제출]`, 마감 전까지 바꿀 수 있음(결과 공개 중에도). 교사 `[결과 공개]`(activityBar `revealLabel`) → 학생에게 선택지별 인원·% 막대(내 선택 강조). 전원 응답 자동 공개 없음. 교사 스테이지 = `columnChart`(막대·타일 탭 → 응답자), 패널 = activityBar(결과 공개·타이머) + 학생별 고른 글자. 복습 화면은 공개 상태 그대로.
 
 **short**: `long:true`면 textarea(maxLen 2000), 아니면 input(maxLen 300). 학생: 입력 + `[제출]` + 글자 수. 교사 스테이지: 카드 그리드(이름+텍스트, 최신 순). 카드 탭 → 강조 토글 `activity.pinned:[studentId]`. reveal 시 학생은 pinned 카드만 본다. activityBar(reveal, timer).
 
@@ -467,6 +479,8 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 | `/teacher-login` | C | 카드: 이름·비밀번호·`입장` + 작은 `처음이면 자동으로 만들어져요` |
 | `/student-login` | C | 기억된 학생 있으면 큰 버튼 `홍길동 (6-2-14) · ABC123 입장` + 작은 `다른 사람이에요`. 없으면 폼: 코드(1칸, 자동 대문자, 6자) · 학년/반/번호(`repeat(3,minmax(0,1fr))`, `type=text inputmode=numeric`) · 이름 · `입장` |
 | `/student/join?c=CODE` | C | QR. 기억된 학생이면 즉시 입장 시도, 아니면 코드 채운 로그인 폼 |
+| `/r/:code` | C | 학습지 복습 QR(짧은 주소). `/student/join`과 같은 처리 — 코드 칸은 교사 코드·복습 코드를 모두 받는다 |
+| `/student/review/:id` | C | 학생 페이스 복습(§9.4). 진행 중인 수업이면 `/student/live/:id`로 |
 | `/student` | C | 대기 카드: 교사 이름 · `선생님이 수업을 시작하면 자동으로 들어가요` · `코드 바꾸기` · 하단 작은 `내 기록` |
 | `/student/live/:id` | C | 학생 수업 화면 |
 | `/student/records` | C | 내 기록 목록 → 세션 상세(읽기 전용) |
@@ -489,8 +503,9 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 - **수업 자료 카드**: 썸네일(cover) · 제목 · `n장 · 날짜` · `[시작]`(primary) · `⋯` 메뉴(편집, 복제(선택), 삭제). 카드 탭 = 편집기. 새 수업: `[+ 새 수업]` → 제목 promptDialog → 빈 ink 1장으로 생성 → 편집기. `[PDF·이미지로 만들기]` → 파일 선택 → `fileToSlides` 진행률 → 생성 → 편집기.
 - **편집기**: 열 때 `lesson.slides===null`이면 `cloudFetchLessonSlides`(진행률 pill). 레일: 썸네일(`def.thumb`), 탭=선택, 길게 누르기/`⋯`=복제·삭제·위/아래(드래그 정렬은 pointer 이벤트로, HTML5 DnD 금지). 레일 하단 `[+ 슬라이드]` → 모달 그리드(카테고리 섹션, 아이콘+라벨, 탭 즉시 현재 뒤에 삽입) · `[+ 파일]`(PDF/이미지 → ink 여러 장). 스테이지 = `mountSlideHost({role:'editor'})`. 인스펙터 = 제목 input + `def.Editor().inspector`(있으면) + validate 경고. 변경 → 300ms 디바운스 `cloudSaveLesson` + 상단 pill `저장됨/저장 중…/저장 실패 [다시]`.
 - **시작**: `수업 이름` 입력 창(기본값 = 같은 자료의 직전 수업 이름 또는 자료 제목, 예: '임진왜란 3학년 2반') → `cloudStartSession({lesson, teacher, title})` await → 성공 `/live/:id`, 실패 toast. flow 기본 teacher. 기록 화면에서 이름 바꾸기(patchSession title).
-- **수업 진행 `/live/:id`**: 상단 바(좌→우) `←`(대시보드, 수업은 계속) · 제목 · **코드 pill `ABC123`**(탭 → QR 모달: 큰 코드 + QR + URL 복사) · `● 12`(온라인 수, 탭 → drawer 참여 탭) · `◀ 3/12 ▶`(가운데 숫자 탭 → 썸네일 스트립 팝오버로 점프) · (ink일 때만) 모드 seg `발표·전체·개별·모둠` · flow 토글 아이콘(`교사 진행`/`자유 이동`) · `[패널]` · `[종료]`.
-  - 스테이지 = `mountSlideHost({role:'teacher'})`. drawer 탭: `활동`(= host.panel, 없으면 탭 숨김) · `참여`(참가자 목록: 온라인 점, 이름, 미응답 표시(응답형일 때), 모둠).
+- **수업 진행 `/live/:id`**: 상단 바(좌→우) `←`(대시보드, 수업은 계속) · 제목 · **코드 pill `ABC123`**(탭 → QR 모달: 큰 코드 + QR + URL 복사 + 아래 줄 `복습 코드 XYZ789 [복습 QR] [빈 학습지]`) · `● 12`(온라인 수, 탭 → drawer 참여 탭) · `◀ 3/12 ▶`(가운데 숫자 탭 → 썸네일 스트립 팝오버로 점프) · (ink일 때만) 모드 seg `발표·전체·개별·모둠` · flow 토글 아이콘(`교사 진행`/`자유 이동`) · `[패널]` · `[종료]`.
+  - 스테이지 = `mountSlideHost({role:'teacher'})`. drawer 탭: `활동`(= host.panel(필기면 모드 seg) + 아래 **[상호작용 추가]**, 늘 보임) · `참여`(참가자 목록: 온라인 점, 이름, 미응답 표시(응답형일 때), 모둠).
+  - **상호작용 추가**(정답 없는 상호작용·미디어: 담벼락·주관식 서술형·워드클라우드·설문·웹 링크·임베드·동영상): 타입 탭 → 그 타입의 `Editor`를 창에 띄워 내용 입력 → `[추가하고 이동]`(validate 경고면 toast 후 창 유지) → `cloudInsertSessionSlide`로 현재 슬라이드 **다음**에 끼워 넣고 바로 그 슬라이드로(진행 중 게임이면 이동과 같은 확인). 이 수업에만 들어가고 수업 자료에는 저장하지 않는다. 학생은 자유 이동 중이어도 새 슬라이드로 옮겨진다(새로 생긴 id 기준).
   - 키보드: ←/→ 이동, F 전체화면, Esc 팝오버 닫기.
   - 이동/모드/flow = `patchSession`. 이 화면은 store 구독 → host.update만 호출(재마운트 금지). 1초 interval 금지.
   - `[종료]` → confirmDialog → `cloudEndSession(session,'completed')` → `/teacher/session/:id`.
@@ -498,6 +513,7 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 - **기록 탭**: 세션 목록(제목, 날짜, 참여 n, 상태 pill). 진행 중 세션은 맨 위 `[돌아가기]`.
 - **학생 탭**: 이 교사 세션에 참여한 학생 표(학번순) → 행 탭 → 참여 세션 목록.
 - **내 코드 탭**: 큰 코드 · QR · `[코드 복사]` `[링크 복사]`.
+- **복습 코드**(기록 상세 메타 줄 `[▦ 복습 XYZ789]` → 모달: 큰 코드 + QR(`/r/CODE`) + `[링크 복사]` `[빈 학습지 인쇄]`). 기록 상세 버튼 `[빈 학습지]` = 필기 슬라이드 고르기 → 기본 필기만 인쇄(머리글에 `학년 반 번 이름` 칸). `학생 인쇄`·`빈 학습지` 모두 **장마다 머리글 오른쪽 위**(워터마크 옆)에 `복습 코드 XYZ789 · 주소` + QR 12mm(머리글 13mm).
 
 ### 9.2 학생
 - **입장**: 코드 정규화 → `cloudFindTeacherByCode`(없으면 '코드를 확인해 주세요') → `cloudJoinStudent`(서버 id 채택, studentProfile 저장 + lastCode) → `cloudFetchLiveSession(teacherId)` → 있으면 `cloudAddParticipant` → `/student/live/:id`; 없으면 `/student`(대기, `watchTeacherLive`로 자동 입장).
@@ -505,7 +521,13 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
   - flow teacher: currentSlide를 따른다. flow student: 로컬 인덱스(처음엔 currentSlide).
   - 세션 status가 live가 아니게 되면 `수업이 끝났어요` 2초 → `/student`(대기: 같은 교사의 다음 수업 자동 입장).
   - `나가기` → 채널 leave → `/student`.
-- **내 기록**: `cloudListSessionsForStudent` → 세션 → 읽기 전용 학생별 뷰(교사 기록의 학생별 컴포넌트와 같은 구조를 student.js가 간단히 구현: 슬라이드마다 ink 읽기 전용 / `def.summary`에 내 응답만 넘김).
+- **내 기록**: `cloudListSessionsForStudent` → 세션 → 읽기 전용 학생별 뷰(교사 기록의 학생별 컴포넌트와 같은 구조를 student.js가 간단히 구현: 슬라이드마다 ink 읽기 전용 / `def.summary`에 내 응답만 넘김). 상세 위 `[복습하기]`(진행 중이면 `[수업 들어가기]`).
+
+### 9.4 복습 코드 (학습지 QR, v2.5)
+- 수업(세션)마다 6자리 `review_code`(교사 코드와 같은 문자, 겹치지 않게). `cloudStartSession` 직후 백그라운드로 만들고, 없던 세션은 기록·인쇄·코드 창을 열 때 만든다. 한 번 정해지면 바뀌지 않는다.
+- 학생: QR `/r/CODE` 또는 로그인 코드 칸에 입력 → 교사 코드 먼저 조회, 없으면 복습 코드 → 학생 등록 → 수업이 live면 `/student/live/:id`, 아니면 `/student/review/:id`. lastCode(대기 화면용 교사 코드)는 이전 값을 유지하고 없을 때만 그 수업 교사 코드로.
+- 복습 화면: 상단 바 제목 · `복습` pill · (수업에서 정답을 공개한 mcq·blank·dragdrop·short만) `[정답 보기]↔[다시 풀기]` · `◀ n/N ▶` · `나가기`(→ 내 기록). 마지막 슬라이드 위치는 기기에 `hada:review:<세션>:<학생>`. 실시간 구독 없음, 참여자 등록은 함(수업에 없던 학생도 교사 기록에 보임).
+- 보기(`sessionView` Proxy): flow `student`, ink는 모두 `mode:'individual'`(내 칸에 저장) + 수업 때 전체·모둠 칠판 필기를 바닥 그림으로 합친 슬라이드(removed 반영, 스냅샷 불변). 응답형은 `phase:'idle', reveal:false, autoRevealed:true`(혼자라 '전원 응답 자동 공개' 끔) → 이전 답이 채워진 채로 다시 제출(같은 행 upsert, 교사 기록에도 반영). `[정답 보기]` = `phase:'ended', reveal:true`. 게임(dino·race)은 `phase:'ended'`(결과만).
 
 ### 9.3 실시간 규칙 요약
 - 교사 변경 → broadcast 선반영(즉시) + DB 디바운스 확정. 수신은 rev 비교.

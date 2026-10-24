@@ -10,21 +10,26 @@
 // 가정: /live/:id 의 세션이 live가 아니면 기록 상세로 보낸다. 다른 곳에서 끝나면 '수업이 끝났어요' 후 기록 상세.
 // 가정: 기록 '학생별'의 필기는 최종 모드(effectiveMode) 우선으로 scope를 고르되, 그 scope에 필기가 없으면 필기가 있는 다른 scope(개별→모둠→전체)를 보여 준다.
 // 가정: 수업 자료 삭제 시 DB cascade로 그 자료의 수업 기록도 지워지므로 확인 문구에 함께 적는다.
+// 가정: 복습 코드(수업마다, 학습지 QR)는 수업 진행의 코드 창 아래 줄과 기록 상세의 [복습 코드]에서 본다. 코드는 처음 열 때 만들어진다.
+// 가정: 수업 중 [상호작용 추가](패널 활동 탭 아래)는 정답 없는 상호작용·미디어만. 그 타입의 편집기를 창에 띄워 내용을 넣고
+//       [추가하고 이동] → 이 수업 스냅샷의 현재 슬라이드 다음에 끼워 넣고 바로 그 슬라이드로(수업 자료에는 저장하지 않음).
 import { store, findLesson, findSession, findStudent, findTeacher, studentLabel, newId } from "./store.js";
 import { go } from "./router.js";
 import { el, mount, template, toast, confirmDialog, promptDialog, modal, sheet, icon, fmtDate, debounce, copyText } from "./ui.js";
 import {
   cloudReady, cloudCreateLesson, cloudSaveLesson, cloudDeleteLesson, cloudDuplicateLesson, cloudFetchLessonSlides,
   cloudStartSession, ensureSession, cloudFetchSession, patchSession, cloudEndSession, cloudResumeSession, cloudDeleteSession,
-  subscribeSession,
+  subscribeSession, cloudEnsureReviewCode, cloudInsertSessionSlide,
 } from "./cloud.js";
 import { fileToSlides } from "./storage.js";
 import { joinSessionChannel } from "./realtime.js";
 import { getSlideType, listSlideTypes, createSlide, CATEGORIES, effectiveMode, injectCss, mountSlideHost } from "./slides/index.js";
 import { renderSlide } from "./lesson-view.js";
-import { openStudentPrint, printStudents, printRecordView } from "./print.js";
+import { openStudentPrint, openBlankPrint, printStudents, printRecordView, reviewUrl } from "./print.js";
 
 const TABS = ["lessons", "records", "students", "code"];
+// 수업 중 바로 추가할 수 있는 타입 (정답 없는 상호작용 · 미디어)
+const QUICK_TYPES = ["wall", "short", "wordcloud", "poll", "link", "embed", "video"];
 const MODES = [["none", "발표"], ["whole", "전체"], ["individual", "개별"], ["group", "모둠"]];
 const STATUS = { live: ["진행 중", "pill-live"], completed: ["끝남", "pill-ok"], stopped: ["중단", "pill-warn"] };
 const ACCEPT = ".pdf,.png,.jpg,.jpeg,.webp,application/pdf,image/png,image/jpeg,image/webp";
@@ -50,9 +55,24 @@ const TEACHER_CSS = `
 .drawer-head { border-bottom:1px solid var(--line); }
 .drawer-head .tabs { flex:1; min-width:0; border-bottom:0; padding:0; }
 .t-pane { display:grid; gap:12px; align-content:start; min-width:0; }
+.t-quick { display:grid; gap:10px; margin-top:6px; padding-top:16px; border-top:1px solid var(--line); }
+.t-plugin-panel[hidden] + .t-quick { margin-top:0; padding-top:0; border-top:0; }
+.t-quick-head { font-size:12px; color:var(--muted); }
+.t-quick-grid { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px; }
+.t-quick-btn { display:flex; align-items:center; gap:8px; min-height:40px; padding:6px 10px; border:1px solid var(--line); border-radius:var(--radius-sm); background:var(--surface); color:var(--ink); font-size:13px; text-align:left; cursor:pointer; min-width:0; }
+.t-quick-btn span:last-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.t-quick-btn .icon { flex:none; display:inline-flex; color:var(--ink-2); }
+.t-quick-btn .icon svg { width:18px; height:18px; }
+@media (hover: hover) { .t-quick-btn:hover { border-color:var(--line-strong); background:var(--surface-2); } }
+.t-quick-editor { position:relative; min-height:220px; max-height:min(62vh, 560px); overflow:auto; margin:0 -4px; }
+.t-quick-editor > .slide-host { height:auto; }
 .person .pill { height:20px; padding:0 8px; font-size:11px; }
 .t-meta { display:flex; flex-wrap:wrap; align-items:center; gap:6px 14px; margin:-12px 0 20px; color:var(--muted); font-size:13px; }
 .t-detail-bar { margin-bottom:16px; }
+.t-review-row { display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:8px; padding-top:16px; border-top:1px solid var(--line); width:100%; }
+.t-review-row b { font-size:17px; letter-spacing:.08em; color:var(--ink); font-variant-numeric:tabular-nums; }
+.t-review-note { font-size:13px; }
+.t-meta .t-review-btn { height:28px; padding:0 10px; font-size:13px; letter-spacing:.04em; }
 .t-sum-head { display:flex; align-items:center; gap:10px; min-width:0; margin-bottom:14px; }
 .t-sum-head h3 { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:16px; }
 .t-sum-num { flex:none; min-width:26px; height:26px; padding:0 6px; border-radius:7px; background:var(--surface-2); display:grid; place-items:center; font-size:12px; font-weight:700; color:var(--ink-2); font-variant-numeric:tabular-nums; }
@@ -239,13 +259,25 @@ function drawQr(box, url) {
   return () => { stopped = true; clearTimeout(timer); };
 }
 
-function openCodeModal(code) {
+// 참여 코드 창. sessionId가 있으면(수업 진행) 아래 줄에 이 수업의 복습 코드 + [복습 QR] [빈 학습지]
+function openCodeModal(code, { sessionId = null, teacher = null } = {}) {
   const url = joinUrl(code);
   const qr = el("div", { class: "qr-box" });
+  let review = null;
+  if (sessionId) {
+    const rc = el("b", {}, findSession(sessionId)?.reviewCode || "······");
+    review = el("div", { class: "t-review-row" }, [
+      el("span", { class: "muted" }, "복습 코드"), rc,
+      el("button", { class: "btn btn-sm", type: "button", onClick: () => openReviewModal(sessionId, teacher) }, [icon("qr", 16), "복습 QR"]),
+      el("button", { class: "btn btn-sm", type: "button", onClick: () => { const s = findSession(sessionId); if (s) openBlankPrint({ session: s, teacher }); } }, [icon("print", 16), "빈 학습지"]),
+    ]);
+    cloudEnsureReviewCode(findSession(sessionId)).then(c => { rc.textContent = c || "——————"; });
+  }
   const body = el("div", { class: "code-panel", style: { padding: "4px 0 0" } }, [
     el("div", { class: "code-big" }, code || "——————"),
     qr,
     el("div", { class: "code-url" }, url),
+    review,
   ]);
   let stop = null;
   modal({
@@ -257,6 +289,37 @@ function openCodeModal(code) {
     onClose: () => { if (stop) stop(); },
   });
   stop = drawQr(qr, url);
+}
+
+// 복습 코드 창: 수업마다 다른 6자리 + QR(/r/CODE). 학습지를 인쇄하면 장마다 같은 QR이 들어간다.
+function openReviewModal(sessionId, teacher) {
+  const s0 = findSession(sessionId);
+  if (!s0) return;
+  const codeEl = el("div", { class: "code-big" }, s0.reviewCode || "······");
+  const qr = el("div", { class: "qr-box" }, el("span", { class: "spinner", "aria-label": "불러오는 중" }));
+  const urlEl = el("div", { class: "code-url" }, "");
+  const body = el("div", { class: "code-panel", style: { padding: "4px 0 0" } }, [
+    codeEl, qr, urlEl,
+    el("div", { class: "muted t-review-note" }, "학습지에 장마다 함께 인쇄돼요"),
+  ]);
+  let stop = null, url = "", closed = false;
+  modal({
+    title: "복습 코드", body,
+    actions: [
+      { label: "링크 복사", icon: "copy", onClick: () => { if (url) copyText(url, "링크를 복사했어요"); } },
+      { label: "빈 학습지 인쇄", icon: "print", onClick: (close) => { const s = findSession(sessionId); if (!s) return; close(); openBlankPrint({ session: s, teacher }); } },
+      { label: "닫기", primary: true },
+    ],
+    onClose: () => { closed = true; if (stop) stop(); },
+  });
+  cloudEnsureReviewCode(s0).then(code => {
+    if (closed) return;
+    if (!code) { codeEl.textContent = "——————"; qr.replaceChildren(el("div", { class: "muted" }, "복습 코드를 만들지 못했어요")); return; }
+    url = reviewUrl(code);
+    codeEl.textContent = code;
+    urlEl.textContent = url;
+    stop = drawQr(qr, url);
+  });
 }
 
 // ── 수업 시작 (카드·편집기 공용) ──
@@ -1142,7 +1205,7 @@ function buildLive(sessionId, teacher) {
   // ── 상단 바 ──
   const code = (currentTeacher() || teacher).joinCode || "";
   const titleEl = el("div", { class: "topbar-title" });
-  const codeBtn = el("button", { class: "code-pill", type: "button", title: "참여 코드", onClick: () => openCodeModal(code) }, code || "코드");
+  const codeBtn = el("button", { class: "code-pill", type: "button", title: "참여 코드", onClick: () => openCodeModal(code, { sessionId, teacher }) }, code || "코드");
   const onlineNum = el("span", {}, "0");
   const onlineBtn = el("button", {
     class: "online-pill", type: "button", title: "접속 중",
@@ -1168,7 +1231,15 @@ function buildLive(sessionId, teacher) {
   const stage = el("section", { class: "stage live-stage" });
   const tabAct = el("button", { type: "button", onClick: () => { userTab = "activity"; renderDrawerTabs(); } }, "활동");
   const tabPeople = el("button", { type: "button", onClick: () => { userTab = "people"; renderDrawerTabs(); } }, "참여");
-  const actBox = el("div", { class: "t-pane" });
+  const pluginBox = el("div", { class: "t-plugin-panel", hidden: true });
+  const quickBox = el("section", { class: "t-quick", "aria-label": "상호작용 추가" }, [
+    el("div", { class: "t-quick-head" }, "상호작용 추가"),
+    el("div", { class: "t-quick-grid" }, QUICK_TYPES.map(t => getSlideType(t)).filter((d, i) => d && d.type === QUICK_TYPES[i])
+      .map(d => el("button", { class: "t-quick-btn", type: "button", title: d.desc || d.label, onClick: () => openQuickAdd(d.type) }, [
+        el("span", { class: "icon", html: d.icon || "" }), el("span", {}, d.label),
+      ]))),
+  ]);
+  const actBox = el("div", { class: "t-pane" }, [pluginBox, quickBox]);
   const peopleHead = el("div", { class: "muted" });
   const peopleList = el("div", { class: "people" });
   const peopleBox = el("div", { class: "t-pane" }, [peopleHead, peopleList]);
@@ -1204,14 +1275,14 @@ function buildLive(sessionId, teacher) {
   }
   function syncPanel() {
     const p = host ? host.panel : null;
-    if (p instanceof Node) { if (actBox.firstChild !== p || actBox.childNodes.length !== 1) actBox.replaceChildren(p); }
-    else if (actBox.firstChild) actBox.replaceChildren();
+    if (p instanceof Node) { if (pluginBox.firstChild !== p || pluginBox.childNodes.length !== 1) pluginBox.replaceChildren(p); }
+    else if (pluginBox.firstChild) pluginBox.replaceChildren();
+    pluginBox.hidden = !pluginBox.firstChild;
     renderDrawerTabs();
   }
+  // 활동 탭은 늘 있다(플러그인 패널이 없어도 [상호작용 추가])
   function renderDrawerTabs() {
-    const hasPanel = !!actBox.firstChild;
-    tabAct.hidden = !hasPanel;
-    const tab = userTab === "activity" && hasPanel ? "activity" : "people";
+    const tab = userTab === "activity" ? "activity" : "people";
     tabAct.classList.toggle("active", tab === "activity");
     tabPeople.classList.toggle("active", tab === "people");
     actBox.hidden = tab !== "activity";
@@ -1345,6 +1416,42 @@ function buildLive(sessionId, teacher) {
       return;
     }
     go("/teacher/session/" + sessionId, { replace: true });
+  }
+
+  // ── 수업 중 상호작용 추가: 편집기 창 → 현재 다음에 끼워 넣고 그 슬라이드로 ──
+  function openQuickAdd(type) {
+    const def = getSlideType(type);
+    let draft;
+    try { draft = createSlide(type); } catch (e) { console.warn("[live] createSlide", e); toast("슬라이드를 만들지 못했어요", { type: "error" }); return; }
+    const box = el("div", { class: "t-quick-editor" });
+    let ed = null;
+    modal({
+      title: `${def.label} 추가`, body: box, wide: true,
+      actions: [
+        { label: "취소" },
+        { label: "추가하고 이동", primary: true, icon: "plus", onClick: async (close) => {
+          const msg = typeof def.validate === "function" ? def.validate(draft) : null;
+          if (msg) { toast(msg); return; }
+          let s = S();
+          if (!s || disposed) return;
+          // 진행 중인 게임에서 떠날 때는 이동과 같은 확인
+          const cur = curSlide(s);
+          if (cur && getSlideType(cur.type).category === "game" && ((s.activity || {})[cur.id] || {}).phase === "running") {
+            const ok = await confirmDialog({ title: "게임을 종료하고 넘어갈까요?", ok: "종료하고 이동" });
+            if (!ok || disposed) return;
+            s = S();
+            const act = s.activity || {};
+            patchSession(s, { activity: { ...act, [cur.id]: { ...(act[cur.id] || {}), phase: "ended", endedAt: Date.now(), endsAt: null } } });
+          }
+          const r = await cloudInsertSessionSlide(s, draft, (s.currentSlide || 0) + 1);
+          if (!r || r.error) { toast((r && r.error) || "슬라이드를 추가하지 못했어요", { type: "error" }); return; }
+          close();
+        } },
+      ],
+      onClose: () => { try { ed && ed.destroy(); } catch (_) {} },
+    });
+    try { ed = mountSlideHost({ role: "editor", root: box, slide: draft, onEditorUpdate: () => {} }); }
+    catch (e) { console.warn("[live] 편집기 표시 실패", e); box.replaceChildren(el("div", { class: "empty" }, "편집기를 불러오지 못했어요")); }
   }
 
   // 썸네일 스트립으로 점프
@@ -1570,14 +1677,19 @@ export function sessionDetailView({ id } = {}) {
             : abtn("이어서", { cls: "btn btn-primary", ic: "play", onClick: resume }),
           abtn("인쇄", { ic: "print", onClick: printView }),
           el("button", { class: "btn", type: "button", onClick: () => { const cur = findSession(id); if (cur) openStudentPrint({ session: cur, teacher }); } }, [icon("users", 18), "학생 인쇄"]),
+          el("button", { class: "btn", type: "button", onClick: () => { const cur = findSession(id); if (cur) openBlankPrint({ session: cur, teacher }); } }, [icon("file", 18), "빈 학습지"]),
           abtn("삭제", { cls: "btn btn-danger", ic: "trash", onClick: remove }),
         ]),
       ]);
+      const reviewTxt = el("span", {}, s.reviewCode || "······");
+      if (!s.reviewCode) cloudEnsureReviewCode(s).then(c => { reviewTxt.textContent = c || "——————"; });
       const meta = el("div", { class: "t-meta" }, [
         statusPill(s.status),
         el("span", {}, dateRange(s)),
         el("span", {}, `참여 ${parts.length}명`),
         el("span", {}, `슬라이드 ${slides.length}장`),
+        el("button", { class: "btn btn-sm t-review-btn no-print", type: "button", title: "복습 코드 · QR", onClick: () => openReviewModal(id, teacher) },
+          [icon("qr", 16), "복습 ", reviewTxt]),
       ]);
       const segBtn = (m, label) => el("button", {
         type: "button", class: mode === m ? "active" : null, "aria-pressed": String(mode === m),

@@ -257,11 +257,11 @@ export function choiceBars(rows, total, { revealed = false } = {}) {
 // 가정: 응답 수 = 이 슬라이드에 응답한 서로 다른 학생 수, m = 참가자 수.
 //       opts.countFn(responses) 로 바꿀 수 있다(예: 문항별 집계).
 // 가정: 타이머 만료 → 교사 클라이언트가 phase 'ended' 로 바꾸는 일은 이 바가 담당(ctx.timeout 로 예약).
-export function activityBar(ctx, { reveal = false, timer = false, countFn = null } = {}) {
+export function activityBar(ctx, { reveal = false, timer = false, countFn = null, revealLabel = "정답 공개" } = {}) {
   const count = el("span", { class: "pill ab-count" });
   const pill = phasePill(ctx.activity());
   const btnPhase = el("button", { class: "btn btn-sm", type: "button", onClick: onPhase });
-  const btnReveal = reveal ? el("button", { class: "btn btn-sm", type: "button", onClick: onReveal }, "정답 공개") : null;
+  const btnReveal = reveal ? el("button", { class: "btn btn-sm", type: "button", onClick: onReveal }, revealLabel) : null;
   const btnReset = el("button", { class: "btn btn-sm btn-ghost", type: "button", onClick: onReset }, "초기화");
 
   // 타이머 팝오버
@@ -384,9 +384,10 @@ export function loadYouTubeApi() {
 
 // ── 문제 편집기 (mcq / videoquiz / dino / race 편집기 공용) ──
 // onChange({ question, options, answerIds }) — 입력마다 호출(저장 디바운스는 코어 담당)
+// answers:false → 정답 표시 칸 없이(설문)
 export function questionEditor({
   question = "", options = [], answerIds = [], multiple = false,
-  maxOptions = 6, minOptions = 2, placeholder = "질문", onChange,
+  maxOptions = 6, minOptions = 2, placeholder = "질문", onChange, answers: withAnswers = true,
 } = {}) {
   let q = String(question ?? "");
   let opts = (options || []).map(o => ({ id: o.id || newId("opt"), text: o.text ?? "" }));
@@ -427,7 +428,7 @@ export function questionEditor({
           answers = answers.filter(x => x !== o.id);
           render(); emit();
         } }, "×");
-      return el("div", { class: "q-opt" }, [mark, el("span", { class: "q-key" }, optionLetter(i)), input, del]);
+      return el("div", { class: "q-opt" }, [withAnswers ? mark : null, el("span", { class: "q-key" }, optionLetter(i)), input, del]);
     }));
     addBtn.disabled = opts.length >= maxOptions;
   }

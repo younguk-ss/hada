@@ -5,10 +5,12 @@
 - 교사마다 **고정 6자리 코드** — 학생은 코드만 입력하면 진행 중인 수업으로 바로 들어가고, 수업 전이면 기다렸다가 자동 입장
 - 교사는 수업 자료에서 **시작**만 누르면 됨
 - 필기 슬라이드: 발표 · 전체 · 개별 · 모둠 모드를 수업 중 1탭 전환, 개별/모둠 실시간 갤러리
-- 상호작용: 객관식, 주관식·서술형, 빈칸 채우기, 워드클라우드, 분류하기(드래그앤드롭), 담벼락
+- 상호작용: 객관식, 설문(정답 없는 의견 고르기), 주관식·서술형, 빈칸 채우기, 워드클라우드, 분류하기(드래그앤드롭), 담벼락
+- 수업 중 상호작용 추가: 패널에서 담벼락·주관식·워드클라우드·설문·웹 링크·임베드·동영상을 골라 바로 다음 슬라이드로 끼워 넣고 이동
 - 미디어: 웹 링크, 임베드, 동영상(YouTube·mp4), 동영상 퀴즈(시점별 문제)
 - 게임: 공룡 점프(정확도+시간 순위), 레이싱 퀴즈(최대 4명 랜덤 조, 정답 부스터·오답 미끄러짐, 2바퀴, 조별 랩타임)
 - 수업 기록: 슬라이드별/학생별, 인쇄
+- 복습 QR: 수업마다 새 복습 코드 — 학습지(학생 결과·빈 학습지) 장마다 QR·코드가 인쇄되고, 학생이 찍으면 그 수업을 자기 페이스로 복습(내 필기·답 이어서)
 
 설계 문서: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
@@ -23,8 +25,8 @@ http://localhost:5173 — 캐시를 끈 정적 서버입니다(ES 모듈이 옛 
 ## Supabase 셋업 (새 프로젝트)
 
 1. https://supabase.com → New project
-2. SQL Editor에서 순서대로 실행: `db/migrations/001_v1.sql` → `002_v2.sql` → `003_v21.sql`
-   - ⚠️ `001_v1.sql`은 `drop table`을 포함하므로 **새 프로젝트에서만** 실행하세요. 기존 프로젝트는 002, 003만.
+2. SQL Editor에서 순서대로 실행: `db/migrations/001_v1.sql` → `002_v2.sql` → `003_v21.sql` → `004_review_code.sql`
+   - ⚠️ `001_v1.sql`은 `drop table`을 포함하므로 **새 프로젝트에서만** 실행하세요. 기존 프로젝트는 002부터.
    - 002가 Storage 버킷 `slides`(public)와 정책까지 만듭니다.
 3. Project Settings → API → Project URL, publishable key를 `env.js`에 넣기:
 
@@ -56,7 +58,7 @@ js/
   realtime.js       세션 채널(broadcast·presence)
   canvas.js, lesson-view.js   필기 캔버스·슬라이드 프레임
   teacher.js, student.js      교사·학생 화면
-  slides/           슬라이드 타입 플러그인(registry·host·common + 13개 타입)
+  slides/           슬라이드 타입 플러그인(registry·host·common + 14개 타입)
 db/migrations/      SQL 마이그레이션
 tools/devserver.py  로컬 개발 서버
 ```

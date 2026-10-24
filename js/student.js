@@ -36,12 +36,15 @@ const CSS = `
 .stu-wait-line { display:flex; align-items:center; justify-content:center; gap:10px; color:var(--ink-2); font-size:15px; }
 .stu-wait .btn { width:100%; }
 .stu-rec-head h2 { font-size:20px; font-weight:700; overflow-wrap:anywhere; }
+.stu-rec-head .btn { justify-self:start; }
 .stu-rec-slide { display:grid; gap:10px; }
 .stu-rec-slide .slide-frame { width:100%; }
 .stu-rec-no { font-size:13px; color:var(--muted); font-weight:600; }
 .stu-top .pill { flex:none; }
 .stu-top .slide-count { min-width:56px; }
-@media (max-width: 420px) { .stu-top .brand { display:none; } }
+@media (max-width: 420px) { .stu-top .brand { display:none; } .stu-review .pill-review { display:none; } }
+.stu-review .stu-top > .btn-sm { flex:none; }
+@media (max-width: 360px) { .stu-review .ans-label { display:none; } .stu-review .stu-top > .btn-sm { padding:0 8px; } }
 `;
 
 const MODE_LABEL = { none: "발표", whole: "전체", individual: "개별", group: "모둠" };
@@ -208,7 +211,7 @@ export function studentLiveView({ id } = {}) {
   let dead = false, host = null, ch = null, unsub = null, offStore = null;
   let endTimer = null, ended = false, retried = false, started = false;
   let mounting = false, dirty = false, loadTimer = null, loadTries = 0;
-  let localIdx = null, lastFlow = null;
+  let localIdx = null, lastFlow = null, lastSnap = null;
   const shown = {}; // 상단 바 텍스트 캐시(바뀔 때만 DOM 갱신)
 
   const titleEl = el("div", { class: "topbar-title" }, "");
@@ -292,6 +295,16 @@ export function studentLiveView({ id } = {}) {
     }
     // 자유 이동으로 바뀌는 순간 로컬 인덱스 = 교사 현재 슬라이드
     if (s.flow === "student" && (lastFlow !== "student" || localIdx == null)) localIdx = s.currentSlide || 0;
+    // 수업 중 슬라이드가 추가되면(스냅샷 교체) 자유 이동이어도 새 슬라이드로, 새 것이 없으면 보던 슬라이드 유지
+    // (패치와 스냅샷의 도착 순서와 무관하게 id로 찾는다)
+    if (lastSnap && slides !== lastSnap && s.flow === "student") {
+      const old = new Set(lastSnap.map(x => x && x.id));
+      const added = slides.findIndex(x => x && !old.has(x.id));
+      const seen = slides.findIndex(x => x && x.id === lastSnap[localIdx ?? 0]?.id);
+      if (added >= 0) localIdx = added;
+      else if (seen >= 0) localIdx = seen;
+    }
+    lastSnap = slides;
     lastFlow = s.flow;
     const idx = clamp(s.flow === "student" ? localIdx : (s.currentSlide || 0), 0, n - 1);
     if (s.flow === "student") localIdx = idx;
@@ -397,6 +410,209 @@ export function studentLiveView({ id } = {}) {
     try { offStore && offStore(); } catch (e) { console.warn(e); }
     try { unsub && unsub(); } catch (e) { console.warn(e); }
     if (ch) { try { ch.leave(); } catch (e) { console.warn(e); } ch = null; }
+    destroyHost();
+  };
+}
+
+// ── 복습 (/student/review/:id) — 학습지 QR로 들어와 내 페이스로 ──
+// 가정: 수업 때 내 필기·답을 그대로 이어서 쓴다(같은 레코드·응답에 저장 → 교사 기록에도 반영). 실시간 구독은 하지 않는다.
+// 가정: 필기는 모두 내 개별(individual) 칸에 쓴다 — 전체·모둠 칠판은 반 전체가 공유하므로 그 필기는 바닥 그림으로만 보여 준다.
+// 가정: 응답형은 다시 받는 상태(phase idle, 정답 숨김). 수업에서 정답을 공개했던 슬라이드만 [정답 보기]로 확인(이때는 잠김).
+// 가정: 게임(공룡·레이싱)은 다른 학생과 함께 하는 활동이라 결과만 보여 준다(phase ended).
+// 가정: 진행 중인 수업이면 수업 화면으로 보낸다. 마지막으로 본 슬라이드는 기기에 기억(localStorage).
+const REVIEW_POS = "hada:review:"; // + sessionId:studentId → 마지막으로 본 슬라이드
+const ANSWER_TYPES = new Set(["mcq", "blank", "dragdrop", "short"]);
+function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
+
+// 수업에서 정답을 공개했던 슬라이드인가
+function hadAnswer(slide, a) {
+  if (!slide || !ANSWER_TYPES.has(slide.type) || !a) return false;
+  return a.reveal === true || (slide.type === "mcq" && a.phase === "ended");
+}
+// 수업 때 공유 칠판(전체·모둠)의 필기 — 복습 화면의 바닥 그림
+function sharedRec(s, slide, studentId) {
+  const R = s.records || {};
+  const m = effectiveMode(slide, s);
+  if (m === "individual") return null;
+  if (m === "group") { const g = myGroupOf(s, studentId); return g ? R.__groups?.[g.id]?.[slide.id] || null : null; }
+  return R.__whole?.[slide.id] || null;
+}
+function reviewInkSlide(s, slide, studentId) {
+  const rec = sharedRec(s, slide, studentId);
+  const rm = new Set((rec && rec.removed) || []);
+  const alive = (x, i) => !!x && !(x.id ? rm.has(x.id) : rm.has("#" + i));
+  return {
+    ...slide, mode: "individual",
+    strokes: [...(slide.strokes || []).filter(alive), ...((rec && rec.strokes) || []).filter(x => x && !(x.id && rm.has(x.id)))],
+    texts: [...(slide.texts || []).filter(x => x && !(x.id && rm.has(x.id))), ...((rec && rec.texts) || []).filter(x => x && !(x.id && rm.has(x.id)))],
+  };
+}
+function reviewActivity(slide, a, showAnswer) {
+  const base = a || { phase: "idle" };
+  if (slide.type === "ink") return { ...base, mode: "individual" };
+  if (getSlideType(slide.type).category === "game") return { ...base, phase: "ended" };
+  if (showAnswer) return { ...base, phase: "ended", reveal: true };
+  const { endsAt, startedAt, ...rest } = base;
+  if (slide.type === "poll") return { ...rest, phase: "idle" }; // 설문: 수업에서 공개한 결과는 그대로 보여 줌(잠그지 않음)
+  // autoRevealed: 객관식의 '전원 응답 → 자동 공개'를 끈다(혼자 복습하면 늘 전원 응답)
+  return { ...rest, phase: "idle", reveal: false, autoRevealed: true };
+}
+
+export function studentReviewView({ id } = {}) {
+  const me = currentStudent();
+  if (!me) { redirect("/student-login"); return; }
+  if (!id) { redirect("/student/records"); return; }
+  css();
+
+  let dead = false, host = null, offStore = null, started = false, mounting = false, dirty = false;
+  let loadTimer = null, loadTries = 0, idx = 0;
+  let slides = null, slidesSrc = null; // 복습용 슬라이드(필기는 바닥 그림 합침) — 스냅샷마다 1회
+  const answers = new Set();             // [정답 보기]를 켠 슬라이드 id
+  let ansVer = 0, viewCache = null;
+  const shown = {};
+
+  const titleEl = el("div", { class: "topbar-title" }, "");
+  const answerLabel = el("span", { class: "ans-label" });
+  const answerBtn = el("button", { class: "btn btn-sm", type: "button", hidden: true, onClick: toggleAnswer }, [icon("eye", 16), answerLabel]);
+  const prevBtn = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "이전", onClick: () => step(-1) }, icon("chevron-left"));
+  const nextBtn = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "다음", onClick: () => step(1) }, icon("chevron-right"));
+  const countEl = el("span", { class: "slide-count" }, "");
+  const exitBtn = el("button", { class: "btn btn-ghost", type: "button", onClick: () => go("/student/records") }, "나가기");
+  const top = el("header", { class: "stu-top" }, [
+    brand(), titleEl, el("span", { class: "pill pill-accent pill-review" }, "복습"), answerBtn,
+    el("div", { class: "slide-nav" }, [prevBtn, countEl, nextBtn]),
+    exitBtn,
+  ]);
+  const stage = el("div", { class: "stu-stage" }, [el("div", { class: "center" }, el("span", { class: "spinner", "aria-label": "불러오는 중" }))]);
+  mount(el("div", { class: "stu stu-review" }, [top, stage]));
+
+  function setText(node, key, text) {
+    if (shown[key] === text) return;
+    shown[key] = text;
+    node.textContent = text;
+  }
+  function destroyHost() {
+    if (host) { try { host.destroy(); } catch (e) { console.warn("[review] host.destroy", e); } }
+    host = null;
+  }
+
+  function reviewSlides(s) {
+    const snap = Array.isArray(s.slidesSnapshot) ? s.slidesSnapshot : [];
+    if (slidesSrc !== snap) {
+      slidesSrc = snap;
+      slides = snap.map(sl => (sl && sl.type === "ink" ? reviewInkSlide(s, sl, me.id) : sl));
+    }
+    return slides;
+  }
+  // 플러그인에게 보여 줄 세션: 활동 상태·모드·흐름만 복습용으로, 나머지(응답·필기·참여자)는 진짜 세션 그대로
+  function sessionView(real) {
+    const c = viewCache;
+    if (c && c.real === real && c.act === real.activity && c.snap === real.slidesSnapshot && c.ans === ansVer) return c.view;
+    const list = reviewSlides(real);
+    const activity = {};
+    for (const sl of list) if (sl) activity[sl.id] = reviewActivity(sl, real.activity?.[sl.id], answers.has(sl.id));
+    const over = { activity, flow: "student", slidesSnapshot: list };
+    const view = new Proxy(real, { get: (t, k) => (Object.hasOwn(over, k) ? over[k] : Reflect.get(t, k)) });
+    viewCache = { real, act: real.activity, snap: real.slidesSnapshot, ans: ansVer, view };
+    return view;
+  }
+
+  function render() {
+    if (dead || !started) return;
+    if (mounting) { dirty = true; return; }
+    const s = findSession(id);
+    if (!s) return;
+    const list = reviewSlides(s);
+    const n = list.length;
+    setText(titleEl, "title", s.title || "");
+    titleEl.title = s.title || "";
+    if (!n) { destroyHost(); stage.replaceChildren(el("div", { class: "empty" }, "슬라이드가 없어요")); return; }
+    idx = clamp(idx, 0, n - 1);
+    const slide = list[idx];
+    setText(countEl, "count", `${idx + 1} / ${n}`);
+    prevBtn.disabled = idx <= 0;
+    nextBtn.disabled = idx >= n - 1;
+    const can = hadAnswer(slide, s.activity?.[slide.id]);
+    answerBtn.hidden = !can;
+    if (can) {
+      const label = answers.has(slide.id) ? "다시 풀기" : "정답 보기";
+      setText(answerLabel, "answer", label);
+      answerBtn.title = label;
+      answerBtn.setAttribute("aria-label", label);
+    }
+    if (host) { host.update({ slide, session: s }); return; }
+    stage.replaceChildren();
+    mounting = true; dirty = false;
+    try { host = mountSlideHost({ role: "student", root: stage, slide, session: s, me, sessionView }); }
+    catch (e) { console.error("[review] 슬라이드 표시 실패", e); host = null; }
+    finally { mounting = false; }
+    if (dead) { destroyHost(); return; }
+    if (!host) { stage.replaceChildren(el("div", { class: "empty" }, "이 슬라이드를 불러오지 못했어요")); return; }
+    if (dirty) { dirty = false; render(); }
+  }
+
+  function step(d) {
+    if (!slides || !slides.length) return;
+    const next = clamp(idx + d, 0, slides.length - 1);
+    if (next === idx) return;
+    idx = next;
+    lsSet(`${REVIEW_POS}${id}:${me.id}`, String(idx));
+    render();
+  }
+  function toggleAnswer() {
+    const slide = slides && slides[idx];
+    if (!slide) return;
+    if (answers.has(slide.id)) answers.delete(slide.id); else answers.add(slide.id);
+    ansVer++;
+    render();
+  }
+  function onKey(e) {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    if (e.defaultPrevented || e.isComposing || e.altKey || e.metaKey || e.ctrlKey) return;
+    if (document.documentElement.classList.contains("has-layer")) return;
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    e.preventDefault();
+    step(e.key === "ArrowLeft" ? -1 : 1);
+  }
+
+  function showLoadFail() {
+    destroyHost();
+    const retry = el("button", { class: "btn", type: "button", onClick: () => { loadTries = 0; load(); } }, "다시 시도");
+    stage.replaceChildren(el("div", { class: "center stack" }, [el("div", { class: "empty" }, "수업을 불러오지 못했어요"), retry]));
+  }
+
+  async function load() {
+    clearTimeout(loadTimer);
+    if (dead || started) return;
+    // 복습은 낡은 캐시(끝난 줄 모르는 live 등)를 믿지 않고 항상 서버에서 한 번 읽는다
+    let s = null;
+    try { s = await cloudFetchSession(id, { forStudentId: me.id }); }
+    catch (e) { console.warn("[review] 세션 조회 실패", e); }
+    if (dead || started) return;
+    if (!s) {
+      showLoadFail();
+      if (++loadTries < 5) loadTimer = setTimeout(load, 3000);
+      return;
+    }
+    if (s.status === "live") { ssSet(LEFT_KEY, null); go("/student/live/" + id, { replace: true }); return; }
+    // 수업에 없던 학생도 복습하면 참여자로 남아 교사 기록에 보인다(이미 있으면 서버가 무시)
+    cloudAddParticipant(id, me.id).then(r => { if (r && r.error) console.warn("[review] 참여 등록 실패", r.error); },
+      e => console.warn("[review] 참여 등록 실패", e));
+    idx = parseInt(lsGet(`${REVIEW_POS}${id}:${me.id}`) || "0", 10) || 0;
+    offStore = store.subscribe(render);
+    document.addEventListener("keydown", onKey);
+    started = true;
+    render();
+  }
+  load();
+
+  return () => {
+    dead = true;
+    clearTimeout(loadTimer);
+    document.removeEventListener("keydown", onKey);
+    try { offStore && offStore(); } catch (e) { console.warn(e); }
     destroyHost();
   };
 }
@@ -536,6 +752,9 @@ export function studentRecordsView() {
         el("div", { class: "stu-rec-head stack-sm" }, [
           el("h2", {}, s.title || "수업"),
           el("div", { class: "muted" }, fmtDate(s.startedAt)),
+          s.status === "live"
+            ? el("button", { class: "btn btn-primary", type: "button", onClick: () => go("/student/live/" + s.id) }, "수업 들어가기")
+            : el("button", { class: "btn btn-primary", type: "button", onClick: () => go("/student/review/" + s.id) }, [icon("pen", 18), "복습하기"]),
         ]),
         ...(slides.length ? slides.map((sl, i) => slideBlock(sl, i, s)) : [el("div", { class: "empty" }, "슬라이드가 없어요")]),
       );

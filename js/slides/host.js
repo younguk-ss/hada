@@ -2,6 +2,7 @@
 // 키 `${slide.id}|${role}` 가 같으면 DOM 보존 + 훅만 호출, 다르면 destroy 후 재마운트.
 // 가정: cloud/realtime/ui/store 는 네임스페이스 import — 다른 에이전트 파일이 아직 덜 됐어도 모듈 링크가 깨지지 않게.
 // 가정: ctx 에 명세 외 보조 함수 timeout(fn, ms)/interval(fn, ms)/clearTimer(id)/lesson/update 를 추가(destroy 시 자동 정리).
+// 가정: sessionView(session) → 플러그인에게 보여 줄 세션(학생 복습: 활동 상태·모드를 바꾼 보기). 쓰기(응답·필기)는 store의 진짜 세션에 한다.
 import * as ui from "../ui.js";
 import * as storeMod from "../store.js";
 import * as cloud from "../cloud.js";
@@ -44,14 +45,14 @@ function toast(msg) {
   else console.log("[toast]", msg);
 }
 
-export function mountSlideHost({ role = "student", root, slide, session, me, lesson, onEditorUpdate } = {}) {
+export function mountSlideHost({ role = "student", root, slide, session, me, lesson, onEditorUpdate, sessionView = null } = {}) {
   let curSlide = slide;
   let curSession = session || null;
   let cur = null;          // { key, inst, ctx, wrap, listeners, timers, lastAct, lastSig }
   let destroyed = false;
 
   const sessionId = () => curSession?.id || null;
-  // 항상 store 의 최신 세션 객체
+  // 항상 store 의 최신 세션 객체 (sessionView가 있으면 그 보기)
   function liveSession() {
     const id = sessionId();
     if (!id) return null;
@@ -59,7 +60,7 @@ export function mountSlideHost({ role = "student", root, slide, session, me, les
     const found = (typeof storeMod.findSession === "function" ? storeMod.findSession(id) : null)
       || st?.sessions?.find?.(s => s.id === id);
     if (found) curSession = found;
-    return curSession;
+    return sessionView && curSession ? sessionView(curSession) : curSession;
   }
 
   function buildCtx(state) {

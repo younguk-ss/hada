@@ -1,17 +1,20 @@
 // 인쇄: 학생 개별 결과(슬라이드·학생 선택) + 기록 화면 인쇄
 // - A4 세로, 여백 최소. 학습지 이미지(특히 A4 세로 PDF)는 16:10 틀의 여백을 잘라 종이 한 장을 꽉 채운다.
 // - 종이마다 오른쪽 위에 작은 워터마크(assets/print-mark.png), 머리글(수업 이름·학생)은 작게.
+// - 학습지(학생 결과·빈 학습지)는 장마다 머리글에 그 수업의 복습 QR + 코드 → 학생이 찍으면 자기 페이스로 복습(/r/CODE).
 // 가정: 필기 좌표는 16:10 프레임 기준(0..1), 배경은 object-fit: contain → 이미지 영역을 계산해 잘라낸다.
+// 가정: 복습 코드를 못 만들면(열 없는 DB·오프라인) QR 없이 인쇄하고 toast로 알린다.
 import { el, modal, toast, icon } from "./ui.js";
 import { findStudent, studentLabel } from "./store.js";
 import { drawStroke, strokeKey } from "./canvas.js";
 import { getSlideType, effectiveMode, injectCss } from "./slides/index.js";
+import { cloudEnsureReviewCode } from "./cloud.js";
 
 const MARK = "assets/print-mark.png";
 const FRAME = 16 / 10;        // 슬라이드 프레임 비율
 const REF_W = 960;            // canvas.js 의 선 굵기 기준 폭
 const PAGE_W = 196;           // A4 210mm - 좌우 7mm
-const BODY_H = 270;           // A4 297mm - 위 5 - 머리 12 - 아래 7 - 여유 3
+const BODY_H = 270;           // A4 297mm - 위 5 - 머리 13 - 아래 7 - 여유 2
 const GAP = 4;                // 슬라이드 사이(mm)
 const PX_W = 1600;            // 출력 이미지 폭(px) ≈ 200dpi
 
@@ -27,10 +30,17 @@ injectCss("print", `
 .pp-sheet{width:210mm;height:296.5mm;box-sizing:border-box;padding:5mm 7mm 7mm;display:flex;flex-direction:column;break-after:page;page-break-after:always;overflow:hidden;background:#fff;color:#1c1c22}
 .pp-sheet:last-child{break-after:auto;page-break-after:auto}
 .pp-sheet.flow{height:auto;overflow:visible}
-.pp-head{flex:none;height:12mm;display:flex;align-items:center;gap:3mm;font:500 8.5pt/1.25 "Pretendard Variable",Pretendard,sans-serif;color:#6b6b72}
+.pp-head{flex:none;height:13mm;display:flex;align-items:center;gap:3mm;font:500 8.5pt/1.25 "Pretendard Variable",Pretendard,sans-serif;color:#6b6b72}
 .pp-head .pp-title{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pp-head .pp-page{font-variant-numeric:tabular-nums}
 .pp-mark{width:11mm;height:11mm;object-fit:contain;flex:none}
+.pp-name{flex:none;display:flex;align-items:flex-end;gap:1mm;color:#1c1c22;font-size:8.5pt}
+.pp-name i{display:inline-block;width:7mm;border-bottom:.25mm solid #8b8a86;height:4mm}
+.pp-name i.w{width:22mm}
+.pp-qr{flex:none;display:flex;align-items:center;gap:1.6mm}
+.pp-qr-txt{display:flex;flex-direction:column;align-items:flex-end;font-size:6pt;line-height:1.2;color:#6b6b72}
+.pp-qr-txt b{font-size:10pt;line-height:1.15;letter-spacing:.08em;color:#1c1c22;font-variant-numeric:tabular-nums}
+.pp-qr-img{width:12mm;height:12mm;display:block;image-rendering:pixelated}
 .pp-body{flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;gap:${GAP}mm}
 .pp-img{display:block}
 .pp-img.framed{outline:.25mm solid #d6d2c8}
@@ -104,8 +114,9 @@ function recordFor(session, slide, studentId) {
 }
 
 // ── 필기 슬라이드 한 장 → { src(objectURL|dataURL), aspect, framed } ──
+// studentId가 없으면 빈 학습지(편집기 기본 필기만)
 async function renderInk(session, slide, studentId) {
-  const rec = recordFor(session, slide, studentId);
+  const rec = studentId ? recordFor(session, slide, studentId) : null;
   const strokes = [...(slide.strokes || []), ...((rec && rec.strokes) || [])];
   const texts = [...(slide.texts || []), ...((rec && rec.texts) || [])];
   const removed = new Set((rec && rec.removed) || []);
@@ -216,30 +227,55 @@ function runPrint({ pageCss, htmlClass }) {
   });
 }
 
-// ── 학생 개별 결과 인쇄 ──
-// slideIds 순서는 세션 슬라이드 순서를 따른다.
-export async function printStudents({ session, studentIds, slideIds, teacher }) {
-  const slides = (session.slidesSnapshot || []).filter(s => slideIds.includes(s.id));
-  if (!slides.length || !studentIds.length) { toast("인쇄할 슬라이드와 학생을 고르세요"); return; }
-  const total = slides.length * studentIds.length;
+// ── 복습 QR (수업마다) ──
+export function reviewUrl(code) {
+  return `${location.origin}${location.pathname}#/r/${encodeURIComponent(code || "")}`;
+}
+// index.html이 qrcode를 defer로 불러오므로 준비될 때까지 잠시 기다림
+async function qrDataUrl(text) {
+  for (let i = 0; i < 40 && !(window.QRCode && window.QRCode.toDataURL); i++) await new Promise(r => setTimeout(r, 250));
+  const Q = window.QRCode;
+  if (!Q || typeof Q.toDataURL !== "function") return null;
+  return await new Promise((res) => {
+    try { Q.toDataURL(text, { width: 360, margin: 0, errorCorrectionLevel: "M" }, (err, url) => res(err ? null : url)); }
+    catch (_) { res(null); }
+  });
+}
+// 머리글용 '복습 코드 · QR' 묶음(장마다 cloneNode). 못 만들면 null
+async function reviewBadge(session) {
+  const code = await cloudEnsureReviewCode(session);
+  if (!code) { toast("복습 코드를 만들지 못해 QR 없이 인쇄해요"); return null; }
+  const src = await qrDataUrl(reviewUrl(code));
+  return el("div", { class: "pp-qr" }, [
+    el("div", { class: "pp-qr-txt" }, [el("span", {}, "복습 코드"), el("b", {}, code), el("span", {}, location.host)]),
+    src ? el("img", { class: "pp-qr-img", src, alt: "" }) : null,
+  ]);
+}
+
+// ── 학습지 묶음 인쇄 (공용) ──
+// sets: [{ studentId|null, who: 머리글 오른쪽(문자열|노드) }], studentId 없으면 빈 학습지
+async function printSheets({ session, sets, slides, teacher }) {
+  const total = slides.length * sets.length;
   const t = toast(total > 6 ? `인쇄 준비 중… (${total}장)` : "인쇄 준비 중…", { duration: 120000 });
+  const badge = await reviewBadge(session);
   document.getElementById("print-root")?.remove();
   const root = el("div", { id: "print-root" });
   const urls = [];
-  let done = 0;
   const title = session.title || "수업";
-  for (const sid of studentIds) {
-    const st = findStudent(sid);
-    const who = st ? studentLabel(st) : "학생";
+  for (const set of sets) {
+    const sid = set.studentId || null;
     const sheets = [];
     let cur = null, used = 0;
     const newSheet = (flow = false) => {
       const body = el("div", { class: "pp-body" });
       const pageNo = el("span", { class: "pp-page" });
+      const who = set.who;
       const sheet = el("section", { class: "pp-sheet" + (flow ? " flow" : "") }, [
         el("header", { class: "pp-head" }, [
-          el("span", { class: "pp-title" }, `${title} · ${who}`),
+          el("span", { class: "pp-title" }, typeof who === "string" ? `${title} · ${who}` : title),
+          who && typeof who !== "string" ? who.cloneNode(true) : null,
           pageNo,
+          badge ? badge.cloneNode(true) : null,
           el("img", { class: "pp-mark", src: MARK, alt: "" }),
         ]),
         body,
@@ -251,7 +287,6 @@ export async function printStudents({ session, studentIds, slideIds, teacher }) 
     for (const sl of slides) {
       if (sl.type === "ink") {
         const out = await renderInk(session, sl, sid);
-        done++;
         if (!out.src) continue;
         if (out.src.startsWith("blob:")) urls.push(out.src);
         // 크기(mm): 폭 196 기준, 높이가 넘치면 높이 기준
@@ -263,9 +298,8 @@ export async function printStudents({ session, studentIds, slideIds, teacher }) 
           class: "pp-img" + (out.framed ? " framed" : ""), src: out.src, alt: "",
           style: { width: `${w.toFixed(1)}mm`, height: `${h.toFixed(1)}mm` },
         }));
-      } else {
+      } else if (sid) {
         const node = renderSummary(session, sl, sid, teacher);
-        done++;
         if (!node) continue;
         cur = newSheet(true); used = BODY_H; // 활동 결과는 자기 장에서 흐르게
         cur._body.appendChild(node);
@@ -285,6 +319,25 @@ export async function printStudents({ session, studentIds, slideIds, teacher }) 
   urls.forEach(u => URL.revokeObjectURL(u));
 }
 
+// ── 학생 개별 결과 인쇄 ──
+// slideIds 순서는 세션 슬라이드 순서를 따른다.
+export async function printStudents({ session, studentIds, slideIds, teacher }) {
+  const slides = (session.slidesSnapshot || []).filter(s => slideIds.includes(s.id));
+  if (!slides.length || !studentIds.length) { toast("인쇄할 슬라이드와 학생을 고르세요"); return; }
+  const sets = studentIds.map(sid => { const st = findStudent(sid); return { studentId: sid, who: st ? studentLabel(st) : "학생" }; });
+  await printSheets({ session, sets, slides, teacher });
+}
+
+// ── 빈 학습지 인쇄 (수업 전·중에 나눠 줄 종이: 기본 필기만 + 이름 칸 + 복습 QR) ──
+export async function printBlank({ session, slideIds, teacher }) {
+  const slides = (session.slidesSnapshot || []).filter(s => s.type === "ink" && slideIds.includes(s.id));
+  if (!slides.length) { toast("인쇄할 슬라이드를 고르세요"); return; }
+  const name = el("span", { class: "pp-name" }, [
+    el("i"), "학년", el("i"), "반", el("i"), "번", " 이름", el("i", { class: "w" }),
+  ]);
+  await printSheets({ session, sets: [{ studentId: null, who: name }], slides, teacher });
+}
+
 // ── 기록 화면 그대로 인쇄 (글씨 작게, 여백 작게, 워터마크) ──
 export async function printRecordView() {
   let mark = document.querySelector(".pp-fixed-mark");
@@ -299,6 +352,50 @@ export async function printRecordView() {
 }`;
   await runPrint({ pageCss: css, htmlClass: "pp-record" });
   mark.remove();
+}
+
+// 슬라이드 고르기 격자 (pick: Set<slideId>, 탭마다 onChange, numOf: 카드 번호)
+function slideGrid(slides, pick, onChange, numOf = (sl, i) => i + 1) {
+  return el("div", { class: "pp-slides" }, slides.map((sl, i) => {
+    const def = getSlideType(sl.type);
+    let th;
+    try { th = def.thumb ? def.thumb(sl) : null; } catch (_) { th = null; }
+    const card = el("button", { class: "pp-slide" + (pick.has(sl.id) ? " on" : ""), type: "button",
+      onClick: () => { pick.has(sl.id) ? pick.delete(sl.id) : pick.add(sl.id); card.classList.toggle("on", pick.has(sl.id)); onChange(); },
+    }, [el("span", { class: "pp-check", html: CHECK }), el("div", { class: "pp-thumb" }, th ? [th] : []), el("div", { class: "pp-cap" }, [el("b", {}, String(numOf(sl, i))), el("span", {}, sl.title || def.label)])]);
+    return card;
+  }));
+}
+
+// ── 빈 학습지 인쇄 선택 창: 필기 슬라이드 고르기 → 인쇄 ──
+export function openBlankPrint({ session, teacher } = {}) {
+  const all = (session && session.slidesSnapshot) || [];
+  const slides = all.filter(sl => sl.type === "ink");
+  if (!slides.length) { toast("인쇄할 필기 슬라이드가 없어요"); return null; }
+  const pick = new Set(slides.map(sl => sl.id));
+  const body = el("div", { class: "pp-wiz" });
+  const m = modal({ title: "빈 학습지 인쇄", body, wide: true, actions: [] });
+  const info = el("span", { class: "grow" });
+  const goBtn = el("button", { class: "btn btn-primary", type: "button", onClick: async () => {
+    if (!pick.size) return;
+    const ids = slides.map(sl => sl.id).filter(id => pick.has(id));
+    m.close();
+    await printBlank({ session, slideIds: ids, teacher });
+  } }, [icon("print", 18), "인쇄"]);
+  const upd = () => { info.textContent = `${pick.size}장 · 장마다 복습 QR · 부수는 인쇄 창에서`; goBtn.disabled = !pick.size; };
+  const render = () => {
+    body.replaceChildren(
+      el("div", { class: "pp-tools" }, [
+        el("button", { class: "btn btn-sm", type: "button", onClick: () => { slides.forEach(sl => pick.add(sl.id)); render(); } }, "전체 선택"),
+        el("button", { class: "btn btn-sm btn-ghost", type: "button", onClick: () => { pick.clear(); render(); } }, "해제"),
+      ]),
+      slideGrid(slides, pick, upd, (sl) => all.indexOf(sl) + 1), // 번호는 수업 슬라이드 순서
+      el("div", { class: "pp-foot" }, [info, el("button", { class: "btn", type: "button", onClick: () => m.close() }, "취소"), goBtn]),
+    );
+    upd();
+  };
+  render();
+  return m;
 }
 
 // ── 학생 인쇄 선택 창: 1) 슬라이드 2) 학생 ──
@@ -321,15 +418,7 @@ export function openStudentPrint({ session, teacher, studentIds: preset } = {}) 
       el(step === 1 ? "b" : "span", {}, "1. 슬라이드"), el("span", {}, "›"), el(step === 2 ? "b" : "span", {}, "2. 학생"),
     ]));
     if (step === 1) {
-      const grid = el("div", { class: "pp-slides" }, slides.map((sl, i) => {
-        const def = getSlideType(sl.type);
-        let th;
-        try { th = def.thumb ? def.thumb(sl) : null; } catch (_) { th = null; }
-        const card = el("button", { class: "pp-slide" + (pickSlides.has(sl.id) ? " on" : ""), type: "button",
-          onClick: () => { pickSlides.has(sl.id) ? pickSlides.delete(sl.id) : pickSlides.add(sl.id); card.classList.toggle("on", pickSlides.has(sl.id)); upd(); },
-        }, [checkEl(), el("div", { class: "pp-thumb" }, th ? [th] : []), el("div", { class: "pp-cap" }, [el("b", {}, String(i + 1)), el("span", {}, sl.title || def.label)])]);
-        return card;
-      }));
+      const grid = slideGrid(slides, pickSlides, () => upd());
       const all = el("button", { class: "btn btn-sm", type: "button", onClick: () => { slides.forEach(s => pickSlides.add(s.id)); render(); } }, "전체 선택");
       const ink = el("button", { class: "btn btn-sm", type: "button", onClick: () => { pickSlides.clear(); slides.filter(s => s.type === "ink").forEach(s => pickSlides.add(s.id)); render(); } }, "필기만");
       const none = el("button", { class: "btn btn-sm btn-ghost", type: "button", onClick: () => { pickSlides.clear(); render(); } }, "해제");

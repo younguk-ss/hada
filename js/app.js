@@ -5,6 +5,8 @@
 // 가정: /student-login?form=1 은 기억된 학생이 있어도 폼을 연다(대기 화면 '코드 바꾸기'). 이때 학생 정보는 채우고 코드는 비운다.
 // 가정: 참여 등록(cloudAddParticipant)은 여기서 하지 않는다 — 수업 화면 진입 시 student.js가 1회 처리.
 // 가정: QR 입장(/student/join?c=)에서 기억된 학생이면 로그인 화면을 그린 뒤 그 코드로 바로 입장을 시도한다(lastCode는 성공 시 저장).
+// 가정: 코드 칸 하나로 교사 코드와 수업별 복습 코드(학습지 QR, /r/CODE)를 함께 받는다 — 교사 코드를 먼저 찾고 없으면 복습 코드.
+//       복습 코드로 들어오면 lastCode(대기 화면용 교사 코드)는 이전 값을 두고, 없을 때만 그 수업 선생님의 코드로 채운다.
 import "./slides/index.js"; // 슬라이드 타입 등록 (top-level await — 라우팅 전에 끝남)
 import { route, start, go } from "./router.js";
 import { mount, template, el } from "./ui.js";
@@ -13,9 +15,9 @@ import { initBrandBanner } from "./brand-banner.js";
 import { store, normCode } from "./store.js";
 import {
   initCloud, cloudReady, cloudLoginTeacher, cloudBootTeacher, cloudFindTeacherByCode, cloudJoinStudent,
-  cloudFetchLiveSession,
+  cloudFetchLiveSession, cloudFindSessionByReviewCode,
 } from "./cloud.js";
-import { studentWaitView, studentLiveView, studentRecordsView, currentStudent } from "./student.js";
+import { studentWaitView, studentLiveView, studentReviewView, studentRecordsView, currentStudent } from "./student.js";
 
 initCloud().then(ok => console.info(ok ? "hada: Supabase 클라우드 모드" : "hada: 로컬 모드"));
 
@@ -209,21 +211,33 @@ function studentLoginView(params = {}, { autoCode = null } = {}) {
     const fail = (msg) => { if (!dead) err.textContent = msg; };
     try {
       // cloudReady는 기다리지 않는다(같은 기기에 교사 로그인이 있으면 교사 부팅 조회까지 기다리게 됨). cloud 함수가 클라이언트 준비를 기다린다.
-      let teacher = null;
-      try { teacher = await cloudFindTeacherByCode(code); }
+      let teacher = null, review = null;
+      try {
+        teacher = await cloudFindTeacherByCode(code);
+        if (!teacher) review = await cloudFindSessionByReviewCode(code);
+      }
       catch (e) { console.warn("[app] 코드 조회 실패", e); return fail("서버에 연결하지 못했어요"); }
       if (dead) return;
-      if (!teacher) return fail("코드를 확인해 주세요");
+      if (!teacher && !review) return fail("코드를 확인해 주세요");
       let student = null;
       try { student = await cloudJoinStudent({ grade, classNum, num, name }); }
       catch (e) { console.warn("[app] 학생 등록 실패", e); return fail("서버에 연결하지 못했어요"); }
       if (dead) return;
       if (!student || !student.id) return fail("잠시 후 다시 시도해 주세요");
+      const lastCode = review
+        ? normCode((profile && profile.id === student.id && profile.lastCode) || (review.teacher && review.teacher.joinCode) || "") || null
+        : code;
       store.set(s => {
-        s.studentProfile = { id: student.id, grade: student.grade, classNum: student.classNum, num: student.num, name: student.name, lastCode: code };
+        s.studentProfile = { id: student.id, grade: student.grade, classNum: student.classNum, num: student.num, name: student.name, lastCode };
         s.whoStudent = student.id;
       });
       ssSet("hada:joinCode", null);
+      if (review) {
+        // 진행 중이면 수업으로, 끝났으면 복습으로 (복습 화면도 live면 수업으로 보낸다)
+        if (review.status === "live") ssSet("hada:left", null);
+        go((review.status === "live" ? "/student/live/" : "/student/review/") + review.id);
+        return;
+      }
       let live = null;
       try { live = await cloudFetchLiveSession(teacher.id, { forStudentId: student.id }); }
       catch (e) { console.warn("[app] 진행 중 수업 조회 실패", e); }
@@ -278,9 +292,9 @@ function studentLoginView(params = {}, { autoCode = null } = {}) {
 
 route("/student-login", (params) => studentLoginView(params || {}));
 
-// QR: /student/join?c=CODE
-route("/student/join", (params) => {
-  const code = normCode((params && params.c) || "");
+// QR: /student/join?c=CODE (교사 코드) · /r/CODE (수업별 복습 코드, 학습지에 인쇄)
+function qrJoin(rawCode) {
+  const code = normCode(rawCode || "");
   const me = currentStudent();
   if (me && me.id && code) {
     // 기록상 주소를 로그인 화면으로 바꿔 둔다 → 수업에서 '뒤로'를 눌러도 자동 입장이 반복되지 않음(재디스패치 없음)
@@ -289,7 +303,9 @@ route("/student/join", (params) => {
   }
   if (code) ssSet("hada:joinCode", code);
   redirect("/student-login");
-});
+}
+route("/student/join", (params) => qrJoin(params && params.c));
+route("/r/:code", (params) => qrJoin(params && params.code));
 
 // ── 학생 ──
 function studentOnly(view) {
@@ -300,6 +316,7 @@ function studentOnly(view) {
 }
 route("/student", studentOnly(() => studentWaitView()));
 route("/student/live/:id", studentOnly((p) => studentLiveView({ id: p.id })));
+route("/student/review/:id", studentOnly((p) => studentReviewView({ id: p.id })));
 route("/student/records", studentOnly(() => studentRecordsView()));
 
 // ── 교사 ──
