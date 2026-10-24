@@ -6,10 +6,16 @@
 // 가정: 잠기는 순간 제출하지 않은 변경은 버리고 제출본을 보여 준다(정답 공개 ✓/✗ 가 실제 제출과 일치하도록).
 // 가정: endsAt·startedAt 은 교사 시계 기준. 코어가 ctx.now()(학생 기기의 교사 시계 추정)를 주면 그것으로 비교하고,
 //       없으면 Date.now()(보정 없음). common.countdownPill/phasePill 은 Date.now() 를 쓰므로 toLocalTime 으로 바꿔 넘긴다.
+// 가정: 정답 표시 = reveal || phase 'ended' || 전원 응답. 전원 응답 = 대상(접속 중 ∩ 참여자, 접속 정보 없으면 참여자)
+//       모두가 제출(개수 비교 대신 '대상 전원 포함'으로 판정 — 접속 끊긴 응답자가 끼어도 정확하게).
+// 가정: 전원 응답 시 교사 클라이언트가 1회 setActivity({ phase:'ended', reveal:true, autoRevealed:true }).
+//       autoRevealed 는 '다시 받기' 뒤에도 남으므로(얕은 병합) 학생은 그 뒤 로컬 전원 응답 판정을 쓰지 않고,
+//       교사는 '다시 받기'·재마운트 때 이미 전원 응답이면 다시 쏘지 않는다(응답이 비거나 대상이 늘면 다시 장전).
+// 가정: 교사 스테이지 막대 타일의 모서리 번호(.cc-key)는 학생 화면과 맞추려고 A/B/C 로 바꿔 쓴다(letterKeys).
 import { el } from "../ui.js";
 import { findStudent } from "../store.js";
 import { registerSlideType, newId, injectCss } from "./registry.js";
-import { activityBar, choiceBars, phasePill, questionEditor, optionLetter } from "./common.js";
+import { activityBar, columnChart, whoSheet, optionColor, phasePill, questionEditor, optionLetter } from "./common.js";
 
 // ── 공용 헬퍼 (short.js, blank.js 도 사용) ──
 
@@ -163,6 +169,29 @@ export function ensureQuizCss(ctx) {
   (ctx?.injectCss || injectCss)("quiz", QUIZ_CSS);
 }
 
+// 전원 응답 판정 대상: 접속 중 ∩ 참여자 (접속 정보가 비면 참여자 전체). 학생 측 online() 은 빈 Set → 참여자
+export function answerTargetIds(ctx) {
+  const parts = ctx?.participants?.() || [];
+  let online = null;
+  try { online = ctx?.online?.() || null; } catch { online = null; }
+  if (online && online.size) return parts.filter(id => online.has(id));
+  return parts.slice();
+}
+
+// 대상 전원이 응답했나 (대상 ≥ 1명). answeredIds: 응답한 학생 id 들(iterable)
+export function everyoneAnswered(ctx, answeredIds) {
+  const target = answerTargetIds(ctx);
+  if (!target.length) return false;
+  const set = answeredIds instanceof Set ? answeredIds : new Set(answeredIds || []);
+  return target.every(id => set.has(id));
+}
+
+// columnChart 타일 모서리 번호 → A/B/C (학생 화면 글자와 맞춤). common 이 글자를 쓰게 되면 그대로 무해
+export function letterKeys(chart) {
+  chart?.querySelectorAll?.(".cc-key").forEach((k, i) => { k.textContent = optionLetter(i); });
+  return chart;
+}
+
 const QUIZ_CSS = `
 .qz-stu { height: 100%; overflow: auto; display: flex; flex-direction: column; gap: 16px; padding: 20px 16px calc(24px + env(safe-area-inset-bottom)); max-width: 760px; margin: 0 auto; width: 100%; box-sizing: border-box; }
 .qz-status { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
@@ -204,6 +233,20 @@ const QUIZ_CSS = `
 
 const ICON = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="2"/><circle cx="5" cy="12" r="2"/><circle cx="5" cy="18" r="2"/><path d="M10 6h10M10 12h10M10 18h10"/></svg>`;
 
+// 객관식 전용 보조 CSS (quiz 공용 CSS 위에)
+const MCQ_CSS = `
+.mcq-stu .choice .choice-key.opt-key { background: var(--opt-color); border-color: var(--opt-color); color: #fff; }
+.mcq-live { gap: 22px; }
+.mcq-head { display: flex; align-items: flex-start; gap: 16px; }
+.mcq-head .qz-q { flex: 1; min-width: 0; font-size: clamp(24px, 3.2vw, 40px); }
+.mcq-meta { flex: none; display: flex; gap: 6px; align-items: center; padding-top: 8px; }
+.mcq-live .cc { --cc-h: clamp(110px, 34cqh, 380px); margin-top: auto; }
+@media (max-width: 720px) { .mcq-live .cc { --cc-h: 140px; } .mcq-head { flex-direction: column-reverse; gap: 8px; } }
+.mcq-sum .cc { --cc-h: 120px; }
+.mcq-sum .cc-tile { min-height: 56px; font-size: 15px; padding: 10px 8px; }
+`;
+const ensureMcqCss = (ctx) => (ctx?.injectCss || injectCss)("mcq", MCQ_CSS);
+
 const defaults = () => ({
   question: "",
   options: Array.from({ length: 4 }, () => ({ id: newId("opt"), text: "" })),
@@ -227,24 +270,38 @@ function grade(cfg, picked) {
   return { score: ok ? 1 : 0, correct: ok };
 }
 
-// 막대 행: 옵션별 선택 학생 수
-function barRows(cfg, map, { keyOn = false } = {}) {
-  const rs = [...map.values()];
-  return cfg.options.map((o, i) => ({
-    label: el("span", { class: "qz-bar-label" }, [
-      el("span", { class: `qz-key${keyOn && cfg.answerIds.includes(o.id) ? " on" : ""}` }, optionLetter(i)),
-      el("span", { class: "t" }, o.text),
-    ]),
-    count: rs.filter(r => (r.payload?.answerIds || []).includes(o.id)).length,
-    highlight: cfg.answerIds.includes(o.id),
-  }));
+// 옵션별 선택 학생 수 (여러 개 고르기면 고른 옵션마다 1)
+function countsOf(cfg, map) {
+  const counts = {};
+  for (const o of cfg.options) counts[o.id] = 0;
+  for (const r of map.values()) {
+    for (const id of new Set(r.payload?.answerIds || [])) if (id in counts) counts[id] += 1;
+  }
+  return counts;
 }
 
-// 정답 막대 강조: common 의 .is-accent 는 :where()(특이도 0)라 styles.css .bar-fill 에 진다
-// → styles.css 가 아는 .bar-row.correct 를 직접 토글(reveal 전 회색, 후 정답 --accent)
-function markCorrect(bars, cfg, on) {
-  [...bars.children].forEach((row, i) => row.classList.toggle("correct", !!on && cfg.answerIds.includes(cfg.options[i]?.id)));
-  return bars;
+// 정답 글자 'A, C'
+const lettersOf = (cfg, ids) => cfg.options.map((o, i) => (ids.includes(o.id) ? optionLetter(i) : null)).filter(Boolean).join(", ");
+
+// 교사 세로 막대(선지 색 타일)
+function chartFor(cfg, onBarClick) {
+  const opts = cfg.options.map((o, i) => ({ id: o.id, label: o.text || optionLetter(i) }));
+  return letterKeys(columnChart(opts, onBarClick ? { onBarClick } : {}));
+}
+
+// 누가 골랐나 (선지별 + 미응답)
+function openWho(ctx, cfg, list, revealed) {
+  if (typeof ctx?.modal !== "function") return;
+  const map = byStudent(list || []);
+  const rs = [...map.values()];
+  const groups = cfg.options.map((o, i) => ({
+    label: `${optionLetter(i)}. ${o.text || ""}`.trim(),
+    color: optionColor(i),
+    correct: !!revealed && cfg.answerIds.includes(o.id),
+    studentIds: rs.filter(r => (r.payload?.answerIds || []).includes(o.id)).map(r => r.studentId),
+  }));
+  groups.push({ label: "미응답", studentIds: (ctx.participants?.() || []).filter(id => !map.has(id)) });
+  whoSheet(ctx, { title: "응답 보기", groups });
 }
 
 function rosterRow(ctx, cfg, id, r) {
@@ -252,6 +309,18 @@ function rosterRow(ctx, cfg, id, r) {
   const picks = cfg.options.map((o, i) => ((r.payload?.answerIds || []).includes(o.id) ? optionLetter(i) : "")).join("");
   const mark = r.correct === true ? " ✓" : r.correct === false ? " ✗" : "";
   return { id, name: nameOf(ctx, id), value: (picks || "?") + mark, cls: r.correct === true ? "ok" : r.correct === false ? "bad" : "" };
+}
+
+// ctx 타이머가 있으면 쓰고(호스트가 정리), 없으면 직접
+function later(ctx, fn, ms) {
+  if (typeof ctx?.timeout === "function") { const id = ctx.timeout(fn, ms); return () => ctx.clearTimer?.(id); }
+  const id = setTimeout(fn, ms);
+  return () => clearTimeout(id);
+}
+function every(ctx, fn, ms) {
+  if (typeof ctx?.interval === "function") { const id = ctx.interval(fn, ms); return () => ctx.clearTimer?.(id); }
+  const id = setInterval(fn, ms);
+  return () => clearInterval(id);
 }
 
 function Editor({ slide, update, ctx }) {
@@ -280,19 +349,25 @@ function Editor({ slide, update, ctx }) {
 
 function Student({ slide, ctx }) {
   ensureQuizCss(ctx);
+  ensureMcqCss(ctx);
   const cfg = cfgOf(slide);
+  const graded = cfg.answerIds.length > 0;
   const shownAt = Date.now();
   let st = actOf(ctx);
   let mine = ctx.myResponse?.("") || null;
   let sel = new Set(mine?.payload?.answerIds || []);
   let dirty = false, sending = false;
+  let sSig = sessionSig(ctx);
 
   const status = statusRow({ onExpire: () => paint(), ctx });
-  if (cfg.multiple) status.el.appendChild(el("span", { class: "pill pill-muted" }, "여러 개 선택"));
+  const resP = el("span", { class: "pill pill-lg", hidden: true });
+  status.el.prepend(resP);
+  const multiP = cfg.multiple ? el("span", { class: "pill pill-muted" }, "여러 개 선택") : null;
+  if (multiP) status.el.appendChild(multiP);
   const btns = cfg.options.map((o, i) => {
     const mark = el("span", { class: "qz-mark" });
     const b = el("button", { class: "choice", type: "button", onClick: () => pick(o.id) }, [
-      el("span", { class: "choice-key" }, optionLetter(i)),
+      el("span", { class: "choice-key opt-key", style: { "--opt-color": optionColor(i) } }, optionLetter(i)),
       el("span", { class: "choice-text" }, o.text || " "),
       mark,
     ]);
@@ -300,14 +375,20 @@ function Student({ slide, ctx }) {
   });
   const submitB = el("button", { class: "btn btn-primary btn-lg btn-block qz-submit", type: "button", onClick: submit }, "제출");
 
-  const root = el("div", { class: "qz-stu" }, [
+  const root = el("div", { class: "qz-stu mcq-stu" }, [
     status.el,
     el("h2", { class: "qz-q" }, cfg.question || slide.title || ""),
     el("div", { class: "qz-choices" }, btns.map(x => x.b)),
     submitB,
   ]);
 
-  const locked = () => isLocked(st, clockNow(ctx)) || !!st.reveal;
+  // 정답 표시: 공개 · 마감 · 전원 응답(자동 공개 뒤 '다시 받기'면 전원 응답은 무시)
+  function revealed() {
+    if (st.reveal === true || st.phase === "ended") return true;
+    if (st.autoRevealed) return false;
+    return everyoneAnswered(ctx, byStudent(ctx.responses?.() || []).keys());
+  }
+  const locked = (rev = revealed()) => rev || isLocked(st, clockNow(ctx));
 
   function pick(id) {
     if (locked() || sending) return;
@@ -331,19 +412,28 @@ function Student({ slide, ctx }) {
   }
 
   function paint() {
-    const lock = locked();
+    const rev = revealed();
+    const lock = locked(rev);
     if (lock && dirty && !sending) { sel = new Set(mine?.payload?.answerIds || []); dirty = false; }
-    const reveal = !!st.reveal;
-    const graded = cfg.answerIds.length > 0;
-    status.set({ state: st, submitted: !!mine && !dirty });
+    const show = rev && graded; // 정답 ✓/✗ 표시
+    const picks = mine?.payload?.answerIds || [];
+    const ok = show && !!mine && sameSet(picks, cfg.answerIds);
+    // 공개 중에는 결과 pill 하나만(마감·제출함·여러 개 선택 숨김)
+    status.set({ state: show ? { phase: "idle" } : st, submitted: !show && !!mine && !dirty });
+    if (multiP) multiP.hidden = show;
+    resP.hidden = !show;
+    if (show) {
+      resP.textContent = ok ? "정답!" : `정답: ${lettersOf(cfg, cfg.answerIds)}`;
+      resP.className = `pill pill-lg ${ok ? "pill-ok" : "pill-muted"}`;
+    }
     for (const x of btns) {
       const picked = sel.has(x.id);
       const isAns = cfg.answerIds.includes(x.id);
       x.b.disabled = lock;
-      x.b.classList.toggle("selected", picked);
-      x.b.classList.toggle("correct", reveal && isAns);
-      x.b.classList.toggle("wrong", reveal && graded && picked && !isAns);
-      x.mark.textContent = reveal && graded && picked ? (isAns ? "✓" : "✗") : "";
+      x.b.classList.toggle("selected", picked && !show);
+      x.b.classList.toggle("correct", show && isAns);
+      x.b.classList.toggle("wrong", show && picked && !isAns);
+      x.mark.textContent = show ? (isAns ? "✓" : picked ? "✗" : "") : "";
     }
     submitB.hidden = lock;
     submitB.disabled = sending || !sel.size || (!!mine && !dirty);
@@ -359,70 +449,114 @@ function Student({ slide, ctx }) {
       if (!dirty) sel = new Set(mine?.payload?.answerIds || []);
       paint();
     },
+    onSession() {
+      const k = sessionSig(ctx);
+      if (k === sSig) return;
+      sSig = k; paint();
+    },
     destroy() { status.destroy(); },
   };
 }
 
 function TeacherLive({ slide, ctx }) {
   ensureQuizCss(ctx);
+  ensureMcqCss(ctx);
   const cfg = cfgOf(slide);
+  const graded = cfg.answerIds.length > 0;
   let st = actOf(ctx);
+  let rev = false;
 
   const status = statusRow({ ctx });
   const countP = el("span", { class: "pill" });
-  const bars = choiceBars([], 0, { revealed: false });
-  const root = el("div", { class: "qz-live" }, [
-    el("div", { class: "qz-live-head" }, [status.el, countP]),
-    el("h2", { class: "qz-q" }, cfg.question || slide.title || ""),
-    bars,
+  const chart = chartFor(cfg, () => openWho(ctx, cfg, ctx.responses() || [], rev));
+  const root = el("div", { class: "qz-live mcq-live" }, [
+    el("div", { class: "mcq-head" }, [
+      el("h2", { class: "qz-q" }, cfg.question || slide.title || ""),
+      el("div", { class: "mcq-meta" }, [status.el, countP]),
+    ]),
+    chart,
   ]);
 
   const bar = activityBar(ctx, { reveal: true, timer: true });
   const roster = rosterList();
   const panel = el("div", { class: "qz-panel" }, [bar, roster.el]);
 
+  const everyone = (map = byStudent(ctx.responses() || [])) => everyoneAnswered(ctx, map.keys());
+
+  // 전원 응답 → 자동 마감·정답 공개 (교사 클라이언트 1회). armed=false 면 응답이 비거나 대상이 늘 때까지 쉬기
+  let armed = true, firing = false, lastAll = everyone();
+  if (lastAll && (st.phase === "ended" || st.autoRevealed)) armed = false;
+  function checkAuto(all) {
+    lastAll = all;
+    if (!all) { armed = true; return; }
+    if (!armed || firing || st.phase === "ended") return;
+    armed = false; firing = true;
+    // 다음 틱에: 훅 안에서 setActivity 재진입 방지
+    later(ctx, () => {
+      firing = false;
+      if (!everyone()) { armed = true; return; }
+      if (ctx.activity().phase === "ended") return;
+      ctx.setActivity({ phase: "ended", reveal: true, endsAt: null, autoRevealed: true });
+    }, 0);
+  }
+
   let sSig = sessionSig(ctx);
   function paint() {
     const list = ctx.responses() || [];
     const map = byStudent(list);
+    const all = everyone(map);
+    rev = st.reveal === true || st.phase === "ended" || (all && (armed || firing));
     status.set({ state: st });
-    countP.textContent = `응답 ${map.size}`;
-    bars.update(barRows(cfg, map), map.size, { revealed: !!st.reveal });
-    markCorrect(bars, cfg, st.reveal);
+    countP.textContent = `응답 ${map.size}/${(ctx.participants() || []).length}`;
+    chart.update({ counts: countsOf(cfg, map), correctIds: graded ? cfg.answerIds : [], revealed: graded && rev });
     roster.set(rosterIds(ctx, list).map(id => rosterRow(ctx, cfg, id, map.get(id))));
     bar.update();
+    checkAuto(all);
   }
   paint();
+  // 접속(presence) 변화는 훅이 없어 2초마다 전원 응답만 다시 본다
+  const stopPoll = every(ctx, () => { const all = everyone(); if (all !== lastAll) paint(); }, 2000);
 
   return {
     el: root,
     panel,
-    onActivity(s) { st = actOf(ctx, s); paint(); },
+    onActivity(s) {
+      const prev = st;
+      st = actOf(ctx, s);
+      // '다시 받기'(ended → 다른 단계): 이미 전원 응답이면 다시 쏘지 않는다
+      if (prev.phase === "ended" && st.phase !== "ended") armed = !everyone();
+      paint();
+    },
     onResponses() { paint(); },
     onSession() {
       const k = sessionSig(ctx);
       if (k === sSig) return;
       sSig = k; paint();
     },
-    destroy() { status.destroy(); bar.destroy?.(); },
+    destroy() { stopPoll(); status.destroy(); bar.destroy?.(); },
   };
 }
 
 function summary(slide, responses = [], session, ctx) {
   ensureQuizCss(ctx);
+  ensureMcqCss(ctx);
   const cfg = cfgOf(slide);
+  const graded = cfg.answerIds.length > 0;
   const map = byStudent(responses);
-  const graded = [...map.values()].filter(r => typeof r.correct === "boolean");
-  const okN = graded.filter(r => r.correct).length;
+  const scored = [...map.values()].filter(r => typeof r.correct === "boolean");
+  const okN = scored.filter(r => r.correct).length;
+  const canWho = !!ctx?.isTeacher && typeof ctx?.modal === "function";
+  const chart = chartFor(cfg, canWho ? () => openWho(ctx, cfg, responses, true) : null);
+  chart.update({ counts: countsOf(cfg, map), correctIds: graded ? cfg.answerIds : [], revealed: graded });
   const roster = rosterList();
   roster.set(sortIds(ctx, [...map.keys()]).map(id => rosterRow(ctx, cfg, id, map.get(id))));
-  return el("div", { class: "qz-sum" }, [
+  return el("div", { class: "qz-sum mcq-sum" }, [
     el("div", { class: "qz-q" }, cfg.question || slide.title || ""),
     el("div", { class: "qz-sum-meta" }, [
       el("span", { class: "pill pill-muted" }, `응답 ${map.size}`),
-      graded.length ? el("span", { class: "pill pill-ok" }, `정답률 ${Math.round((okN / graded.length) * 100)}%`) : null,
+      scored.length ? el("span", { class: "pill pill-ok" }, `정답률 ${Math.round((okN / scored.length) * 100)}%`) : null,
     ]),
-    markCorrect(choiceBars(barRows(cfg, map, { keyOn: true }), map.size, { revealed: true }), cfg, true),
+    chart,
     map.size ? roster.el : null,
   ]);
 }

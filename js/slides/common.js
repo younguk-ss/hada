@@ -81,7 +81,7 @@ export function columnChart(options, { onBarClick } = {}) {
       const tile = el("div", { class: "cc-tile", role: onBarClick ? "button" : null, tabindex: onBarClick ? "0" : null,
         onClick: () => onBarClick?.(o.id),
         onKeydown: (e) => { if (onBarClick && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); onBarClick(o.id); } },
-      }, [label, el("span", { class: "cc-key" }, String(i + 1)), el("span", { class: "cc-tick", html: CHECK_SVG })]);
+      }, [label, el("span", { class: "cc-key" }, optionLetter(i)), el("span", { class: "cc-tick", html: CHECK_SVG })]);
       const col = el("div", { class: "cc-col" }, [count, bar, tile]);
       col.style.setProperty("--cc-color", color);
       root.appendChild(col);

@@ -3,13 +3,17 @@
 // 가정: 입력칸 폭 계산 시 한글·전각 문자는 2ch 로 센다(명세의 max(4, 최장 대안+1)ch 를 한글에 맞게).
 // 가정: reveal(정답 공개) 중에는 입력을 잠근다. 교사 스테이지는 reveal 전 빈칸 번호만, 후에 정답 표시.
 // 가정: 잠기는 순간 제출하지 않은 입력은 제출본으로 되돌린다(공개 채점이 실제 제출과 일치하도록).
+// 가정: 교사 스테이지 상단 '문항별 | 학생별'(answer-matrix.js). 문항별 = 빈칸별 정답률(행 클릭 → 답별 학생 명단),
+//       학생별 = 학생 × 빈칸 표(행 클릭 → 그 학생 답을 문장 속에 채워 보기). 같은 답 묶음은 normalizeAnswer 기준.
+// 가정: 기록 화면(summary)은 교사면 막대 + 표, 학생(자기 응답만 받음)이면 자기 답을 문장 속에 채워 보여 준다.
 import { el } from "../ui.js";
 import { registerSlideType, injectCss } from "./registry.js";
-import { activityBar, choiceBars, normalizeAnswer } from "./common.js";
+import { activityBar, choiceBars, normalizeAnswer, whoSheet } from "./common.js";
 import {
   ensureQuizCss, statusRow, rosterList, rosterIds, byStudent, nameOf,
-  isLocked, clockNow, elapsedMs, actOf, seg, field, quizThumb, sessionSig, sortIds,
+  isLocked, clockNow, elapsedMs, actOf, seg, field, quizThumb, sessionSig,
 } from "./mcq.js";
+import { answerMatrix, viewSeg, pickRows, matrixIds, circled } from "./answer-matrix.js";
 
 const ICON = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9h4M17 9h4M3 15h8"/><rect x="8.5" y="6" width="7" height="6" rx="1.5"/><path d="M14 18h7"/></svg>`;
 
@@ -31,6 +35,14 @@ const CSS = `
 .bl-preview { padding: 14px 16px; border: 1px dashed var(--line-strong); border-radius: var(--radius-sm); background: var(--surface); }
 .bl-preview .bl-text { font-size: 17px; line-height: 2; }
 .qz-sum .bl-text { font-size: 16px; line-height: 1.9; }
+.qz-live.is-matrix .bl-text { font-size: 18px; line-height: 1.9; }
+.bl-wrong .row.pick { cursor: pointer; margin: 0 -6px; padding: 2px 6px; border-radius: 8px; }
+@media (hover: hover) { .bl-wrong .row.pick:hover { background: var(--surface-2); } }
+.bl-pick { display: inline-block; min-width: 2em; margin: 0 4px; padding: 0 10px; border: 2px solid; border-radius: 8px; line-height: 1.6; font-weight: 600; text-align: center; }
+.bl-pick.ok { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+.bl-pick.bad { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
+.bl-detail { display: grid; gap: 10px; justify-items: start; }
+.bl-detail .bl-text { font-size: 18px; line-height: 2.2; }
 `;
 
 const defaults = () => ({ text: "", caseSensitive: false });
@@ -210,8 +222,10 @@ function blankStats(cfg, blanks, map) {
 }
 
 // 빈칸별 정답률 막대(common.choiceBars: count=맞은 수, total=응답 수) + 오답 상위 3
-function statsView() {
+// onPick(빈칸 idx) 이 있으면 막대·오답 줄을 눌러 답별 학생 명단을 연다
+function statsView({ onPick = null } = {}) {
   const bars = choiceBars([], 0, { revealed: true });
+  const syncPick = onPick ? pickRows(bars, onPick) : null;
   const wrongBox = el("div", { class: "bl-wrong" });
   let wSig = null;
   return {
@@ -219,19 +233,83 @@ function statsView() {
     set(stats, reveal) {
       const total = stats[0]?.total || 0;
       bars.update(stats.map(s => ({
-        label: reveal ? `${s.b.idx + 1}. ${s.b.display}` : `빈칸 ${s.b.idx + 1}`,
+        label: reveal ? `${circled(s.b.idx)} ${s.b.display}` : circled(s.b.idx),
         count: s.ok,
         highlight: true,
       })), total, { revealed: true });
+      syncPick?.();
       const next = JSON.stringify(stats.map(s => s.top.map(w => [w.text, w.n])));
       if (next === wSig) return;
       wSig = next;
-      wrongBox.replaceChildren(...stats.filter(s => s.top.length).map(s => el("div", { class: "row" }, [
-        el("span", { class: "k" }, `빈칸 ${s.b.idx + 1}`),
+      wrongBox.replaceChildren(...stats.filter(s => s.top.length).map(s => el("div", {
+        class: onPick ? "row pick" : "row", onClick: onPick ? () => onPick(s.b.idx) : null,
+      }, [
+        el("span", { class: "k" }, circled(s.b.idx)),
         ...s.top.map(w => el("span", { class: "w" }, `${w.text} ${w.n}`)),
       ])));
     },
   };
+}
+
+// 빈칸 하나의 답별 학생 명단(정답 → 오답 많은 순 → 미입력 → 미응답)
+// 가정: 정답 묶음은 대안(서울|Seoul)을 모두 합치고, 표시 정답과 다르게 쓴 학생은 이름 옆에 쓴 그대로 보인다.
+function openWho(ctx, cfg, b, map, ids) {
+  if (!b) return;
+  const cs = cfg.caseSensitive;
+  const right = { label: b.display, color: "var(--ok)", correct: true, studentIds: [], extra: {} };
+  const wrong = new Map();
+  const blankG = { label: "미입력", studentIds: [] };
+  for (const [id, r] of map) {
+    const raw = String(r.payload?.answers?.[b.idx] ?? "").trim();
+    if (isRight(b, raw, cs)) {
+      right.studentIds.push(id);
+      if (normBlank(raw, cs) !== normBlank(b.display, cs)) right.extra[id] = raw;
+      continue;
+    }
+    const k = normBlank(raw, cs);
+    if (!k) { blankG.studentIds.push(id); continue; }
+    let g = wrong.get(k);
+    if (!g) wrong.set(k, g = { label: raw, color: "var(--danger)", studentIds: [] });
+    g.studentIds.push(id);
+  }
+  const none = { label: "미응답", studentIds: ids.filter(id => !map.has(id)) };
+  const rest = [...wrong.values()].sort((a, c) => c.studentIds.length - a.studentIds.length);
+  whoSheet(ctx, { title: `빈칸 ${circled(b.idx)}`, groups: [right, ...[...rest, blankG, none].filter(g => g.studentIds.length)] });
+}
+
+// 학생별 표의 한 행: 맞으면 ✓, 틀리면 ✗ + 쓴 답
+function rowOf(cfg, blanks, r) {
+  if (!r) return null;
+  const a = r.payload?.answers || [];
+  const cells = {};
+  let ok = 0;
+  for (const b of blanks) {
+    const raw = String(a[b.idx] ?? "").trim();
+    const right = isRight(b, raw, cfg.caseSensitive);
+    if (right) ok++;
+    cells[String(b.idx)] = { ok: right, text: right ? "" : raw, hint: raw };
+  }
+  return { cells, score: ok, total: blanks.length };
+}
+const matrixCols = (blanks, reveal) => blanks.map(b => ({ key: String(b.idx), label: circled(b.idx), sub: reveal ? b.display : "", title: `빈칸 ${b.idx + 1}` }));
+
+// 학생 답을 문장 속에 채워 보기: 맞음 ok · 틀림 danger + 정답 하이라이트
+function filledText(cfg, parts, answers = []) {
+  return el("p", { class: "bl-text" }, parts.flatMap(p => {
+    if (p.kind === "text") return textNodes(p.value);
+    const raw = String(answers[p.idx] ?? "").trim();
+    const ok = isRight(p, raw, cfg.caseSensitive);
+    const pick = el("span", { class: `bl-pick ${ok ? "ok" : "bad"}` }, raw || "　");
+    return ok ? [pick] : [pick, el("span", { class: "bl-ans" }, p.display)];
+  }));
+}
+function detailOf(cfg, parts, r) {
+  const answers = r?.payload?.answers || [];
+  const g = gradeBlanks(cfg, answers);
+  return el("div", { class: "bl-detail" }, [
+    el("span", { class: `pill ${g.correct ? "pill-ok" : "pill-warn"}` }, `${g.ok}/${g.n}`),
+    filledText(cfg, parts, answers),
+  ]);
 }
 
 function TeacherLive({ slide, ctx }) {
@@ -240,6 +318,7 @@ function TeacherLive({ slide, ctx }) {
   const parts = parseBlanks(cfg.text);
   const blanks = parts.filter(p => p.kind === "blank");
   let st = actOf(ctx);
+  let map = new Map(), ids = [];
 
   const status = statusRow({ ctx });
   const countP = el("span", { class: "pill" });
@@ -250,10 +329,19 @@ function TeacherLive({ slide, ctx }) {
     slots[p.idx] = s;
     return [s];
   }));
-  const stats = statsView();
+  const stats = statsView({ onPick: (i) => openWho(ctx, cfg, blanks[i], map, ids) });
+  const matrix = answerMatrix(ctx, {
+    memoKey: slide.id,
+    columns: () => matrixCols(blanks, !!st.reveal),
+    ids: () => ids,
+    rowFor: (id) => rowOf(cfg, blanks, map.get(id)),
+    detail: (id) => detailOf(cfg, parts, map.get(id)),
+  });
+  const view = viewSeg(slide.id, () => paint());
+  const box = el("div", { class: "am-box" }, [stats.el, matrix]);
   const root = el("div", { class: "qz-live" }, [
-    el("div", { class: "qz-live-head" }, [status.el, countP]),
-    textEl, stats.el,
+    el("div", { class: "qz-live-head" }, [view, el("span", { style: { flex: "1" } }), status.el, countP]),
+    textEl, box,
   ]);
 
   const bar = activityBar(ctx, { reveal: true, timer: true });
@@ -263,16 +351,23 @@ function TeacherLive({ slide, ctx }) {
   let sSig = sessionSig(ctx);
   function paint() {
     const list = ctx.responses() || [];
-    const map = byStudent(list);
+    map = byStudent(list);
+    ids = matrixIds(ctx, list);
     const reveal = !!st.reveal;
+    const byStu = view.value() === "student";
     status.set({ state: st });
     countP.textContent = `응답 ${map.size}`;
     blanks.forEach(b => {
       const s = slots[b.idx];
-      s.textContent = reveal ? b.display : String(b.idx + 1);
+      s.textContent = reveal ? b.display : circled(b.idx);
       s.classList.toggle("shown", reveal);
     });
-    stats.set(blankStats(cfg, blanks, map), reveal);
+    root.classList.toggle("is-matrix", byStu);
+    box.classList.toggle("is-matrix", byStu);
+    stats.el.hidden = byStu;
+    matrix.hidden = !byStu;
+    if (byStu) matrix.update(); // 보이는 쪽만 갱신(전환 시 다시 그림)
+    else stats.set(blankStats(cfg, blanks, map), reveal);
     roster.set(rosterIds(ctx, list).map(id => {
       const r = map.get(id);
       if (!r) return { id, name: nameOf(ctx, id), value: "—", cls: "none" };
@@ -303,25 +398,40 @@ function summary(slide, responses = [], session, ctx) {
   const parts = parseBlanks(cfg.text);
   const blanks = parts.filter(p => p.kind === "blank");
   const map = byStudent(responses);
-  const textEl = el("p", { class: "bl-text" }, parts.flatMap(p => (p.kind === "text"
+  const shownText = () => el("p", { class: "bl-text" }, parts.flatMap(p => (p.kind === "text"
     ? textNodes(p.value) : [el("span", { class: "bl-slot shown" }, p.display)])));
-  const stats = statsView();
+  // 학생 기록: 자기 답을 문장 속에 채워 보여 준다
+  if (ctx?.role === "student") {
+    const r = map.get(ctx.me?.id) || [...map.values()][0] || null;
+    return el("div", { class: "qz-sum" }, r
+      ? [detailOf(cfg, parts, r)]
+      : [shownText(), el("div", { class: "muted" }, "제출하지 않았어요")]);
+  }
+  const ids = matrixIds(ctx, responses);
+  const canOpen = typeof ctx?.modal === "function";
+  const stats = statsView({ onPick: canOpen ? (i) => openWho(ctx, cfg, blanks[i], map, ids) : null });
   stats.set(blankStats(cfg, blanks, map), true);
   const graded = [...map.values()].map(r => gradeBlanks(cfg, r.payload?.answers || []));
   const avg = graded.length ? Math.round((graded.reduce((n, g) => n + g.score, 0) / graded.length) * 100) : null;
-  const roster = rosterList();
-  roster.set(sortIds(ctx, [...map.keys()]).map(id => {
-    const g = gradeBlanks(cfg, map.get(id).payload?.answers || []);
-    return { id, name: nameOf(ctx, id), value: `${g.ok}/${g.n}`, cls: g.correct ? "ok" : "bad" };
-  }));
+  let matrix = null;
+  if (map.size) {
+    matrix = answerMatrix(ctx, {
+      memoKey: `sum|${slide.id}`,
+      columns: matrixCols(blanks, true),
+      ids: () => ids,
+      rowFor: (id) => rowOf(cfg, blanks, map.get(id)),
+      detail: canOpen ? (id) => detailOf(cfg, parts, map.get(id)) : null,
+    });
+    matrix.update();
+  }
   return el("div", { class: "qz-sum" }, [
-    textEl,
+    shownText(),
     el("div", { class: "qz-sum-meta" }, [
       el("span", { class: "pill pill-muted" }, `응답 ${map.size}`),
       avg !== null ? el("span", { class: "pill pill-ok" }, `평균 ${avg}%`) : null,
     ]),
     map.size ? stats.el : null,
-    map.size ? roster.el : null,
+    matrix,
   ]);
 }
 

@@ -15,6 +15,12 @@
 // 가정: 레인 0 = 가장 안쪽. 차 색은 레인 순서(초록·빨강·파랑·노랑).
 // 가정: summary 의 ctx.isTeacher === false(학생 '내 기록', 내 응답만 전달)면 조 순위표 대신 내 결과만 보여 준다.
 // 가정: 결과 제출 실패 시 5초→10초→…30초 간격으로 재시도(실패 toast 연타 방지).
+// 가정: 교사 '조 크게 보기'는 { 경기 키(startedAt), 조 id } 로 기억 — 같은 경기 안에서만 유지.
+//       [다시]·새 시작으로 조가 다시 편성되면(조 id 'g1' 이 재사용돼도) 자동으로 전체 조 그리드로 돌아간다.
+// 가정: 크게 보기 트랙은 스테이지 폭을 채우되 높이를 넘으면 줄인다(16:10 유지, 트랙 전체가 한눈에). 해상도는 TrackView 규칙(dpr, 최대 2).
+// 가정: 대기 중 미리보기 트랙도 눌러 크게 볼 수 있다('트랙 미리보기', 이름표·◀▶ 없음).
+// 가정: 크게 보기 머리줄 상태 = 조 선두 차의 랩 + 경기 시계(전원 완주면 '완주 · 마지막 완주 기록'), 칩 = 완주 순위·기록(끝남 뒤 미완주 DNF).
+// 가정: Esc 는 모달·팝오버가 먼저 가져간다(ui.js 레이어가 캡처 단계에서 전파를 멈춤). 입력칸에서 누른 Esc 는 무시.
 import { el, icon } from "../ui.js";
 import { findStudent } from "../store.js";
 import { registerSlideType, newId, injectCss, groupStudents } from "./registry.js";
@@ -760,9 +766,26 @@ const CSS = `
 .race-tile-h { display: flex; gap: 10px; align-items: center; padding: 0 10px; height: 34px; font-size: 13px; overflow: hidden; white-space: nowrap; }
 .race-tile-h b { font-size: 14px; flex: none; }
 .race-tile-h .mb { display: inline-flex; align-items: center; gap: 4px; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--ink-2); }
+.race-tile.pick { cursor: pointer; transition: border-color .15s, box-shadow .15s; }
+@media (hover: hover) { .race-tile.pick:hover { border-color: var(--line-strong); box-shadow: var(--shadow-1); } }
+.race-tile.pick:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-soft), 0 0 0 1px var(--accent); }
+.race-focus { display: flex; flex-direction: column; gap: 8px; outline: none; }
+.race-focus-h { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; flex: none; }
+.race-focus-h > b { font-size: 15px; flex: none; }
+.race-focus-st { font-variant-numeric: tabular-nums; }
+.race-chips { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.race-chip { display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 10px 0 8px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); font-size: 13px; white-space: nowrap; max-width: 220px; font-variant-numeric: tabular-nums; }
+.race-chip .nm { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.race-chip .tm { color: var(--ink-2); font-size: 12px; }
+.race-chip .tm.dnf { color: var(--danger); font-weight: 600; }
+.race-focus-stage { align-self: center; max-width: 100%; border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow-1); background: #e2b878; }
 .race-panel { display: grid; gap: 14px; }
 .race-gblock { display: grid; gap: 4px; }
+.race-gblock.focus { background: var(--accent-soft); border-radius: 10px; margin: -6px -8px; padding: 6px 8px; }
 .race-gt { font-weight: 700; font-size: 14px; }
+.race-gt-btn { justify-self: start; background: none; border: 0; padding: 0; text-align: left; border-radius: 4px; }
+@media (hover: hover) { .race-gt-btn:hover { color: var(--accent); } }
+.race-gt-btn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
 .race-tbl-wrap { overflow-x: auto; }
 .race-table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
 .race-table th { font-weight: 600; color: var(--muted); font-size: 12px; }
@@ -1239,7 +1262,21 @@ function TeacherLive({ slide, ctx }) {
   ]);
   const grid = el("div", { class: "race-grid" });
   const countEl = el("div", { class: "race-count" });
-  const wrap = el("div", { class: "race-grid-wrap" }, [grid, countEl]);
+  // 조 크게 보기: 같은 스테이지 안에서 그리드 대신 보인다
+  const PREVIEW = "preview"; // 대기 중 미리보기 트랙
+  let focus = null;          // { key: race 키('' = 대기), gid } | null
+  let fSig = "", gridScroll = 0, previewTile = null;
+  const focusView = new TrackView(() => ({ laps, Q }));
+  const fBack = el("button", { class: "btn btn-sm", type: "button", onClick: () => setFocus(null) }, "← 전체 조");
+  const fName = el("b");
+  const fChips = el("div", { class: "race-chips" });
+  const fStatus = el("span", { class: "pill race-focus-st" });
+  const fPrev = el("button", { class: "btn btn-sm btn-icon", type: "button", title: "이전 조", "aria-label": "이전 조", onClick: () => cycle(-1) }, "◀");
+  const fNext = el("button", { class: "btn btn-sm btn-icon", type: "button", title: "다음 조", "aria-label": "다음 조", onClick: () => cycle(1) }, "▶");
+  const fHead = el("div", { class: "race-focus-h" }, [fBack, fName, fChips, el("span", { class: "race-sp" }), fStatus, fPrev, fNext]);
+  const fStage = el("div", { class: "race-focus-stage" }, [focusView.canvas]);
+  const focusEl = el("div", { class: "race-focus", tabindex: "-1", hidden: true }, [fHead, fStage]);
+  const wrap = el("div", { class: "race-grid-wrap" }, [grid, focusEl, countEl]);
   const idleInfo = el("div", { class: "race-idle-info" });
   const root = el("div", { class: "race-live" }, [head, wrap, idleInfo]);
   const panelBody = el("div", { class: "race-panel" });
@@ -1298,19 +1335,28 @@ function TeacherLive({ slide, ctx }) {
     return Math.min(n, endAt) - race.startedAt;
   };
 
+  // 타일 전체를 버튼처럼(클릭·Enter·Space → 크게 보기)
+  const pickAttrs = (gid, label) => ({
+    class: "race-tile pick", tabindex: "0", role: "button", "aria-label": `${label} 크게 보기`,
+    onClick: () => setFocus(gid),
+    onKeydown: e => { if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) { e.preventDefault(); setFocus(gid); } },
+  });
+
   function buildTiles() {
     if (!race) {
       if (!previewView) previewView = new TrackView(() => ({ laps, Q }));
-      grid.replaceChildren(el("div", { class: "race-tile" }, [previewView.canvas]));
+      previewTile = el("div", pickAttrs(PREVIEW, "트랙"), [previewView.canvas]);
+      grid.replaceChildren(previewTile);
       return;
     }
+    previewTile = null;
     race.tiles = race.groups.map(g => {
       const view = new TrackView(() => ({ laps, Q }));
       const labels = (g.memberIds || []).slice(0, 4).map(sid => ({ sid, node: el("span", {}, nameFn(sid)) }));
       const names = labels.map((l, lane) => el("span", { class: "mb" }, [
         el("span", { class: "race-dot", style: { background: COLORS[lane].body } }), l.node,
       ]));
-      const tile = el("div", { class: "race-tile" }, [el("div", { class: "race-tile-h" }, [el("b", {}, g.name || g.id), ...names]), view.canvas]);
+      const tile = el("div", pickAttrs(g.id, g.name || g.id), [el("div", { class: "race-tile-h" }, [el("b", {}, g.name || g.id), ...names]), view.canvas]);
       return { group: g, view, el: tile, labels };
     });
     grid.replaceChildren(...race.tiles.map(t => t.el));
@@ -1335,6 +1381,134 @@ function TeacherLive({ slide, ctx }) {
     needDraw = true;
   }
 
+  // ── 조 크게 보기 ──
+  const focusTile = () => (focus && race && focus.key === race.key ? race.tiles.find(t => t.group.id === focus.gid) || null : null);
+  const validFocus = gid => !!gid && (race ? race.tiles.some(t => t.group.id === gid) : gid === PREVIEW);
+  const resetView = v => { if (v) { v.parts = []; v.disp.clear(); v.acc.clear(); } }; // 숨었던 동안의 잔상(스무딩·입자) 비우기
+
+  function setFocus(gid) {
+    const next = validFocus(gid) ? { key: race?.key || "", gid } : null;
+    if ((focus?.gid ?? null) === (next?.gid ?? null) && (focus?.key ?? "") === (next?.key ?? "")) return;
+    const prev = focus;
+    const a = document.activeElement;
+    const fromGrid = !!a && grid.contains(a), fromFocus = !!a && focusEl.contains(a);
+    if (!prev && next) gridScroll = wrap.scrollTop;
+    focus = next;
+    grid.hidden = !!focus;
+    focusEl.hidden = !focus;
+    resetView(focusView); resetView(previewView);
+    for (const t of race?.tiles || []) resetView(t.view);
+    fSig = "";
+    if (focus) {
+      paintFocusHead();
+      fitFocus();
+      if (!prev) wrap.scrollTop = 0;
+      if (fromGrid) { try { focusEl.focus({ preventScroll: true }); } catch { /* 무시 */ } }
+    } else {
+      fitGrid();
+      wrap.scrollTop = gridScroll;
+      // 키보드 사용자: 보던 조의 타일로 포커스 되돌리기
+      const back = prev?.gid === PREVIEW ? previewTile : race?.tiles.find(t => t.group.id === prev?.gid)?.el;
+      if (fromFocus && back?.isConnected) { try { back.focus({ preventScroll: true }); } catch { /* 무시 */ } }
+    }
+    markPanel(!!focus);
+    needDraw = true;
+    loop.kick();
+  }
+  function cycle(d) {
+    const ts = race?.tiles || [];
+    const i = ts.findIndex(t => t.group.id === focus?.gid);
+    if (i < 0 || ts.length < 2) return;
+    setFocus(ts[(i + d + ts.length) % ts.length].group.id);
+  }
+  // 경기가 바뀌었거나 조가 사라졌으면 그리드로
+  function checkFocus() {
+    if (focus && !(validFocus(focus.gid) && focus.key === (race?.key || ""))) setFocus(null);
+  }
+
+  // 스테이지 폭을 채우되 높이를 넘지 않게(16:10 유지)
+  function fitFocus() {
+    if (!focus) return;
+    const W = wrap.clientWidth, H = wrap.clientHeight;
+    if (!W) return;
+    const avail = H - fHead.offsetHeight - 8;
+    let w = W;
+    if (H > 0 && avail > 0) w = Math.min(W, avail * (TW / TH));
+    fStage.style.width = `${Math.floor(Math.min(W, Math.max(240, w)))}px`;
+    needDraw = true;
+  }
+
+  // 머리줄: 조 이름 + 멤버 칩(카트 색, 완주 순위·기록) — 바뀔 때만 다시 만든다
+  function paintFocusHead(results = null) {
+    if (!focus) return;
+    const ft = focusTile();
+    if (!ft) {
+      if (fSig !== PREVIEW) {
+        fSig = PREVIEW;
+        fName.textContent = "트랙 미리보기";
+        fChips.replaceChildren();
+        fStatus.textContent = `${laps}바퀴 · 문제 ${Q}`;
+        fPrev.hidden = fNext.hidden = true;
+        fitFocus();
+      }
+      return;
+    }
+    results ||= resultsMap(ctx.responses(), race.startedAt, race.rs);
+    const ended = act.phase === "ended";
+    const ranks = new Map(standings(ft.group, results).map(r => [r.sid, r]));
+    const items = (ft.group.memberIds || []).slice(0, 4).map((sid, lane) => {
+      const r = ranks.get(sid);
+      const tm = r?.res ? `${r.rank === 1 ? "🏆 " : ""}${r.rank}위 ${fmtClock(r.res.totalMs)}` : ended ? "DNF" : "";
+      return { lane, name: nameFn(sid), tm };
+    });
+    const sig = JSON.stringify([ft.group.id, race.tiles.length, items.map(i => [i.name, i.tm])]);
+    if (sig === fSig) return;
+    fSig = sig;
+    fName.textContent = ft.group.name || ft.group.id;
+    fChips.replaceChildren(...items.map(i => el("span", { class: "race-chip", style: { borderColor: COLORS[i.lane].body } }, [
+      el("span", { class: "race-dot", style: { background: COLORS[i.lane].body } }),
+      el("span", { class: "nm" }, i.name),
+      i.tm ? el("span", { class: `tm${i.tm === "DNF" ? " dnf" : ""}` }, i.tm) : null,
+    ])));
+    fPrev.hidden = fNext.hidden = race.tiles.length < 2;
+    fitFocus(); // 칩 줄바꿈으로 머리줄 높이가 바뀔 수 있다
+  }
+  // 상태(매 프레임): 선두 랩 + 경기 시계
+  function paintFocusStatus(cars, t, results) {
+    let s;
+    if (t < 0) s = "출발 전";
+    else if (cars.length && cars.every(c => c.done)) {
+      s = `완주 · ${fmtClock(Math.max(...cars.map(c => results.get(c.sid)?.totalMs ?? c.sim.finishAt ?? 0)))}`;
+    } else {
+      const lap = Math.max(1, ...cars.map(c => (c.done ? laps : Math.min(laps, c.sim.cross.length + 1))));
+      s = `LAP ${lap}/${laps} · ${fmtClock(Math.max(0, t))}`;
+    }
+    if (fStatus.textContent !== s) fStatus.textContent = s;
+  }
+
+  // 패널: 보고 있는 조 구역 강조 + 보이게 스크롤
+  function markPanel(scroll = false) {
+    const gid = focusTile()?.group.id || null;
+    for (const [id, b] of race?.blocks || []) b.classList.toggle("focus", id === gid);
+    if (scroll && gid) scrollToBlock(race.blocks?.get(gid));
+  }
+  // 가장 가까운 세로 스크롤 조상만 움직인다(scrollIntoView 는 닫힌 서랍 때문에 바깥 레이아웃까지 밀 수 있다)
+  function scrollToBlock(b) {
+    if (!b?.isConnected) return;
+    let sc = b.parentElement;
+    while (sc && sc !== document.body) {
+      const oy = getComputedStyle(sc).overflowY;
+      if ((oy === "auto" || oy === "scroll") && sc.scrollHeight > sc.clientHeight) break;
+      sc = sc.parentElement;
+    }
+    if (!sc || sc === document.body || getComputedStyle(sc).visibility === "hidden") return;
+    const r = b.getBoundingClientRect(), s = sc.getBoundingClientRect();
+    let dy = 0;
+    if (r.top < s.top + 8) dy = r.top - s.top - 8;
+    else if (r.bottom > s.bottom - 8) dy = Math.min(r.top - s.top - 8, r.bottom - s.bottom + 8);
+    if (dy) { try { sc.scrollTo({ top: sc.scrollTop + dy, behavior: "smooth" }); } catch { sc.scrollTop += dy; } }
+  }
+
   function sync() {
     act = ctx.activity() || { phase: "idle" };
     const sa = act.phase !== "idle" ? Number(act.startedAt) || 0 : 0;
@@ -1346,6 +1520,7 @@ function TeacherLive({ slide, ctx }) {
       buildTiles();
       fitGrid();
     }
+    checkFocus(); // 같은 경기면 크게 보기 유지, 다시 편성됐으면 그리드로
     if (race) race.endSeen = act.phase === "ended" ? (race.endSeen ?? ctxNow(ctx)) : null; // endedAt 없을 때 멈출 시각
     paintHead();
     renderPanel(true);
@@ -1362,8 +1537,10 @@ function TeacherLive({ slide, ctx }) {
       const all = race.groups.flatMap(g => g.memberIds || []);
       const res = resultsMap(ctx.responses(), race.startedAt, race.rs);
       countPill.textContent = `완주 ${all.filter(id => res.has(id)).length}/${all.length}`;
+      paintFocusHead(res);
     } else {
       countPill.textContent = `참여 ${rosterIds().length}명`;
+      paintFocusHead();
     }
     idleInfo.hidden = !!race;
     if (!race) {
@@ -1397,10 +1574,19 @@ function TeacherLive({ slide, ctx }) {
     const sig = JSON.stringify([ended, blocks.map(b => b.rows.map(r => [r.sid, nameFn(r.sid), r.res?.totalMs ?? null, live.get(r.sid)?.label, live.get(r.sid)?.correct]))]);
     if (!force && sig === race.panelSig) return;
     race.panelSig = sig;
-    panelBody.replaceChildren(...blocks.map(({ g, rows }) => el("div", { class: "race-gblock" }, [
-      el("div", { class: "race-gt" }, g.name || g.id),
-      standingsTable(rows, { laps, Q, ended, nameFn, liveOf: sid => live.get(sid) }),
-    ])));
+    race.blocks = new Map(); // gid → 구역(크게 보기 강조용)
+    panelBody.replaceChildren(...blocks.map(({ g, rows }) => {
+      const b = el("div", { class: "race-gblock" }, [
+        el("button", {
+          class: "race-gt race-gt-btn", type: "button", title: "크게 보기", "aria-label": `${g.name || g.id} 크게 보기`,
+          onClick: () => setFocus(g.id),
+        }, g.name || g.id),
+        standingsTable(rows, { laps, Q, ended, nameFn, liveOf: sid => live.get(sid) }),
+      ]);
+      race.blocks.set(g.id, b);
+      return b;
+    }));
+    markPanel(false);
   }
 
   // 배정 학생 전원 완주 → 3초 뒤 종료
@@ -1421,16 +1607,24 @@ function TeacherLive({ slide, ctx }) {
 
   function frame(dt) {
     if (!race) {
-      if (needDraw && previewView?.draw([], 0, false)) needDraw = false;
+      if (needDraw && (focus ? focusView : previewView)?.draw([], 0, false)) needDraw = false;
       return;
     }
     const t = tNow();
     const liveRun = act.phase === "running";
     const results = resultsMap(ctx.responses(), race.startedAt, race.rs);
     let drawn = true;
-    for (const tile of race.tiles) {
-      const cars = groupCars(tile.group, t, { Q, laps, rs: race.rs, results, nameFn });
-      drawn = tile.view.draw(cars, dt, liveRun) && drawn;
+    const ft = focusTile();
+    if (ft) {
+      // 크게 보기: 보이는 캔버스(이 조)만 그린다 — 숨은 미니 트랙은 쉰다
+      const cars = groupCars(ft.group, t, { Q, laps, rs: race.rs, results, nameFn });
+      drawn = focusView.draw(cars, dt, liveRun);
+      paintFocusStatus(cars, t, results);
+    } else {
+      for (const tile of race.tiles) {
+        const cars = groupCars(tile.group, t, { Q, laps, rs: race.rs, results, nameFn });
+        drawn = tile.view.draw(cars, dt, liveRun) && drawn;
+      }
     }
     if (drawn) needDraw = false;
     let txt = "";
@@ -1444,7 +1638,7 @@ function TeacherLive({ slide, ctx }) {
       if (txt) countEl.classList.add("pop");
     }
   }
-  const busy = () => !!race?.tiles?.some(t => t.view.busy());
+  const busy = () => (focus ? focusView.busy() : !!race?.tiles?.some(t => t.view.busy()));
   const loop = makeLoop(frame, () => (act.phase === "running" && !!race) || busy() || needDraw);
 
   function onEvt() { paintHead(); renderPanel(); checkAutoEnd(); loop.kick(); }
@@ -1467,12 +1661,22 @@ function TeacherLive({ slide, ctx }) {
     onEvt();
   });
 
-  const ro = typeof ResizeObserver === "function" ? new ResizeObserver(() => { fitGrid(); loop.kick(); }) : null;
+  const ro = typeof ResizeObserver === "function" ? new ResizeObserver(() => { fitGrid(); fitFocus(); loop.kick(); }) : null;
   ro?.observe(wrap);
   tk.every(() => {
     if (act.phase === "running") { paintHead(); renderPanel(); checkAutoEnd(); }
     loop.kick();
   }, 1000);
+
+  // Esc → 전체 조 (모달·팝오버가 열려 있으면 그쪽이 먼저 가져간다)
+  const typing = n => !!n && (n.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(n.tagName || ""));
+  const onKey = e => {
+    if (!focus || e.key !== "Escape" || e.defaultPrevented || e.isComposing) return;
+    if (!root.isConnected || typing(e.target)) return;
+    e.preventDefault();
+    setFocus(null);
+  };
+  document.addEventListener("keydown", onKey);
 
   sync();
 
@@ -1490,6 +1694,7 @@ function TeacherLive({ slide, ctx }) {
     destroy() {
       loop.stop();
       ro?.disconnect();
+      document.removeEventListener("keydown", onKey);
       if (race?.endTimer != null) tk.cancel(race.endTimer);
       tk.clearAll();
     },

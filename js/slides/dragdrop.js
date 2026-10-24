@@ -3,9 +3,14 @@
 // 가정: reveal 중에는 입력을 잠그고, 표시는 제출한 배치 기준으로 한다.
 // 가정: 타이머 만료 시 교사 측 phase 'ended' 처리는 common.js activityBar 가 맡는다(학생은 로컬로도 잠금).
 // 가정: countdownPill(endsAt) 은 스스로 갱신되는 HTMLElement 를 반환한다(destroy 가 있으면 호출).
+// 가정: 교사 스테이지 상단 '문항별 | 학생별'(answer-matrix.js). 문항별 = 항목별 정답률(행 클릭 → 놓은 분류별 학생 명단),
+//       학생별 = 학생 × 항목 표(✗ 칸엔 고른 분류, 행 클릭 → 그 학생의 분류 결과).
+// 가정: 교사 스테이지의 '→ 정답 분류' 는 정답 공개 후에만 보인다(빈칸과 같게 — 화면이 학생에게 비칠 수 있어서).
+// 가정: 기록 화면(summary)은 교사면 막대 + 표, 학생(자기 응답만 받음)이면 자기 분류 결과를 보여 준다.
 import { el } from "../ui.js";
 import { registerSlideType, injectCss, newId, shuffle } from "./registry.js";
-import { activityBar, countdownPill, choiceBars } from "./common.js";
+import { activityBar, countdownPill, choiceBars, whoSheet } from "./common.js";
+import { answerMatrix, viewSeg, pickRows, matrixIds, rosterSig } from "./answer-matrix.js";
 
 const MIN_B = 2, MAX_B = 4, MIN_I = 2, MAX_I = 12;
 
@@ -43,6 +48,13 @@ const CSS = `
 .dd-result{display:flex;flex-direction:column;gap:10px}
 .dd-to{color:var(--muted);margin-left:6px;font-size:12px}
 .dd-avg{color:var(--ink-2);font-size:14px}
+.dd-head .am-view{flex:none}
+.dd-view{display:flex;flex-direction:column;gap:10px;align-items:stretch}
+.dd-view>.pill{align-self:flex-start}
+.dd-view .dd-buckets{flex:none}
+.dd-view .dd-bucket{min-height:88px}
+.dd-view .dd-chip{touch-action:auto;cursor:default;min-height:40px;font-size:15px}
+.dd-loose{align-self:center;margin-right:4px;color:var(--muted);font-size:13px;font-weight:600}
 .dd-editor{display:flex;flex-direction:column;gap:14px;width:100%;max-width:600px;margin:0 auto;padding:24px;box-sizing:border-box}
 .dd-erow{display:flex;align-items:center;gap:8px}
 .dd-erow .input{flex:1}
@@ -91,28 +103,102 @@ function statusPill(slot, st, submitted, prev, ctx) {
   } else if (key === "done") slot.appendChild(el("span", { class: "pill pill-ok" }, "제출함"));
 }
 
-// 아이템별 정답률 막대 (common.js choiceBars 재사용) → { el, update(responses) }
-function itemBars(cfg) {
-  const buckets = new Map((cfg.buckets || []).map(b => [b.id, b.label]));
+// 학생별 배치: studentId → placements (itemKey '')
+function placementsBy(list = []) {
+  const m = new Map();
+  for (const r of list || []) {
+    if ((r?.itemKey || "") !== "" || !r?.payload?.placements) continue;
+    m.set(r.studentId, r.payload.placements);
+  }
+  return m;
+}
+function bucketLabel(cfg, id) {
+  const b = (cfg.buckets || []).find(x => x.id === id);
+  return b ? (b.label || "?") : "";
+}
+
+// 아이템별 정답률 막대 (common.js choiceBars 재사용) → { el, update(map, reveal) }
+// onPick(아이템 번호) 이 있으면 막대 행을 눌러 놓은 분류별 학생 명단을 연다
+function itemBars(cfg, { onPick = null } = {}) {
   const avg = el("div", { class: "dd-avg" });
   const empty = el("div", { class: "empty" }, "아직 응답이 없어요");
   const bars = choiceBars([], 0, { revealed: true });
+  const syncPick = onPick ? pickRows(bars, onPick) : null;
   const wrap = el("div", { class: "dd-result" }, [avg, bars, empty]);
-  function update(responses) {
-    const list = (responses || []).filter(r => r?.payload?.placements);
+  function update(map, reveal = true) {
+    const list = [...map.values()];
     empty.style.display = list.length ? "none" : "";
     bars.style.display = avg.style.display = list.length ? "" : "none";
     let sum = 0;
-    for (const r of list) sum += gradePlacements(cfg, r.payload.placements).score;
+    for (const pl of list) sum += gradePlacements(cfg, pl).score;
     avg.textContent = list.length ? `평균 정답률 ${Math.round(sum / list.length * 100)}% · ${list.length}명` : "";
     const rows = (cfg.items || []).map(it => ({
-      label: el("span", { title: it.text || "" }, [it.text || "—", el("small", { class: "dd-to" }, `→ ${buckets.get(it.bucketId) || "?"}`)]),
-      count: list.filter(r => r.payload.placements[it.id] === it.bucketId).length,
+      label: el("span", { title: it.text || "" }, [it.text || "—", reveal ? el("small", { class: "dd-to" }, `→ ${bucketLabel(cfg, it.bucketId) || "?"}`) : null]),
+      count: list.filter(pl => pl[it.id] === it.bucketId).length,
       highlight: true,
     }));
     bars.update(rows, list.length, { revealed: true });
+    syncPick?.();
   }
   return { el: wrap, update };
+}
+
+// 항목 하나를 어느 분류에 놓았는지 학생 명단(정답 분류 → 다른 분류 → 미배치 → 미응답)
+function openItemWho(ctx, cfg, it, map, ids) {
+  if (!it) return;
+  const buckets = cfg.buckets || [];
+  const right = buckets.find(b => b.id === it.bucketId) || null;
+  const ordered = right ? [right, ...buckets.filter(b => b !== right)] : buckets;
+  const groups = ordered.map(b => ({ label: b.label || "?", color: b === right ? "var(--ok)" : "var(--danger)", correct: b === right, studentIds: [] }));
+  const byB = new Map(ordered.map((b, i) => [b.id, groups[i]]));
+  const loose = { label: "미배치", studentIds: [] };
+  for (const [id, pl] of map) (byB.get(pl[it.id]) || loose).studentIds.push(id);
+  const none = { label: "미응답", studentIds: ids.filter(id => !map.has(id)) };
+  whoSheet(ctx, { title: it.text || "항목", groups: [...groups, loose, none].filter(g => g.correct || g.studentIds.length) });
+}
+
+// 학생별 표: 열 = 항목, ✗ 칸엔 고른 분류
+const matrixCols = (cfg, reveal) => (cfg.items || []).map(it => ({
+  key: it.id, label: it.text || "—", title: it.text || "", sub: reveal ? bucketLabel(cfg, it.bucketId) : "",
+}));
+function rowOf(cfg, pl) {
+  if (!pl) return null;
+  const items = cfg.items || [];
+  const cells = {};
+  let n = 0;
+  for (const it of items) {
+    const ok = pl[it.id] === it.bucketId;
+    if (ok) n++;
+    const lb = bucketLabel(cfg, pl[it.id]) || "미배치";
+    cells[it.id] = { ok, text: ok ? "" : lb, hint: lb };
+  }
+  return { cells, score: n, total: items.length };
+}
+
+// 한 학생의 분류 결과: 분류마다 놓은 항목, ✓/✗ + 틀리면 정답 분류
+function placedView(cfg, pl = {}) {
+  const buckets = cfg.buckets || [], items = cfg.items || [];
+  const p = pl || {};
+  const g = gradePlacements(cfg, p);
+  const chip = (it) => {
+    const ok = p[it.id] === it.bucketId;
+    return el("div", { class: `dd-chip locked ${ok ? "ok" : "bad"}` }, [
+      el("span", { class: "dd-mark" }, ok ? "✓" : "✗"),
+      it.text || "",
+      ok ? null : el("span", { class: "dd-answer" }, bucketLabel(cfg, it.bucketId) || "?"),
+    ]);
+  };
+  const known = new Set(buckets.map(b => b.id));
+  const loose = items.filter(it => !known.has(p[it.id]));
+  return el("div", { class: "dd-view" }, [
+    el("span", { class: `pill ${g.correct ? "pill-ok" : "pill-warn"}` }, `${g.n}/${g.total}`),
+    loose.length ? el("div", { class: "dd-tray" }, [el("span", { class: "dd-loose" }, "미배치"), ...loose.map(chip)]) : null,
+    el("div", { class: "dd-buckets", style: { gridTemplateColumns: `repeat(${Math.max(1, buckets.length)}, minmax(0,1fr))` } },
+      buckets.map(b => el("div", { class: "dd-bucket" }, [
+        el("div", { class: "dd-bucket-label" }, b.label || ""),
+        el("div", { class: "dd-bucket-body" }, items.filter(it => p[it.id] === b.id).map(chip)),
+      ]))),
+  ]);
 }
 
 const ICON = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="13" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/><rect x="8" y="3" width="8" height="5" rx="1.5"/><path d="M12 8v2.5M12 10.5l-4 2M12 10.5l4 2"/></svg>`;
@@ -438,31 +524,79 @@ registerSlideType({
   TeacherLive({ slide, ctx }) {
     ensureCss(ctx);
     const cfg = slide.config || {};
+    const items = cfg.items || [];
+    let map = new Map(), ids = [];
     const bar = activityBar(ctx, { reveal: true, timer: true });
-    const result = itemBars(cfg);
+    const result = itemBars(cfg, { onPick: (i) => openItemWho(ctx, cfg, items[i], map, ids) });
+    const matrix = answerMatrix(ctx, {
+      memoKey: slide.id,
+      columns: () => matrixCols(cfg, !!ctx.activity().reveal),
+      ids: () => ids,
+      rowFor: (id) => rowOf(cfg, map.get(id)),
+      detail: (id) => placedView(cfg, map.get(id)),
+      wide: (cfg.buckets || []).length >= 3,
+    });
+    const view = viewSeg(slide.id, () => refresh());
+    const box = el("div", { class: "am-box" }, [result.el, matrix]);
     const root = el("div", { class: "dd dd-teacher" }, [
-      el("div", { class: "dd-head" }, [el("h2", { class: "dd-prompt" }, cfg.prompt || "")]),
-      bar, result.el,
+      el("div", { class: "dd-head" }, [el("h2", { class: "dd-prompt" }, cfg.prompt || ""), view]),
+      bar, box,
     ]);
-    const refresh = () => result.update(ctx.responses());
+    let sig = rosterSig(ctx);
+    function refresh() {
+      const list = ctx.responses() || [];
+      map = placementsBy(list);
+      ids = matrixIds(ctx, list);
+      const byStu = view.value() === "student";
+      box.classList.toggle("is-matrix", byStu);
+      result.el.hidden = byStu;
+      matrix.hidden = !byStu;
+      if (byStu) matrix.update(); // 보이는 쪽만 갱신(전환 시 다시 그림)
+      else result.update(map, !!ctx.activity().reveal);
+    }
     refresh();
     return {
       el: root,
-      onActivity() { bar.update?.(); },
+      onActivity() { bar.update?.(); refresh(); },
       onResponses() { bar.update?.(); refresh(); },
-      onSession() { bar.update?.(); },
+      onSession() {
+        bar.update?.();
+        const k = rosterSig(ctx);
+        if (k !== sig) { sig = k; refresh(); }
+      },
       destroy() { bar.destroy?.(); },
     };
   },
 
-  summary(slide, responses, session, ctx) {
+  summary(slide, responses = [], session, ctx) {
     ensureCss(ctx);
     const cfg = slide.config || {};
-    const result = itemBars(cfg);
-    result.update(responses);
-    return el("div", { class: "dd dd-sum", style: { height: "auto", overflow: "visible" } }, [
-      el("h3", { class: "dd-prompt" }, cfg.prompt || ""),
-      result.el,
+    const items = cfg.items || [];
+    const map = placementsBy(responses);
+    const wrap = (kids) => el("div", { class: "dd dd-sum", style: { height: "auto", overflow: "visible" } }, [
+      el("h3", { class: "dd-prompt" }, cfg.prompt || ""), ...kids,
     ]);
+    // 학생 기록: 자기 분류 결과
+    if (ctx?.role === "student") {
+      const pl = map.get(ctx.me?.id) || [...map.values()][0] || null;
+      return wrap([pl ? placedView(cfg, pl) : el("div", { class: "muted" }, "제출하지 않았어요")]);
+    }
+    const ids = matrixIds(ctx, responses);
+    const canOpen = typeof ctx?.modal === "function";
+    const result = itemBars(cfg, { onPick: canOpen ? (i) => openItemWho(ctx, cfg, items[i], map, ids) : null });
+    result.update(map, true);
+    let matrix = null;
+    if (map.size) {
+      matrix = answerMatrix(ctx, {
+        memoKey: `sum|${slide.id}`,
+        columns: matrixCols(cfg, true),
+        ids: () => ids,
+        rowFor: (id) => rowOf(cfg, map.get(id)),
+        detail: canOpen ? (id) => placedView(cfg, map.get(id)) : null,
+        wide: (cfg.buckets || []).length >= 3,
+      });
+      matrix.update();
+    }
+    return wrap([result.el, matrix]);
   },
 });

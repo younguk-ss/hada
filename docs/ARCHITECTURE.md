@@ -361,7 +361,7 @@ ctx = {
 - summary: whole 레코드 미니 캔버스 / individual 학생 수 표기 + 갤러리(읽기 전용).
 - 저장: `cloudWriteRecord`(250ms 디바운스). 병합은 cloud.js `applyRecord`가 담당, ink는 `viewer.refresh()`.
 
-**mcq**: 옵션 2~6. 학생: 질문 + 옵션 카드(`.choice`, 최소 56px, 1탭 선택, multiple이면 토글) + `[제출]`. 제출 후 pill '제출함', 마감 전 변경 가능. 채점 `correct = 집합 동일`, `score = correct?1:0`. reveal: 정답 옵션 `--highlight`, 내 선택 ✓/✗. 교사 스테이지: 질문 + `choiceBars`(옵션별 가로 막대, n·%), reveal 전 회색, 후 정답 `--accent`. activityBar(reveal, timer). validate: 정답 미선택 → '정답을 선택하세요'.
+**mcq**: 옵션 2~6. 정답 표시 = `reveal || phase==='ended' || 접속 학생 전원 응답`(전원 응답 시 교사 클라이언트가 `{phase:'ended', reveal:true, autoRevealed:true}`). 교사 화면 = `columnChart`(가로 색상 선지 타일 + 세로 막대, 막대/타일 탭 → `whoSheet` 응답자 목록). 학생: 질문 + 옵션 카드(`.choice`, 최소 56px, 1탭 선택, multiple이면 토글) + `[제출]`. 제출 후 pill '제출함', 마감 전 변경 가능. 채점 `correct = 집합 동일`, `score = correct?1:0`. reveal: 정답 옵션 `--highlight`, 내 선택 ✓/✗. 교사 스테이지: 질문 + `choiceBars`(옵션별 가로 막대, n·%), reveal 전 회색, 후 정답 `--accent`. activityBar(reveal, timer). validate: 정답 미선택 → '정답을 선택하세요'.
 
 **short**: `long:true`면 textarea(maxLen 2000), 아니면 input(maxLen 300). 학생: 입력 + `[제출]` + 글자 수. 교사 스테이지: 카드 그리드(이름+텍스트, 최신 순). 카드 탭 → 강조 토글 `activity.pinned:[studentId]`. reveal 시 학생은 pinned 카드만 본다. activityBar(reveal, timer).
 
@@ -371,7 +371,7 @@ ctx = {
 
 **dragdrop (분류하기)**: buckets 2~4, items 2~12. **HTML5 drag API 금지** — pointer 이벤트 + `setPointerCapture` + `position:fixed` 고스트 + `elementFromPoint`로 버킷 판정, `touch-action:none`. 탭 대안: 아이템 탭(선택) → 버킷 탭(이동). 학생: 상단 트레이(섞어서) / 하단 버킷(≤768px 세로). 모두 배치해야 `[제출]` 활성. `score = 맞은 수/전체`, `correct = score===1`. reveal: 틀린 아이템 ✗ + 정답 버킷 라벨. 교사: 아이템별 정답률 막대. activityBar(reveal, timer).
 
-**wall (담벼락)**: 글 = Response(itemKey=`newId('post')`), payload `{text ≤200자, color 0..4}`. 팔레트 `#fff4c2 #fde2e4 #dbeafe #dcfce7 #ede9fe`(allowColor false면 0). 그리드 `repeat(auto-fill,minmax(200px,1fr))`(학생 160px), 최신이 앞. 학생: 하단 고정 `[+ 글쓰기]` → sheet(textarea + 색 점 + `[올리기]`); 내 글 탭 → 수정/삭제. 교사: 모든 글 `삭제`(confirm 없음, toast '삭제했어요'), `[잠금]`(phase ended). showNames false면 학생 화면에서 이름 숨김(교사는 항상). DOM은 itemKey 키로 보존.
+**wall (담벼락)**: 글 = Response(itemKey `post_…`), payload `{text ≤200자, color 0..4, at, author?:'teacher'}`; 댓글 = Response(itemKey `cmt_…`), payload `{postKey, text ≤200자, at, author?}`. 교사도 `submit(…, {asTeacher:true})`로 글·댓글 작성(studentId=교사 id, 이름 '선생님' 배지). activity `{phase('ended'=잠금), pinned:[postKey], order:[postKey]}` — 표시 순서 = 고정 → order에 없는 새 글(최신 순) → order 순. 교사: 포인터 드래그로 위치 이동(마우스 6px, 터치 300ms 길게 누르기), ⋯ 메뉴(고정/해제·삭제), 모든 글·댓글 삭제, `[잠금]`. 학생: `[+ 글쓰기]` sheet, 내 글 수정/삭제, 댓글 작성/내 댓글 삭제. 팔레트 `#fff4c2 #fde2e4 #dbeafe #dcfce7 #ede9fe`. showNames false면 학생 화면에서 이름 숨김(교사 글은 항상 '선생님'). DOM은 itemKey 키로 보존, 순서 변경은 FLIP.
 
 **link**: 전체 영역 iframe + 우상단 `[새 탭에서 열기]` 항상. iframe load가 3초 내 없거나 http(s) 아님 → 제목 + 큰 `[열기]` 버튼만. 프로토콜 없으면 `https://` 보정.
 
@@ -379,7 +379,7 @@ ctx = {
 
 **video**: YouTube(`parseYouTubeId`) → IFrame Player API(`loadYouTubeApi()` 1회 로드), 아니면 `<video controls playsinline>`(mp4/webm). 그 외 → 편집기 경고 '유튜브 또는 mp4 주소만 지원해요'. 학생 자율 재생. 교사 TeacherLive 같은 플레이어.
 
-**videoquiz**: questions `[{id, atSec, kind:'mcq'|'short'|'essay', question, options?:[{id,text}]×4, answerIds?}]` atSec 오름차순. 250ms 폴링(YouTube `getCurrentTime`)/`timeupdate`. 미응답 문제 중 `atSec <= currentTime`이 있으면 일시정지 + 가장 이른 문제 오버레이(탐색으로 건너뛰어도 걸림). 제출 `submit(payload, { itemKey: q.id, correct })` → 닫고 재생. mcq 자동 채점, short(1줄 100자)/essay(여러 줄 1000자) 채점 없음. 교사 panel: 문제별 결과(mcq 막대, 서술 카드). 편집기: URL + 미리보기 플레이어 + `[현재 시점에 문제 추가]`(플레이어 현재 초 → atSec) + 문제 목록(시점 mm:ss 편집 가능).
+**videoquiz**: `session.flow==='teacher'`면 교사 페이스 — 영상은 교사 화면에서만 재생, 학생은 `칠판의 영상을 봐주세요`; 시점 도달 시 교사 클라이언트가 일시정지 + `activity.vq={state:'question',qid}`·`vqAsked`, 학생 화면에 문제, `vqRevealed`(전원 응답 시 자동), `[계속 재생]`. `flow==='student'`면 아래 자율 재생. questions `[{id, atSec, kind:'mcq'|'short'|'essay', question, options?:[{id,text}]×4, answerIds?}]` atSec 오름차순. 250ms 폴링(YouTube `getCurrentTime`)/`timeupdate`. 미응답 문제 중 `atSec <= currentTime`이 있으면 일시정지 + 가장 이른 문제 오버레이(탐색으로 건너뛰어도 걸림). 제출 `submit(payload, { itemKey: q.id, correct })` → 닫고 재생. mcq 자동 채점, short(1줄 100자)/essay(여러 줄 1000자) 채점 없음. 교사 panel: 문제별 결과(mcq 막대, 서술 카드). 편집기: URL + 미리보기 플레이어 + `[현재 시점에 문제 추가]`(플레이어 현재 초 → atSec) + 문제 목록(시점 mm:ss 편집 가능).
 
 **dino (공룡 점프)** — `js/slides/dino.js`
 - config `{questions:[{id, question, options:[{id,text}]×4, answerIds:[id]}], jumpsPerQuestion:3}`, questions ≥1(validate).
