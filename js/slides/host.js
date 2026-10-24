@@ -135,8 +135,10 @@ export function mountSlideHost({ role = "student", root, slide, session, me, les
         const k = itemKey || "";
         return ctx.responses().find(r => r.studentId === me.id && (r.itemKey || "") === k) || null;
       },
-      async submit(payload, { itemKey = "", score = null, correct = null, timeMs = null } = {}) {
-        if (role !== "student" || !me || !sessionId()) return null;
+      // asTeacher: 교사도 응답 행을 쓸 수 있게 허용(담벼락 교사 글·댓글). studentId = 교사 id.
+      async submit(payload, { itemKey = "", score = null, correct = null, timeMs = null, asTeacher = false } = {}) {
+        if (!me || !sessionId()) return null;
+        if (role !== "student" && !(role === "teacher" && asTeacher)) return null;
         const k = itemKey || "";
         const tmpId = -(++tmpSeq);
         const r = {

@@ -1,5 +1,6 @@
 // 플러그인 공용 UI·헬퍼 (docs/ARCHITECTURE.md §6.3)
-// activityBar · choiceBars · countdownPill · phasePill · questionEditor · loadYouTubeApi · normalizeAnswer · optionLetter
+// activityBar · choiceBars · columnChart · whoSheet · OPTION_COLORS/optionColor · countdownPill · phasePill
+// questionEditor · loadYouTubeApi · normalizeAnswer · optionLetter
 // 가정: 스타일은 styles.css(.btn/.pill/.bars/.bar-row/.bar-fill/.field)가 기본. 여기서는 구조용 보조 CSS만
 //       :where() 로 주입해 styles.css 규칙이 항상 이기도록 한다.
 import { el } from "../ui.js";
@@ -29,7 +30,122 @@ injectCss("slides-common", `
 :where(.q-opt .q-key){width:22px;text-align:center;color:var(--muted);font-weight:600}
 :where(.q-opt input[type=text]){flex:1;min-width:0}
 :where(.q-opt input[type=radio],.q-opt input[type=checkbox]){width:20px;height:20px;accent-color:var(--ok);flex:none}
+.cc{--cc-h:200px;display:grid;grid-template-columns:repeat(var(--cc-n,4),minmax(0,1fr));gap:14px;align-items:end}
+.cc-col{display:flex;flex-direction:column;align-items:stretch;gap:8px;min-width:0}
+.cc-count{display:flex;align-items:center;justify-content:center;gap:6px;font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--ink);min-height:30px}
+.cc-count .cc-check{color:var(--ok);display:none}
+.cc-col.is-correct.is-revealed .cc-count .cc-check{display:inline-flex}
+.cc-bar{appearance:none;border:0;padding:0;margin:0;background:transparent;height:var(--cc-h);display:flex;align-items:flex-end;cursor:pointer;border-radius:12px}
+.cc-bar:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-soft)}
+.cc-bar:disabled{cursor:default}
+.cc-fill{width:100%;min-height:4px;height:0;border-radius:12px 12px 4px 4px;background:var(--cc-color);transition:height .4s cubic-bezier(.2,.7,.2,1),opacity .3s ease}
+.cc-bar:hover:not(:disabled) .cc-fill{filter:brightness(1.06)}
+.cc-tile{position:relative;display:flex;align-items:center;justify-content:center;min-height:96px;padding:14px 12px;border-radius:14px;background:var(--cc-color);color:#fff;font-weight:700;font-size:18px;line-height:1.3;text-align:center;overflow-wrap:anywhere;transition:opacity .3s ease}
+.cc-key{position:absolute;top:8px;right:12px;font-size:15px;font-weight:800;opacity:.55}
+.cc-tile .cc-tick{position:absolute;top:6px;right:8px;width:30px;height:30px;border-radius:50%;background:#fff;color:var(--ok);display:none;align-items:center;justify-content:center;box-shadow:var(--shadow-1)}
+.cc-col.is-correct.is-revealed .cc-tile .cc-tick{display:inline-flex}
+.cc-col.is-correct.is-revealed .cc-key{display:none}
+.cc.is-revealed .cc-col:not(.is-correct) .cc-fill,.cc.is-revealed .cc-col:not(.is-correct) .cc-tile{opacity:.32}
+@media (max-width:720px){.cc{--cc-h:140px;gap:8px}.cc-tile{min-height:64px;font-size:15px;padding:10px 8px}.cc-count{font-size:17px}}
+.who-group{display:flex;flex-direction:column;gap:8px;padding:12px 0;border-top:1px solid var(--line)}
+.who-group:first-child{border-top:0;padding-top:0}
+.who-head{display:flex;align-items:center;gap:8px;font-weight:600}
+.who-dot{width:12px;height:12px;border-radius:4px;background:var(--who-color,var(--line-strong));flex:none}
+.who-head .who-n{margin-left:auto;color:var(--muted);font-weight:500;font-variant-numeric:tabular-nums}
+.who-names{display:flex;flex-wrap:wrap;gap:6px}
+.who-name{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;background:var(--surface-2);font-size:14px}
+.who-name .who-extra{color:var(--muted)}
+.who-empty{color:var(--muted);font-size:14px}
 `);
+
+// ── 선지 색상 (미니멀 톤의 4~6색, 객관식·동영상 퀴즈 교사 화면 공용) ──
+export const OPTION_COLORS = ["#0f9fa6", "#2f4f8f", "#b07a3c", "#a3384f", "#3f8f5f", "#6b5b9a"];
+export function optionColor(i) { return OPTION_COLORS[(Math.max(0, i | 0)) % OPTION_COLORS.length]; }
+
+// ── 세로 막대 + 가로 선지 타일 (교사 화면) ──
+// options: [{ id, label }]. update({ counts: {optId:n}, correctIds: [], revealed })
+// onBarClick(optId) — 막대나 타일을 누르면 호출(누가 골랐는지 보기)
+export function columnChart(options, { onBarClick } = {}) {
+  const root = el("div", { class: "cc" });
+  let cols = [];
+  let last = { counts: {}, correctIds: [], revealed: false };
+  function build(opts) {
+    root.style.setProperty("--cc-n", String(Math.max(1, opts.length)));
+    cols = opts.map((o, i) => {
+      const color = o.color || optionColor(i);
+      const num = el("span", {}, "0명");
+      const count = el("div", { class: "cc-count" }, [el("span", { class: "cc-check", html: CHECK_SVG }), num]);
+      const fill = el("span", { class: "cc-fill" });
+      const bar = el("button", { class: "cc-bar", type: "button", "aria-label": `${optionLetter(i)} 응답자 보기`, onClick: () => onBarClick?.(o.id) }, [fill]);
+      const label = el("span", {}, o.label || optionLetter(i));
+      const tile = el("div", { class: "cc-tile", role: onBarClick ? "button" : null, tabindex: onBarClick ? "0" : null,
+        onClick: () => onBarClick?.(o.id),
+        onKeydown: (e) => { if (onBarClick && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); onBarClick(o.id); } },
+      }, [label, el("span", { class: "cc-key" }, String(i + 1)), el("span", { class: "cc-tick", html: CHECK_SVG })]);
+      const col = el("div", { class: "cc-col" }, [count, bar, tile]);
+      col.style.setProperty("--cc-color", color);
+      root.appendChild(col);
+      return { id: o.id, col, num, fill, bar, label };
+    });
+  }
+  function setOptions(opts) {
+    const same = opts.length === cols.length && opts.every((o, i) => cols[i].id === o.id);
+    if (!same) { root.replaceChildren(); build(opts); }
+    else opts.forEach((o, i) => { const t = o.label || optionLetter(i); if (cols[i].label.textContent !== t) cols[i].label.textContent = t; });
+    update(last);
+  }
+  function update({ counts = {}, correctIds = [], revealed = false } = {}) {
+    last = { counts, correctIds, revealed };
+    const max = Math.max(1, ...cols.map(c => Number(counts[c.id]) || 0));
+    root.classList.toggle("is-revealed", !!revealed);
+    for (const c of cols) {
+      const n = Number(counts[c.id]) || 0;
+      c.num.textContent = `${n}명`;
+      c.fill.style.height = `${Math.max(2, Math.round((n / max) * 100))}%`;
+      c.col.classList.toggle("is-correct", correctIds.includes(c.id));
+      c.col.classList.toggle("is-revealed", !!revealed);
+      c.bar.disabled = !onBarClick;
+    }
+  }
+  root.update = update;
+  root.setOptions = setOptions;
+  build(options || []);
+  update(last);
+  return root;
+}
+const CHECK_SVG = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
+
+// ── 누가 답했는지 보기 (교사) ──
+// groups: [{ label, color?, correct?, studentIds: [], extra?: { [studentId]: '부가 텍스트' } }]
+// 이름은 ctx.students() → '6-2-14 홍길동' 형식, 교사 id 는 '선생님'
+export function whoSheet(ctx, { title = "응답한 학생", groups = [], empty = "아직 아무도 없어요" } = {}) {
+  const map = (ctx.students && ctx.students()) || new Map();
+  const teacherId = ctx.session?.()?.teacherId;
+  const nameOf = (id) => {
+    if (id && id === teacherId) return "선생님";
+    const s = map.get ? map.get(id) : null;
+    return s ? `${s.grade}-${s.classNum}-${s.num} ${s.name}` : "알 수 없음";
+  };
+  const body = el("div", { class: "who" }, groups.map(g => {
+    const ids = (g.studentIds || []).slice().sort((a, b) => nameOf(a).localeCompare(nameOf(b), "ko", { numeric: true }));
+    const head = el("div", { class: "who-head" }, [
+      el("span", { class: "who-dot" }), el("span", {}, g.label || ""),
+      g.correct ? el("span", { class: "pill pill-ok" }, "정답") : null,
+      el("span", { class: "who-n" }, `${ids.length}명`),
+    ]);
+    if (g.color) head.firstChild.style.setProperty("--who-color", g.color);
+    const names = ids.length
+      ? el("div", { class: "who-names" }, ids.map(id => el("span", { class: "who-name" }, [
+          el("span", {}, nameOf(id)),
+          g.extra && g.extra[id] ? el("span", { class: "who-extra" }, g.extra[id]) : null,
+        ])))
+      : el("div", { class: "who-empty" }, empty);
+    return el("div", { class: "who-group" }, [head, names]);
+  }));
+  const open = ctx.modal || null;
+  if (typeof open === "function") return open({ title, body, actions: [{ label: "닫기", primary: true, onClick: (close) => close() }] });
+  return null;
+}
 
 // ── 작은 헬퍼 ──
 export function optionLetter(i) {
@@ -164,7 +280,8 @@ export function activityBar(ctx, { reveal = false, timer = false, countFn = null
 
   function onPhase() {
     const a = ctx.activity();
-    if (a.phase === "ended") ctx.setActivity({ phase: "idle", startedAt: null, endsAt: null });
+    // 다시 받기: 마감·전원 응답으로 자동 공개된 정답도 다시 숨긴다
+    if (a.phase === "ended") ctx.setActivity({ phase: "idle", reveal: false, startedAt: null, endsAt: null });
     else ctx.setActivity({ phase: "ended", endsAt: null });
   }
   function onReveal() { ctx.setActivity({ reveal: !ctx.activity().reveal }); }
