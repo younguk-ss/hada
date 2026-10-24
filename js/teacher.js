@@ -22,6 +22,7 @@ import { fileToSlides } from "./storage.js";
 import { joinSessionChannel } from "./realtime.js";
 import { getSlideType, listSlideTypes, createSlide, CATEGORIES, effectiveMode, injectCss, mountSlideHost } from "./slides/index.js";
 import { renderSlide } from "./lesson-view.js";
+import { openStudentPrint, printStudents, printRecordView } from "./print.js";
 
 const TABS = ["lessons", "records", "students", "code"];
 const MODES = [["none", "발표"], ["whole", "전체"], ["individual", "개별"], ["group", "모둠"]];
@@ -286,7 +287,13 @@ async function startLesson(lessonId) {
       const ok = await confirmDialog({ title: "확인이 필요한 슬라이드가 있어요", body: list, ok: "그래도 시작" });
       if (!ok) return;
     }
-    const res = await cloudStartSession({ lesson: findLesson(lessonId) || lesson, teacher: currentTeacher() });
+    // 수업(세션) 이름: 같은 자료로 여러 반을 수업해도 기록에서 구분되도록 (예: 임진왜란 3학년 2반)
+    const prevName = mySessions(lesson.teacherId).find(x => x.lessonId === lessonId && x.title && x.title !== lesson.title)?.title;
+    const name = await promptDialog({
+      title: "수업 이름", value: prevName || lesson.title, placeholder: "예) 임진왜란 3학년 2반", ok: "시작", maxlength: 60,
+    });
+    if (name == null) return;
+    const res = await cloudStartSession({ lesson: findLesson(lessonId) || lesson, teacher: currentTeacher(), title: name.trim() || lesson.title });
     if (!res || res.error) { toast((res && res.error) || "수업을 시작하지 못했어요", { type: "error" }); return; }
     go("/live/" + res.id);
   } catch (e) {
@@ -1526,6 +1533,28 @@ export function sessionDetailView({ id } = {}) {
       if (!disposed) go("/teacher?tab=records", { replace: true });
     }
 
+    async function rename() {
+      const cur = findSession(id);
+      if (!cur) return;
+      const name = await promptDialog({ title: "수업 이름", value: cur.title || "", placeholder: "예) 임진왜란 3학년 2반", ok: "저장", maxlength: 60 });
+      if (name == null || disposed) return;
+      const v = name.trim();
+      if (!v || v === cur.title) return;
+      const r = await patchSession(cur, { title: v });
+      if (r && r.error) { toast("이름을 바꾸지 못했어요", { type: "error" }); return; }
+      if (!disposed) render();
+    }
+    // 학생별 보기에서는 그 학생 결과를 학습지처럼, 슬라이드별 보기는 화면 그대로 인쇄
+    async function printView() {
+      const cur = findSession(id);
+      if (!cur) return;
+      if (mode === "students" && picked) {
+        await printStudents({ session: cur, studentIds: [picked], slideIds: (cur.slidesSnapshot || []).map(x => x.id), teacher });
+      } else {
+        await printRecordView();
+      }
+    }
+
     function render() {
       const s = findSession(id);
       if (!s || disposed) return;
@@ -1534,11 +1563,13 @@ export function sessionDetailView({ id } = {}) {
       const head = el("div", { class: "page-head" }, [
         backBtn(),
         el("h1", {}, s.title || "수업"),
+        el("button", { class: "btn btn-icon btn-ghost no-print", type: "button", "aria-label": "수업 이름 바꾸기", title: "이름 바꾸기", onClick: rename }, icon("edit", 18)),
         el("div", { class: "actions" }, [
           s.status === "live"
             ? el("button", { class: "btn btn-primary", type: "button", onClick: () => go("/live/" + id) }, "돌아가기")
             : abtn("이어서", { cls: "btn btn-primary", ic: "play", onClick: resume }),
-          el("button", { class: "btn", type: "button", onClick: () => window.print() }, [icon("print", 18), "인쇄"]),
+          abtn("인쇄", { ic: "print", onClick: printView }),
+          el("button", { class: "btn", type: "button", onClick: () => { const cur = findSession(id); if (cur) openStudentPrint({ session: cur, teacher }); } }, [icon("users", 18), "학생 인쇄"]),
           abtn("삭제", { cls: "btn btn-danger", ic: "trash", onClick: remove }),
         ]),
       ]);

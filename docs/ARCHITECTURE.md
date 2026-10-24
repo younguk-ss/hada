@@ -477,13 +477,13 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 - **로그인**: `cloudLoginTeacher` → whoTeacher → `cloudBootTeacher` → `/teacher`.
 - **수업 자료 카드**: 썸네일(cover) · 제목 · `n장 · 날짜` · `[시작]`(primary) · `⋯` 메뉴(편집, 복제(선택), 삭제). 카드 탭 = 편집기. 새 수업: `[+ 새 수업]` → 제목 promptDialog → 빈 ink 1장으로 생성 → 편집기. `[PDF·이미지로 만들기]` → 파일 선택 → `fileToSlides` 진행률 → 생성 → 편집기.
 - **편집기**: 열 때 `lesson.slides===null`이면 `cloudFetchLessonSlides`(진행률 pill). 레일: 썸네일(`def.thumb`), 탭=선택, 길게 누르기/`⋯`=복제·삭제·위/아래(드래그 정렬은 pointer 이벤트로, HTML5 DnD 금지). 레일 하단 `[+ 슬라이드]` → 모달 그리드(카테고리 섹션, 아이콘+라벨, 탭 즉시 현재 뒤에 삽입) · `[+ 파일]`(PDF/이미지 → ink 여러 장). 스테이지 = `mountSlideHost({role:'editor'})`. 인스펙터 = 제목 input + `def.Editor().inspector`(있으면) + validate 경고. 변경 → 300ms 디바운스 `cloudSaveLesson` + 상단 pill `저장됨/저장 중…/저장 실패 [다시]`.
-- **시작**: `cloudStartSession` await(버튼 로딩) → 성공 `/live/:id`, 실패 toast. 모달 없음. flow 기본 teacher.
+- **시작**: `수업 이름` 입력 창(기본값 = 같은 자료의 직전 수업 이름 또는 자료 제목, 예: '임진왜란 3학년 2반') → `cloudStartSession({lesson, teacher, title})` await → 성공 `/live/:id`, 실패 toast. flow 기본 teacher. 기록 화면에서 이름 바꾸기(patchSession title).
 - **수업 진행 `/live/:id`**: 상단 바(좌→우) `←`(대시보드, 수업은 계속) · 제목 · **코드 pill `ABC123`**(탭 → QR 모달: 큰 코드 + QR + URL 복사) · `● 12`(온라인 수, 탭 → drawer 참여 탭) · `◀ 3/12 ▶`(가운데 숫자 탭 → 썸네일 스트립 팝오버로 점프) · (ink일 때만) 모드 seg `발표·전체·개별·모둠` · flow 토글 아이콘(`교사 진행`/`자유 이동`) · `[패널]` · `[종료]`.
   - 스테이지 = `mountSlideHost({role:'teacher'})`. drawer 탭: `활동`(= host.panel, 없으면 탭 숨김) · `참여`(참가자 목록: 온라인 점, 이름, 미응답 표시(응답형일 때), 모둠).
   - 키보드: ←/→ 이동, F 전체화면, Esc 팝오버 닫기.
   - 이동/모드/flow = `patchSession`. 이 화면은 store 구독 → host.update만 호출(재마운트 금지). 1초 interval 금지.
   - `[종료]` → confirmDialog → `cloudEndSession(session,'completed')` → `/teacher/session/:id`.
-- **기록 `/teacher/session/:id`**: `cloudFetchSession` → 요약(날짜·참여 n명·슬라이드 n장) + seg `슬라이드별 / 학생별`. 슬라이드별 = 각 슬라이드 `def.summary`. 학생별 = 학생 선택 → 그 학생 ink(읽기 전용) + 응답(정오) 슬라이드 순. `[인쇄]`(@media print). `[이어서]`(stopped/completed → `cloudResumeSession` → `/live/:id`) · `[삭제]`.
+- **기록 `/teacher/session/:id`**: `cloudFetchSession` → 요약(날짜·참여 n명·슬라이드 n장) + seg `슬라이드별 / 학생별`. 슬라이드별 = 각 슬라이드 `def.summary`. 학생별 = 학생 선택 → 그 학생 ink(읽기 전용) + 응답(정오) 슬라이드 순. `[인쇄]`(슬라이드별 = 화면 그대로, 학생별 = 그 학생 학습지 인쇄) · `[학생 인쇄]`(js/print.js: 1) 슬라이드 선택 2) 학생 선택 → 학생마다 A4 세로, 여백 0 + 시트 안 패딩, 머리글 작게, 오른쪽 위 워터마크 `assets/print-mark.png`. 필기 슬라이드는 16:10 틀에서 학습지 이미지 영역만 잘라 JPEG로 렌더 — A4 세로 학습지는 종이 한 장을 꽉 채움, 가로 슬라이드는 한 장에 2개). `[이어서]`(stopped/completed → `cloudResumeSession` → `/live/:id`) · `[삭제]`.
 - **기록 탭**: 세션 목록(제목, 날짜, 참여 n, 상태 pill). 진행 중 세션은 맨 위 `[돌아가기]`.
 - **학생 탭**: 이 교사 세션에 참여한 학생 표(학번순) → 행 탭 → 참여 세션 목록.
 - **내 코드 탭**: 큰 코드 · QR · `[코드 복사]` `[링크 복사]`.

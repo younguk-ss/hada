@@ -641,7 +641,7 @@ export async function cloudDuplicateLesson(lessonId) {
 // ── 세션 ──
 const snapFallback = new Set(); // 스냅샷 대신 수업 자료 slides로 채운 세션 id
 
-export async function cloudStartSession({ lesson, teacher }) {
+export async function cloudStartSession({ lesson, teacher, title }) {
   await ready();
   try {
     if (!lesson) return { error: "수업 자료를 찾지 못했어요" };
@@ -664,7 +664,7 @@ export async function cloudStartSession({ lesson, teacher }) {
     }
     others.forEach(s => { s.status = "stopped"; s.endedAt = now; s.rev = Math.max(s.rev + 1, now); });
     const session = ensureSessionShape({
-      id: newId("ses"), lessonId: lesson.id, teacherId, title: lesson.title,
+      id: newId("ses"), lessonId: lesson.id, teacherId, title: (String(title || "").trim() || lesson.title).slice(0, 60),
       status: "live", flow: "teacher", currentSlide: 0, rev: now, groups: [], activity: {},
       startedAt: now, endedAt: null, participants: [], slidesSnapshot: snapshot,
       records: { __whole: {}, __groups: {} }, responses: {}, _full: true,
