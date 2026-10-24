@@ -13,8 +13,10 @@
 // 6) 보기 변환(setView): 확대·이동 화면에서는 캔버스가 보이는 영역(뷰포트) 크기만큼만 비트맵을 갖고,
 //    슬라이드(정규화 0..1)가 그 안에서 놓인 위치·크기 {ox, oy, cw, ch, baseW}(CSS px)로 그린다 → 확대해도 선이 선명하고 메모리 일정.
 //    baseW = 확대 1배일 때 슬라이드 폭(선 굵기 기준). 보기가 없으면 캔버스 전체 = 슬라이드(기존 동작).
-// 7) 확대·이동 화면에서 선 굵기는 화면 기준으로 고정 — 확대해도(쓸 때도, 볼 때도) 같은 펜은 같은 굵기로 보인다.
-//    저장하는 굵기도 확대 배율과 무관(펜 S/M/L 값 그대로). 기록·썸네일·인쇄 같은 정적 그림은 기존대로 그림 폭 비례.
+// 7) 선 굵기와 확대: 획은 쓸 때의 확대 배율 zw를 기억하고, size = 펜 값 ÷ zw(슬라이드 위 실제 굵기)로 저장한다.
+//    확대·이동 화면에서는 size × min(보는 배율, zw)로 그린다 →
+//      쓸 때와 같은 배율: 쓸 때 본 굵기 그대로 / 축소: 글씨와 함께 가늘어짐(굵어 보이지 않게) / 더 확대: 쓸 때보다 굵어지지 않음.
+//    기록·썸네일·인쇄 같은 정적 그림은 size(실제 굵기) × 그림 폭/960. zw 없는 이전 획은 zw = 1.
 
 import { newId } from "./slides/registry.js";
 
@@ -210,8 +212,9 @@ export class InkCanvas {
       this.current = {
         tool: this.tool,
         color: this.color,
-        // 형광펜은 굵게(확대 배율과 무관하게 같은 값으로 저장)
-        size: this.tool === "highlight" ? this.size * 4 : this.size,
+        // 형광펜은 굵게. 슬라이드 위 실제 굵기 = 펜 값 ÷ 쓰는 배율(7)
+        size: Math.max(0.05, r2((this.tool === "highlight" ? this.size * 4 : this.size) / this.zoomFactor())),
+        ...(this.zoomFactor() > 1.01 ? { zw: r2(this.zoomFactor()) } : {}),
         points: [pt],
         ts: Date.now(),
       };
@@ -283,8 +286,8 @@ export class InkCanvas {
   }
 
   _intersects(stroke, eraser, zf = 1) {
-    // 화면에서 보이는 지우개 크기만큼 → 확대 배율만큼 슬라이드 위 반경을 줄임
-    const r = ((eraser.size || 12) / 1000 + 0.012) / Math.max(1, zf);
+    // 화면에서 보이는 지우개 크기만큼: 지우개 굵기는 이미 배율로 나뉘어 있고, 고정 여유분만 배율로 줄임
+    const r = (eraser.size || 12) / 1000 + 0.012 / Math.max(1, zf);
     const r2_ = r * r;
     for (const ep of eraser.points) {
       for (const p of stroke.points) {
@@ -316,7 +319,7 @@ export class InkCanvas {
   // 보기 변환을 적용해 획 그리기(슬라이드 영역 밖은 잘라냄)
   _paint(g, list) {
     if (!this.view) {
-      for (const s of list) drawStroke(g, s, g.canvas.width, g.canvas.height, this._k);
+      for (const s of list) drawStroke(g, s, g.canvas.width, g.canvas.height, this._k);  // 보기 없음 = 배율 1(실제 굵기)
       return;
     }
     const v = this.view, d = g.canvas.width / (this._cssW || 1);
@@ -325,7 +328,9 @@ export class InkCanvas {
     g.rect(v.ox * d, v.oy * d, v.cw * d, v.ch * d);
     g.clip();
     g.translate(v.ox * d, v.oy * d);
-    for (const s of list) drawStroke(g, s, v.cw * d, v.ch * d, this._k);
+    const zv = (v.cw || 1) / (v.baseW || v.cw || 1);
+    // 7) 쓸 때 배율까지만 함께 커짐 — 축소하면 가늘어지고, 더 확대해도 쓸 때보다 굵어지지 않음
+    for (const s of list) drawStroke(g, s, v.cw * d, v.ch * d, this._k * Math.min(zv, s.zw || 1));
     g.restore();
   }
 
@@ -448,9 +453,9 @@ export function drawStroke(ctx, s, W, H, k = 1) {
 
 // 미니 캔버스(갤러리·썸네일·기록)용 정적 렌더. 캔버스 크기는 그대로 쓰거나 width/height로 지정.
 // texts도 함께 그림(글자 크기는 폭/960 비례). removed id는 제외.
-// region({x0,y0,x1,y1}, 슬라이드 정규화) → 그 영역만 캔버스에 꽉 차게 확대해서 그림. lineK = 선 굵기 배율(기본 폭/960)
-//   확대해도 선 굵기는 lineK 그대로(화면 기준 고정), 글자는 슬라이드와 함께 커짐.
-export function paintStrokes(canvas, strokes, { removed = [], texts = [], width, height, region = null, lineK = null } = {}) {
+// region({x0,y0,x1,y1}, 슬라이드 정규화) → 그 영역만 캔버스에 꽉 차게 확대해서 그림(선·글자 모두 슬라이드와 함께 커짐).
+// minPx = 가장 가는 선의 최소 굵기(캔버스 px) — 작은 칸에서도 보이게
+export function paintStrokes(canvas, strokes, { removed = [], texts = [], width, height, region = null, minPx = 0.7 } = {}) {
   if (!canvas) return;
   if (width && canvas.width !== width) canvas.width = width;
   if (height && canvas.height !== height) canvas.height = height;
@@ -461,10 +466,10 @@ export function paintStrokes(canvas, strokes, { removed = [], texts = [], width,
   ctx.save();
   if (region) ctx.translate(-region.x0 * W, -region.y0 * H);
   const rm = removed && removed.length ? new Set(removed) : null;
-  const k = W / REF_W, kl = lineK || k;
+  const k = W / REF_W;
   (strokes || []).forEach((s, i) => {
     if (rm && rm.has(strokeKey(s, i))) return;
-    drawStroke(ctx, s, W, H, kl);
+    drawStroke(ctx, s, W, H, Math.max(k, minPx / Math.max(0.05, s.size || 2)));
   });
   for (const t of texts || []) {
     if (!t || !t.value || (rm && t.id && rm.has(t.id))) continue;

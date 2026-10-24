@@ -10,6 +10,7 @@
 //       가정: 너무 좁게 확대하지 않도록 최소 범위는 학습지 폭의 절반(=최대 2배), 교사 첨삭 획은 따라가지 않는다,
 //             범위가 조금 바뀐 정도(가운데 15%·크기 20% 미만)는 그대로 둬서 칸이 흔들리지 않게 한다. 필기가 없으면 학습지 전체.
 //       보기 '전체': 학습지 내용 영역 전체(세로 칸). 필기는 칸 크기 × dpr 캔버스에 보이는 영역만 그린다(선명·메모리 일정).
+//       선 굵기는 슬라이드 위 실제 굵기(canvas.js 7) — 확대해서 쓴 글씨는 가늘게, 크게 쓴 글씨는 굵게, 학생 화면과 같은 비율.
 // 확대: 필기 화면(편집기·교사 전체·학생·학생 필기 크게 보기)은 renderSlide({ zoom:true }) — 두 손가락·휠·도구바 [− 100% +].
 //       학생 화면은 스테이지 전체가 보기 영역이고, 도구바가 덮는 만큼만 맞춤에서 비운다(이동하면 도구바 뒤로도 보임).
 //       가로로 남는 화면이면 도구바를 왼쪽 세로 2열로 옮겨 슬라이드를 키운다(어느 쪽이 더 크게 보이는지 계산해 선택).
@@ -371,8 +372,8 @@ function miniFrame(slide, { big = false, crop = false } = {}) {
     if (s === sig) return false;
     sig = s;
     const opts = { removed: r.removed || [], texts: baseT.concat(r.texts || []) };
-    // 칸: 선 굵기는 칸 폭 기준(확대해도 굵어지지 않음, 작은 칸에서도 보이게 최소값)
-    if (crop && page) Object.assign(opts, { region: page, lineK: Math.max(cv.width / 960, (window.devicePixelRatio || 1) * 0.45) });
+    // 칸: 보이는 영역만(선 굵기는 슬라이드 위 실제 굵기 — 학생이 그 배율에서 본 모습과 같음)
+    if (crop && page) Object.assign(opts, { region: page, minPx: (window.devicePixelRatio || 1) * 0.6 });
     paintStrokes(cv, baseS.concat(r.strokes || []), opts);
     return true;
   };
