@@ -3,7 +3,8 @@
 // 뷰포트(스테이지) 안에 16:10 슬라이드를 놓고 두 손가락 핀치 · 트랙패드/휠 · 버튼으로 확대·이동한다.
 // - 배경·텍스트(.slide-frame)는 실제 레이아웃 크기를 바꿔 그린다 → 브라우저가 원본 해상도로 다시 그려 선명.
 // - 필기 캔버스는 뷰포트 크기 비트맵 + 보기 변환(InkCanvas.setView) → 확대해도 선이 선명하고 메모리 일정.
-// - 제스처 중에는 GPU transform으로 미리 보여 주고, 손을 떼면 확정(선명하게 다시 그림).
+// - 제스처 중 배경은 GPU transform으로 미리 보여 주고, 필기는 획이 많지 않으면 매 프레임 다시 그린다
+//   (선 굵기가 화면 기준 고정이라 그림처럼 늘리면 굵어졌다 돌아옴). 손을 떼면 확정(선명하게 다시 그림).
 // - 맞춤: 세로 학습지는 종이의 내용 영역(흰 여백 제외)이 화면에 꽉 차게, 가로 슬라이드는 슬라이드 전체.
 //   이동은 종이(배경 이미지) 안에서만 — 16:10 바깥 빈 여백으로 끌려가지 않게.
 // 입력: 펜·마우스 = 필기. 한 손가락 = 필기(펜을 한 번이라도 쓰면 손바닥 오인을 막으려고 한 손가락은 무시).
@@ -16,6 +17,7 @@ const ASPECT = 1.6;          // 슬라이드 16:10
 const MARGIN = 10;           // 맞춤 시 가장자리 여백(px)
 const STEP = 1.25;           // 버튼 확대 배율
 const PAD = 0.02;            // 내용 영역 둘레 여유(종이 크기 비율)
+const LIVE_POINTS = 6000;    // 획 점이 이 이하면 확대 중에도 필기를 실제로 다시 그림(선 굵기가 출렁이지 않게)
 const focusCache = new Map(); // 분석 주소 → 내용 영역(이미지 정규화) | null
 let penSeen = false;          // 이 기기에서 펜을 쓴 적이 있으면 한 손가락은 필기하지 않음
 
@@ -54,7 +56,7 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
   let fitMode = true;                  // 사용자가 직접 확대·이동하기 전까지는 크기가 바뀌면 다시 맞춤
   let laidOut = false, destroyed = false;
   let analyzeSrc = src || null;
-  let commitTimer = 0;
+  let commitTimer = 0, liveInk = false;
   const listeners = new Set();
 
   // ── 기하 ──
@@ -88,7 +90,12 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
   function applyLive() {
     const k = live.z / cur.z;
     frame.style.transform = `translate(${live.ox - cur.ox}px, ${live.oy - cur.oy}px) scale(${k})`;
-    canvas.style.transform = `translate(${live.ox - cur.ox * k}px, ${live.oy - cur.oy * k}px) scale(${k})`;
+    if (liveInk) {
+      const cw = baseW * live.z;
+      ink.setView({ ox: live.ox, oy: live.oy, cw, ch: cw / ASPECT, baseW });
+    } else {
+      canvas.style.transform = `translate(${live.ox - cur.ox * k}px, ${live.oy - cur.oy * k}px) scale(${k})`;
+    }
   }
   function commit(v = live) {
     if (destroyed) return;
@@ -102,7 +109,11 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
   }
   function setLive(v) {
     live = clampView(v);
-    if (!frame.style.willChange) { frame.style.willChange = "transform"; canvas.style.willChange = "transform"; }
+    if (!frame.style.willChange) {
+      liveInk = ink.pointCount() <= LIVE_POINTS;
+      frame.style.willChange = "transform";
+      if (!liveInk) canvas.style.willChange = "transform";
+    }
     applyLive();
     emit("live");
   }
