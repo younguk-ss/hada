@@ -46,6 +46,7 @@ function mergeSession(ex, inc) {
   }
   if (inc.reviewCode && !ex.reviewCode) { ex.reviewCode = inc.reviewCode; changed = true; } // 복습 코드는 한 번 정해지면 불변
   if (!ex.slidesSnapshot.length && inc.slidesSnapshot?.length) { ex.slidesSnapshot = inc.slidesSnapshot; changed = true; }
+  if (!(ex.worksheet || []).length && inc.worksheet?.length) { ex.worksheet = inc.worksheet; changed = true; } // 학습지 스냅샷도 시작 후 불변
   // records: 없는 슬라이드 레코드만 추가 (병합은 메시지 경로가 담당)
   const ir = inc.records || {};
   for (const [k, v] of Object.entries(ir)) {

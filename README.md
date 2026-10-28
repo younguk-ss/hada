@@ -11,6 +11,7 @@
 - 게임: 공룡 점프(정확도+시간 순위), 레이싱 퀴즈(최대 4명 랜덤 조, 정답 부스터·오답 미끄러짐, 2바퀴, 조별 랩타임)
 - 수업 기록: 슬라이드별/학생별, 인쇄
 - 복습 QR: 수업마다 새 복습 코드 — 학습지(학생 결과·빈 학습지) 장마다 QR·코드가 인쇄되고, 학생이 찍으면 그 수업을 자기 페이스로 복습(내 필기·답 이어서)
+- 학습지: 편집기 `[📝 학습지]`에 PDF·이미지를 미리 올려 두면 수업 중 학생이 화면 오른쪽 📝 탭으로 열어 각자 필기. 교사는 같은 탭으로 학생들의 필기를 실시간 갤러리로 보고(확대·첨삭), `[학생 화면에 띄우기]`로 모든 학생 화면을 학습지로 바꿀 수 있음(쪽 이동은 자유). 기록·복습·인쇄에도 포함
 
 설계 문서: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
@@ -25,7 +26,7 @@ http://localhost:5173 — 캐시를 끈 정적 서버입니다(ES 모듈이 옛 
 ## Supabase 셋업 (새 프로젝트)
 
 1. https://supabase.com → New project
-2. SQL Editor에서 순서대로 실행: `db/migrations/001_v1.sql` → `002_v2.sql` → `003_v21.sql` → `004_review_code.sql`
+2. SQL Editor에서 순서대로 실행: `db/migrations/001_v1.sql` → `002_v2.sql` → `003_v21.sql` → `004_review_code.sql` → `005_worksheet.sql`
    - ⚠️ `001_v1.sql`은 `drop table`을 포함하므로 **새 프로젝트에서만** 실행하세요. 기존 프로젝트는 002부터.
    - 002가 Storage 버킷 `slides`(public)와 정책까지 만듭니다.
 3. Project Settings → API → Project URL, publishable key를 `env.js`에 넣기:
@@ -57,6 +58,7 @@ js/
   storage.js        슬라이드 이미지 업로드·썸네일·PDF 변환
   realtime.js       세션 채널(broadcast·presence)
   canvas.js, lesson-view.js   필기 캔버스·슬라이드 프레임
+  worksheet.js      학습지 공용(📝 탭·작성 상태·개별 모드 세션 보기)
   teacher.js, student.js      교사·학생 화면
   slides/           슬라이드 타입 플러그인(registry·host·common + 14개 타입)
 db/migrations/      SQL 마이그레이션

@@ -14,19 +14,23 @@
 // 가정: 수업 중 [상호작용 추가](패널 활동 탭 아래)는 정답 없는 상호작용·미디어만. 그 타입의 편집기를 창에 띄워 내용을 넣고
 //       [추가하고 이동] → 이 수업 스냅샷의 현재 슬라이드 다음에 끼워 넣고 바로 그 슬라이드로(수업 자료에는 저장하지 않음).
 //       맨 앞 [빈 슬라이드]는 채울 내용이 없어 창 없이 바로 — 흰 필기 슬라이드(모드 '전체', 수업 중 모드 seg로 바꿈).
+// 가정: 학습지(js/worksheet.js) — 편집기 상단 [📝 학습지] 창에서 PDF·이미지를 올려 자료에 붙인다(lesson.worksheet, 저장은 cloudSaveLesson).
+//       수업 진행에서는 오른쪽 가장자리 📝 탭(작성 중 인원 배지) → 스테이지를 학습지 갤러리로 바꿈(ink '개별' 갤러리 재사용, 칸 탭 → 첨삭).
+//       [학생 화면에 띄우기] = activity.__ws.force. 학습지 화면이 열려 있을 때 ←/→는 학습지 쪽을 넘긴다(슬라이드 호스트는 숨긴 채 유지).
 import { store, findLesson, findSession, findStudent, findTeacher, studentLabel, newId } from "./store.js";
 import { go } from "./router.js";
 import { el, mount, template, toast, confirmDialog, promptDialog, modal, sheet, icon, fmtDate, debounce, copyText } from "./ui.js";
 import {
   cloudReady, cloudCreateLesson, cloudSaveLesson, cloudDeleteLesson, cloudDuplicateLesson, cloudFetchLessonSlides,
   cloudStartSession, ensureSession, cloudFetchSession, patchSession, cloudEndSession, cloudResumeSession, cloudDeleteSession,
-  subscribeSession, cloudEnsureReviewCode, cloudInsertSessionSlide,
+  subscribeSession, cloudEnsureReviewCode, cloudInsertSessionSlide, cloudEnsureWorksheet,
 } from "./cloud.js";
 import { fileToSlides } from "./storage.js";
 import { joinSessionChannel } from "./realtime.js";
 import { getSlideType, listSlideTypes, createSlide, CATEGORIES, effectiveMode, injectCss, mountSlideHost } from "./slides/index.js";
 import { renderSlide } from "./lesson-view.js";
 import { openStudentPrint, openBlankPrint, printStudents, printRecordView, reviewUrl } from "./print.js";
+import { wsPages, wsForced, setWsForce, wsPageTitle, wsStats, makeWsSessionView, wsTab, wsCss } from "./worksheet.js";
 
 const TABS = ["lessons", "records", "students", "code"];
 // 수업 중 바로 추가할 수 있는 타입 (정답 없는 상호작용 · 미디어)
@@ -728,6 +732,7 @@ export function editorView({ id } = {}) {
 
 function buildEditor(lessonId, teacher) {
   ensureCss();
+  wsCss();
   let disposed = false;
   let selId = null;
   let host = null;
@@ -748,11 +753,16 @@ function buildEditor(lessonId, teacher) {
   const retryBtn = el("button", { class: "btn btn-tiny", type: "button", hidden: true, onClick: () => doSave() }, "다시");
   const loadPill = el("span", { class: "pill", hidden: true });
   const btnStart = el("button", { class: "btn btn-primary", type: "button", "data-start": lessonId, onClick: onStart }, [icon("play", 18), "시작"]);
+  const wsCnt = el("span", { class: "ws-cnt", hidden: true });
+  const wsBtn = el("button", {
+    class: "btn", type: "button", title: "학습지 — 수업 중 학생이 각자 필기하는 PDF·이미지", onClick: openWorksheet,
+  }, [el("span", { "aria-hidden": "true" }, "📝"), el("span", { class: "hide-sm" }, "학습지"), wsCnt]);
   const top = el("header", { class: "topbar editor-top" }, [
     el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "뒤로", onClick: () => go("/teacher") }, icon("chevron-left")),
     titleIn,
     el("span", { class: "topbar-group" }, [savePill, retryBtn, loadPill]),
     el("span", { class: "topbar-spacer" }),
+    wsBtn,
     btnStart,
   ]);
 
@@ -1124,11 +1134,108 @@ function buildEditor(lessonId, teacher) {
     await startLesson(lessonId);
   }
 
+  // ── 학습지 관리 창: 쪽 목록(썸네일·순서·삭제) + [PDF·이미지 추가] → lesson.worksheet, 저장은 slides와 같은 디바운스 저장 ──
+  let wsBusy = false;
+  function syncWsBtn() {
+    const n = (Array.isArray(L()?.worksheet) ? L().worksheet : []).length;
+    wsCnt.hidden = !n;
+    wsCnt.textContent = n ? String(n) : "";
+  }
+  async function openWorksheet() {
+    const l0 = L();
+    if (!l0) return;
+    if (!Array.isArray(l0.worksheet)) {
+      // 아직 안 불러온 자료(이 탭에서 만든 자료 등) → 서버에서 1회. 못 읽으면 저장이 DB 쪽을 지울 수 있어 열지 않는다
+      wsBtn.classList.add("loading");
+      let r = null;
+      try { r = await cloudEnsureWorksheet(lessonId); } catch (e) { console.warn("[editor] 학습지 불러오기 실패", e); }
+      wsBtn.classList.remove("loading");
+      if (disposed) return;
+      if (!Array.isArray(r)) { toast("학습지를 불러오지 못했어요", { type: "error" }); return; }
+    }
+    const pages = () => (Array.isArray(L()?.worksheet) ? L().worksheet : []);
+    const grid = el("div", { class: "ws-grid" });
+    const fileIn2 = el("input", { type: "file", accept: ACCEPT, multiple: true, hidden: true });
+    const prog = el("span", { class: "pill", hidden: true });
+    const addBtn = el("button", { class: "btn btn-primary", type: "button", disabled: wsBusy, onClick: () => fileIn2.click() }, [icon("plus", 18), "PDF·이미지 추가"]);
+    const body = el("div", { class: "stack" }, [
+      el("div", { class: "ws-tools" }, [addBtn, prog, fileIn2]),
+      grid,
+      el("div", { class: "ws-note" }, "수업 중 학생이 각자 필기하는 학습지예요. 학생은 화면 오른쪽 📝 탭으로 열어 쓰고, 교사는 같은 탭에서 학생들의 필기를 실시간으로 봐요. 수업 기록·인쇄에도 함께 들어가요."),
+    ]);
+    const m = modal({ title: "학습지", body, wide: true, actions: [{ label: "닫기", primary: true }] });
+    function changed() { markDirty(); syncWsBtn(); renderGrid(); }
+    function card(p, i, n) {
+      const move = (d) => {
+        const list = pages();
+        const j = i + d;
+        if (j < 0 || j >= list.length) return;
+        [list[i], list[j]] = [list[j], list[i]];
+        changed();
+      };
+      const del = async () => {
+        const ok = await confirmDialog({ title: `학습지 ${i + 1}쪽을 삭제할까요?`, ok: "삭제", danger: true });
+        if (!ok || disposed) return;
+        const list = pages();
+        const k = list.findIndex(x => x.id === p.id);
+        if (k >= 0) list.splice(k, 1);
+        changed();
+      };
+      return el("div", { class: "ws-card" }, [
+        el("div", { class: "ws-thumb" }, thumbOf(p)),
+        el("div", { class: "ws-row" }, [
+          el("span", { class: "ws-no" }, `${i + 1}쪽`),
+          el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "앞으로", title: "앞으로", disabled: i === 0, onClick: () => move(-1) }, icon("chevron-left", 16)),
+          el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "뒤로", title: "뒤로", disabled: i === n - 1, onClick: () => move(1) }, icon("chevron-right", 16)),
+          el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "삭제", title: "삭제", onClick: del }, icon("trash", 16)),
+        ]),
+      ]);
+    }
+    function renderGrid() {
+      const list = pages();
+      if (!list.length) {
+        grid.replaceChildren(el("div", { class: "empty ws-empty", style: { gridColumn: "1 / -1" } }, "아직 학습지가 없어요 — PDF나 이미지를 올려 보세요"));
+        return;
+      }
+      grid.replaceChildren(...list.map((p, i) => card(p, i, list.length)));
+    }
+    fileIn2.addEventListener("change", async () => {
+      const files = [...(fileIn2.files || [])];
+      fileIn2.value = "";
+      if (!files.length || wsBusy) return;
+      wsBusy = true;
+      addBtn.disabled = true;
+      prog.hidden = false;
+      prog.textContent = "올리는 중…";
+      try {
+        for (const f of files) {
+          const news = await fileToSlides(f, lessonId, (d, t) => { prog.textContent = t > 1 ? `올리는 중 ${d}/${t}` : "올리는 중…"; });
+          const l = L();
+          if (!l) return;
+          if (!Array.isArray(l.worksheet)) l.worksheet = [];
+          // 학습지 쪽은 늘 '개별' 모드의 ink 슬라이드 모양
+          l.worksheet.push(...(news || []).map(s => ({ ...s, mode: "individual", title: null })));
+        }
+        changed();
+      } catch (e) {
+        console.warn("[editor] 학습지 추가 실패", e);
+        toast((e && e.message) || "파일을 불러오지 못했어요", { type: "error" });
+      } finally {
+        wsBusy = false;
+        addBtn.disabled = false;
+        prog.hidden = true;
+      }
+    });
+    renderGrid();
+    return m;
+  }
+
   // ── 불러오기 ──
   function setReady(on) {
     btnStart.disabled = !on || starting.has(lessonId);
     btnAdd.disabled = !on;
     btnFile.disabled = !on || fileBusy;
+    wsBtn.disabled = !on;
   }
   async function load() {
     const l = L();
@@ -1156,6 +1263,7 @@ function buildEditor(lessonId, teacher) {
     setReady(true);
     renderRail();
     select((slides()[0] && slides()[0].id) || null);
+    syncWsBtn();
   }
 
   const onHide = () => saveSoon.flush();
@@ -1231,6 +1339,33 @@ function buildLive(sessionId, teacher) {
 
   // ── 본문: 스테이지 + 드로어 ──
   const stage = el("section", { class: "stage live-stage" });
+  // 학습지: 오른쪽 가장자리 📝 탭 → 스테이지를 학생 필기 갤러리로(슬라이드 호스트는 숨긴 채 유지) · [학생 화면에 띄우기]
+  const wsView = makeWsSessionView();
+  let wsOpen = false, wsIdx = 0, wsHost = null, wsHostPage = null, wsSegN = -1, wsTimer = null, wsForceBusy = false;
+  const wsPrev = el("button", { class: "btn btn-icon btn-ghost btn-sm", type: "button", "aria-label": "이전 쪽", onClick: () => wsGo(wsIdx - 1) }, icon("chevron-left", 18));
+  const wsNext = el("button", { class: "btn btn-icon btn-ghost btn-sm", type: "button", "aria-label": "다음 쪽", onClick: () => wsGo(wsIdx + 1) }, icon("chevron-right", 18));
+  const wsPagesSeg = el("div", { class: "seg ws-pages", role: "group", "aria-label": "학습지 쪽" });
+  const wsCount = el("span", { class: "slide-count", hidden: true });
+  const wsStat = el("span", { class: "ws-stat" });
+  const wsForceBtn = el("button", { class: "btn btn-sm ws-force", type: "button", "aria-pressed": "false", onClick: toggleWsForce });
+  const wsCloseBtn = el("button", { class: "btn btn-sm btn-ghost", type: "button", title: "슬라이드 화면으로", onClick: () => setWsOpen(false) }, [icon("x", 16), "슬라이드로"]);
+  const wsHead = el("div", { class: "ws-head" }, [
+    el("span", { class: "ws-title" }, [el("span", { "aria-hidden": "true" }, "📝"), "학습지"]),
+    wsPrev, wsPagesSeg, wsCount, wsNext, wsStat, el("span", { class: "spacer" }), wsForceBtn, wsCloseBtn,
+  ]);
+  const wsBody = el("div", { class: "ws-body" });
+  const wsStage = el("section", { class: "stage live-stage ws-stage", hidden: true, "aria-label": "학습지" }, [el("div", { class: "ws-view" }, [wsHead, wsBody])]);
+  const wsTabEl = wsTab({ onClick: () => setWsOpen(!wsOpen) });
+  // 드로어 활동 탭 맨 위: 상태 한 줄 + [학생 필기 보기] [학생 화면에 띄우기]
+  const wsPaneStat = el("span", {});
+  const wsPaneForce = el("button", { class: "btn btn-sm ws-force", type: "button", "aria-pressed": "false", onClick: toggleWsForce });
+  const wsPane = el("section", { class: "ws-pane", hidden: true, "aria-label": "학습지" }, [
+    el("div", { class: "ws-pane-head" }, [el("span", { "aria-hidden": "true" }, "📝"), el("b", {}, "학습지"), wsPaneStat]),
+    el("div", { class: "ws-pane-row" }, [
+      el("button", { class: "btn btn-sm", type: "button", onClick: () => setWsOpen(true) }, [icon("eye", 16), "학생 필기 보기"]),
+      wsPaneForce,
+    ]),
+  ]);
   const tabAct = el("button", { type: "button", onClick: () => { userTab = "activity"; renderDrawerTabs(); } }, "활동");
   const tabPeople = el("button", { type: "button", onClick: () => { userTab = "people"; renderDrawerTabs(); } }, "참여");
   const pluginBox = el("div", { class: "t-plugin-panel", hidden: true });
@@ -1246,7 +1381,7 @@ function buildLive(sessionId, teacher) {
         ])),
     ]),
   ]);
-  const actBox = el("div", { class: "t-pane" }, [pluginBox, quickBox]);
+  const actBox = el("div", { class: "t-pane" }, [wsPane, pluginBox, quickBox]);
   const peopleHead = el("div", { class: "muted" });
   const peopleList = el("div", { class: "people" });
   const peopleBox = el("div", { class: "t-pane" }, [peopleHead, peopleList]);
@@ -1257,7 +1392,7 @@ function buildLive(sessionId, teacher) {
     ]),
     el("div", { class: "drawer-body" }, [actBox, peopleBox]),
   ]);
-  const root = el("div", { class: "live" }, [top, el("div", { class: "live-body" }, [stage, drawer])]);
+  const root = el("div", { class: "live" }, [top, el("div", { class: "live-body" }, [stage, wsStage, drawer, wsTabEl])]);
   mount(root);
 
   // ── 동기화 ──
@@ -1362,6 +1497,103 @@ function buildLive(sessionId, teacher) {
         groupOf.has(id) ? el("span", { class: "pill pill-muted" }, groupOf.get(id)) : null,
       ]);
     }));
+  }
+
+  // ── 학습지 ──
+  function wsStudentIds(s) { return [...new Set([...(s.participants || []), ...onlineSet()])]; }
+  function destroyWsHost() {
+    if (wsHost) { try { wsHost.destroy(); } catch (e) { console.warn("[live] 학습지 host destroy", e); } }
+    wsHost = null; wsHostPage = null;
+    wsBody.replaceChildren();
+  }
+  function setWsOpen(on) {
+    on = !!on && wsPages(S()).length > 0;
+    if (on === wsOpen) return;
+    wsOpen = on;
+    closePop();
+    stage.hidden = on;
+    wsStage.hidden = !on;
+    if (!on) destroyWsHost();
+    syncWs();
+  }
+  function wsGo(i) {
+    const n = wsPages(S()).length;
+    if (!n) return;
+    i = Math.max(0, Math.min(n - 1, i));
+    if (i === wsIdx) return;
+    wsIdx = i;
+    syncWs();
+  }
+  async function toggleWsForce() {
+    const s = S();
+    if (!s || wsForceBusy) return;
+    wsForceBusy = true;
+    const on = !wsForced(s);
+    try {
+      const r = await setWsForce(s, on);
+      if (r && r.error) toast("저장하지 못했어요", { type: "error" });
+      else toast(on ? "모든 학생 화면에 학습지를 띄웠어요" : "학생이 학습지를 닫을 수 있어요");
+    } finally { wsForceBusy = false; }
+  }
+  // 쪽 버튼(12쪽까지: 번호 + 그 쪽을 지금 쓰는 인원 배지, 더 많으면 n / N)
+  function buildWsSeg(n) {
+    wsSegN = n;
+    const many = n > 12;
+    wsPagesSeg.hidden = many;
+    wsCount.hidden = !many;
+    wsPagesSeg.replaceChildren(...(many ? [] : Array.from({ length: n }, (_, i) => el("button", {
+      type: "button", title: `${i + 1}쪽`, onClick: () => wsGo(i),
+    }, [String(i + 1), el("i", { class: "ws-dot", hidden: true })]))));
+  }
+  function syncWs() {
+    if (disposed) return;
+    const s = S();
+    if (!s) return;
+    const pages = wsPages(s);
+    const n = pages.length;
+    if (!n) {
+      wsPane.hidden = true;
+      wsTabEl.set({ hidden: true });
+      if (wsOpen) setWsOpen(false);
+      return;
+    }
+    const st = wsStats(s, wsStudentIds(s));
+    const forced = wsForced(s);
+    wsPane.hidden = false;
+    wsTabEl.set({ hidden: false, open: wsOpen, forced, badge: st.writing, label: wsOpen ? "슬라이드" : "학습지" });
+    const statTxt = `작성 중 ${st.writing} · 작성함 ${st.written}/${st.total}`;
+    wsPaneStat.textContent = `${n}쪽 · ${statTxt}`;
+    for (const b of [wsForceBtn, wsPaneForce]) {
+      if (b.getAttribute("aria-pressed") !== String(forced) || !b.firstChild) {
+        b.setAttribute("aria-pressed", String(forced));
+        b.replaceChildren(icon(forced ? "lock" : "unlock", 16), forced ? "학생 화면에 띄움" : "학생 화면에 띄우기");
+        b.title = forced ? "학생 화면이 학습지로 고정돼요 · 누르면 풀기(학생이 닫을 수 있음)" : "모든 학생 화면을 학습지로 바꿔요(쪽은 학생이 자유롭게)";
+      }
+    }
+    if (!wsOpen) return;
+    wsIdx = Math.max(0, Math.min(n - 1, wsIdx));
+    if (wsSegN !== n) buildWsSeg(n);
+    if (n > 12) wsCount.textContent = `${wsIdx + 1} / ${n}`;
+    else wsPagesSeg.querySelectorAll("button").forEach((b, i) => {
+      b.classList.toggle("active", i === wsIdx);
+      b.setAttribute("aria-pressed", String(i === wsIdx));
+      const dot = b.querySelector(".ws-dot");
+      const w = st.perPage[i] ? st.perPage[i].writing : 0;
+      if (dot) { dot.hidden = !w; if (w && dot.textContent !== String(w)) dot.textContent = String(w); }
+    });
+    wsPrev.disabled = wsIdx <= 0;
+    wsNext.disabled = wsIdx >= n - 1;
+    wsStat.textContent = statTxt;
+    const page = pages[wsIdx];
+    if (wsHost && wsHostPage === page.id) { wsHost.update({ slide: page, session: s }); return; }
+    destroyWsHost();
+    wsHostPage = page.id;
+    try { wsHost = mountSlideHost({ role: "teacher", root: wsBody, slide: page, session: s, me: teacher, sessionView: wsView }); }
+    catch (e) {
+      console.error("[live] 학습지 표시 실패", e);
+      wsHost = null;
+      wsBody.replaceChildren(el("div", { class: "empty" }, "학습지를 불러오지 못했어요"));
+    }
   }
 
   // ── 이동 · 모드 · 흐름 · 종료 ──
@@ -1498,14 +1730,18 @@ function buildLive(sessionId, teacher) {
   const onKey = (e) => {
     if (disposed || e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || e.isComposing) return;
     if (isTypingTarget(e.target)) return;
-    if (e.key === "ArrowLeft") { e.preventDefault(); step(-1); }
-    else if (e.key === "ArrowRight") { e.preventDefault(); step(1); }
+    // 학습지 화면이 열려 있으면 ←/→는 학습지 쪽(보고 있는 것을 넘긴다)
+    if (e.key === "ArrowLeft") { e.preventDefault(); if (wsOpen) wsGo(wsIdx - 1); else step(-1); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); if (wsOpen) wsGo(wsIdx + 1); else step(1); }
     else if (e.code === "KeyF" || e.key === "f" || e.key === "F") { e.preventDefault(); toggleFullscreen(); }
-    else if (e.key === "Escape") closePop();
+    else if (e.key === "Escape") {
+      if (openPop) closePop();
+      else if (wsOpen && !document.documentElement.classList.contains("has-layer")) setWsOpen(false);
+    }
   };
   document.addEventListener("keydown", onKey);
 
-  const offPres = ch.onPresence(() => { if (disposed) return; syncOnline(); syncPeople(); });
+  const offPres = ch.onPresence(() => { if (disposed) return; syncOnline(); syncPeople(); syncWs(); });
   const offStore = store.subscribe(() => {
     if (disposed) return;
     const s = S();
@@ -1518,6 +1754,7 @@ function buildLive(sessionId, teacher) {
     syncHost();
     syncTop();
     syncPeople();
+    syncWs();
   });
 
   setDrawer(drawerOpen);
@@ -1525,13 +1762,18 @@ function buildLive(sessionId, teacher) {
   syncHost();
   syncOnline();
   syncPeople();
+  syncWs();
+  // '작성 중'(최근 20초)은 시간이 지나면 저절로 풀리므로 주기적으로 배지만 다시 셈
+  wsTimer = setInterval(() => { if (!disposed && wsPages(S()).length) syncWs(); }, 5000);
 
   return () => {
     disposed = true;
+    clearInterval(wsTimer);
     document.removeEventListener("keydown", onKey);
     offStore();
     try { offPres(); } catch (_) {}
     closePop();
+    destroyWsHost();
     if (host) { try { host.destroy(); } catch (e) { console.warn(e); } host = null; }
     try { unsub(); } catch (_) {}
     try { ch.leave(); } catch (_) {}
@@ -1583,13 +1825,14 @@ function summaryEl(session, slide, responses, ctx) {
   return el("div", { class: "muted" }, "기록이 없어요");
 }
 
-function slideSection(slide, i, body) {
+// tag: 타입 라벨 대신 보여 줄 표지(학습지 쪽은 '학습지')
+function slideSection(slide, i, body, tag = null) {
   const def = getSlideType(slide.type);
   return el("section", { class: "card print-slide" }, [
     el("div", { class: "t-sum-head" }, [
       el("span", { class: "t-sum-num" }, String(i + 1)),
       el("h3", {}, slideLabel(slide)),
-      el("span", { class: "pill pill-muted" }, def.label),
+      el("span", { class: "pill " + (tag ? "pill-accent" : "pill-muted") }, tag || def.label),
     ]),
     body,
   ]);
@@ -1708,6 +1951,7 @@ export function sessionDetailView({ id } = {}) {
         el("span", {}, dateRange(s)),
         el("span", {}, `참여 ${parts.length}명`),
         el("span", {}, `슬라이드 ${slides.length}장`),
+        wsPages(s).length ? el("span", {}, `학습지 ${wsPages(s).length}쪽`) : null,
         el("button", { class: "btn btn-sm t-review-btn no-print", type: "button", title: "복습 코드 · QR", onClick: () => openReviewModal(id, teacher) },
           [icon("qr", 16), "복습 ", reviewTxt]),
       ]);
@@ -1735,9 +1979,13 @@ export function sessionDetailView({ id } = {}) {
       if (!s) return;
       const slides = s.slidesSnapshot || [];
       if (!slides.length) { content.replaceChildren(el("div", { class: "empty empty-box" }, "슬라이드가 없어요")); return; }
+      // 학습지 쪽은 슬라이드 뒤에 이어서(개별 필기 갤러리 / 그 학생 필기)
+      const ws = wsPages(s).map((p, i) => ({ ...p, title: wsPageTitle(p, i), mode: "individual" }));
       if (mode === "slides") {
-        content.replaceChildren(...slides.map((sl, i) => slideSection(sl, i,
-          summaryEl(s, sl, (s.responses || {})[sl.id] || [], recordCtx(s, teacher, sl, timers)))));
+        content.replaceChildren(
+          ...slides.map((sl, i) => slideSection(sl, i, summaryEl(s, sl, (s.responses || {})[sl.id] || [], recordCtx(s, teacher, sl, timers)))),
+          ...ws.map((p, i) => slideSection(p, slides.length + i, summaryEl(s, p, [], recordCtx(s, teacher, p, timers)), "학습지")),
+        );
         return;
       }
       // 학생별
@@ -1764,7 +2012,8 @@ export function sessionDetailView({ id } = {}) {
         }
         return slideSection(sl, i, body);
       });
-      content.replaceChildren(chips, el("h2", { class: "t-print-only" }, st ? studentLabel(st) : "학생"), ...sections);
+      const wsSections = ws.map((p, i) => slideSection(p, slides.length + i, inkFor(s, p, picked), "학습지"));
+      content.replaceChildren(chips, el("h2", { class: "t-print-only" }, st ? studentLabel(st) : "학생"), ...sections, ...wsSections);
     }
 
     // 학생 한 명의 필기(읽기 전용)

@@ -52,7 +52,8 @@
 teacher  = { id, name, passwordHash, joinCode }
 student  = { id, grade, classNum, num, name }
 lesson   = { id, teacherId, title, createdAt, updatedAt, slideCount, cover /*첫 슬라이드 썸네일 URL|null*/,
-             slides: Slide[] | null /* null = 아직 안 불러옴 */ }
+             slides: Slide[] | null /* null = 아직 안 불러옴 */,
+             worksheet: Slide[] | null /* 학습지 쪽(ink 모양, mode 'individual', §9.5). null = 아직 안 불러옴 → 저장 때 건드리지 않음 */ }
 Slide    = { id, type /*'ink'|'mcq'|…*/, title /*string|null*/, config /*object, 타입별*/,
              // ink 전용(다른 타입은 생략 가능):
              bg /*URL|null*/, bgPath /*storage path|null*/, thumb /*URL|null*/, mode /*'none'|'whole'|'individual'|'group'*/,
@@ -62,6 +63,7 @@ session  = { id, lessonId, teacherId, title, status /*'live'|'stopped'|'complete
              reviewCode /*6자리 복습 코드|undefined — 학습지 QR, §9.4*/,
              activity: { [slideId]: ActivityState }, startedAt, endedAt,
              participants: studentId[], slidesSnapshot: Slide[],
+             worksheet: Slide[] /* 학습지 스냅샷(시작 때 lesson.worksheet 복사, 불변). 학생 필기는 records[studentId][pageId] */,
              records: { __whole: { [slideId]: Rec }, __groups: { [groupId]: { [slideId]: Rec } }, [studentId]: { [slideId]: Rec } },
              responses: { [slideId]: Response[] } }
 Rec      = { strokes: Stroke[], texts: Text[], removed: string[] /* 지운 stroke id (whole/group 병합용 tombstone) */ }
@@ -90,7 +92,9 @@ slides(id pk, lesson_id fk cascade, position, type default 'ink', title, config 
 sessions(id pk, lesson_id fk, teacher_id fk, title, status, flow, current_slide, groups jsonb, activity jsonb, rev bigint default 0,
          slides_snapshot jsonb /*레거시: v2는 '[]'*/, started_at, ended_at, last_writer,
          review_code text unique /*004: 수업별 복습 코드, NULL 허용 — SESSION_COLS에 넣지 않고 따로 읽고 씀*/)
-session_snapshots(session_id pk fk cascade, slides jsonb)          -- realtime 미발행
+session_snapshots(session_id pk fk cascade, slides jsonb, worksheet jsonb default '[]' /*005: 학습지 스냅샷*/)   -- realtime 미발행
+worksheet_pages(id pk, lesson_id fk cascade, position, title, bg_url, bg_path, thumb_url, base_strokes jsonb, base_texts jsonb,   -- 005: 수업 자료별 학습지
+                unique(lesson_id, position) DEFERRABLE INITIALLY DEFERRED)   -- 없는 DB면 앱이 학습지 기능만 조용히 건너뜀(cloud.js wsTableMissing/snapHasWs)
 session_participants(session_id, student_id, joined_at, pk(session_id, student_id))
 slide_records(id, session_id fk cascade, slide_id, scope, scope_id NOT NULL /* whole → session_id */, strokes jsonb, texts jsonb, removed jsonb default '[]',
               last_writer, updated_at, unique(session_id, slide_id, scope, scope_id))
@@ -124,6 +128,7 @@ js/realtime.js          [A]  세션 채널: broadcast + presence (§5.4)
 js/canvas.js            [I]  InkCanvas: stroke id, undo, destroy, 소수 4자리
 js/lesson-view.js       [I]  renderSlide: 병합(tombstone), 디바운스 저장, dispose
 js/zoom-view.js         [I]  필기 화면 확대·이동(핀치·휠·버튼), 내용 영역 맞춤 — renderSlide({ zoom:true })
+js/worksheet.js         [B/C] 학습지 공용(§9.5): wsPages·wsForced·setWsForce·wsStats(작성 중/작성함)·makeWsSessionView(개별 모드 Proxy)·wsTab(📝 탭)·CSS
 js/slides/registry.js   [H]  레지스트리 + 헬퍼(effectiveMode, parseYouTubeId, groupStudents, fmtMs, shuffle, escapeHtml, newId)
 js/slides/common.js     [H]  플러그인 공용 UI: activityBar, choiceBars, countdownPill, loadYouTubeApi, normalizeAnswer, optionLetter
 js/slides/host.js       [H]  mountSlideHost + ctx (§6.2)
@@ -528,6 +533,17 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 - 학생: QR `/r/CODE` 또는 로그인 코드 칸에 입력 → 교사 코드 먼저 조회, 없으면 복습 코드 → 학생 등록 → 수업이 live면 `/student/live/:id`, 아니면 `/student/review/:id`. lastCode(대기 화면용 교사 코드)는 이전 값을 유지하고 없을 때만 그 수업 교사 코드로.
 - 복습 화면: 상단 바 제목 · `복습` pill · (수업에서 정답을 공개한 mcq·blank·dragdrop·short만) `[정답 보기]↔[다시 풀기]` · `◀ n/N ▶` · `나가기`(→ 내 기록). 마지막 슬라이드 위치는 기기에 `hada:review:<세션>:<학생>`. 실시간 구독 없음, 참여자 등록은 함(수업에 없던 학생도 교사 기록에 보임).
 - 보기(`sessionView` Proxy): flow `student`, ink는 모두 `mode:'individual'`(내 칸에 저장) + 수업 때 전체·모둠 칠판 필기를 바닥 그림으로 합친 슬라이드(removed 반영, 스냅샷 불변). 응답형은 `phase:'idle', reveal:false, autoRevealed:true`(혼자라 '전원 응답 자동 공개' 끔) → 이전 답이 채워진 채로 다시 제출(같은 행 upsert, 교사 기록에도 반영). `[정답 보기]` = `phase:'ended', reveal:true`. 게임(dino·race)은 `phase:'ended'`(결과만).
+
+### 9.5 학습지 (v2.6)
+- **무엇**: 수업 자료에 미리 올려 둔 PDF·이미지 쪽(`lesson.worksheet`, DB `worksheet_pages`). 슬라이드 진행과 별개로 학생이 수업 중 언제든 열어 **각자** 필기한다. 쪽은 ink 슬라이드 모양(`mode:'individual'`), 필기는 기존 `slide_records`(slide_id = 쪽 id, scope individual)에 저장 → 실시간·병합·기록·인쇄가 그대로 동작.
+- **편집기**: 상단 `[📝 학습지 n]` → 창: 쪽 썸네일 격자(앞으로·뒤로·삭제) + `[PDF·이미지 추가]`(여러 파일, `fileToSlides` → mode individual). 변경은 slides와 같은 300ms 디바운스 `cloudSaveLesson`(④ worksheet_pages 삭제→upsert, `lesson.worksheet===null`이면 건드리지 않음). 복제 시 함께 복사.
+- **세션**: 시작 때 `session.worksheet` 스냅샷(`session_snapshots.worksheet`, 불변). `cloudFetchSession`은 `slides,worksheet`를 읽고 열이 없는 DB면 `slides`만(`snapHasWs`). 수업 중 슬라이드 끼워 넣기는 `slides`만 upsert하므로 학습지는 보존.
+- **교사 `/live/:id`**: 학습지가 있으면 스테이지 오른쪽 가장자리 **📝 탭**(배지 = 지금 쓰는 학생 수, 5초마다 다시 셈). 탭 → 슬라이드 호스트는 숨긴 채(상태 유지) 스테이지를 **학습지 화면**으로: 머리 줄 `📝 학습지 · [1][2][3](쪽 버튼, 쪽마다 작성 중 배지; 13쪽 이상은 ◀ n/N ▶) · 작성 중 n · 작성함 m/전체 · [학생 화면에 띄우기] · [슬라이드로]` + 본문 = `mountSlideHost({ role:'teacher', sessionView: makeWsSessionView() })` → ink `TeacherLive` **개별 갤러리** 재사용(필기 부분/전체 보기, 칸 탭 → 크게 보기·첨삭). 열려 있을 때 ←/→는 학습지 쪽, Esc는 닫기. 드로어 활동 탭 맨 위에도 `학습지 n쪽 · 작성 중 · 작성함 [학생 필기 보기] [학생 화면에 띄우기]`.
+- **띄우기(강제 배정)**: `activity.__ws = { force:boolean, at }`(`__snap`처럼 예약 키, `patchSession`으로 broadcast+DB). 켜면 모든 학생 화면이 학습지로 바뀌고 닫기 버튼이 잠긴다(쪽 이동은 자유). 끄면 학생 화면은 열린 채 남고 탭으로 닫을 수 있다.
+- **학생 `/student/live/:id`**: 학습지가 있으면 오른쪽 가장자리 📝 탭. 탭 → 슬라이드 스테이지 숨김(호스트 유지, 비디오 등 상태 보존) + 학습지 스테이지(머리 줄 `📝 학습지 · ◀ n/N ▶`, 본문 = ink `Student` 개별 모드: 도구바·확대). 탭을 다시 누르면 닫고 슬라이드로. 띄워진 동안은 탭이 잠금 표시(누르면 toast). `activity.__ws.force`가 켜지는 순간 자동으로 열리고 toast. 쪽 기억 `sessionStorage hada:ws:<세션>`. ←/→는 학습지가 열려 있으면 쪽 이동.
+- **'작성 중'/'작성함'**(`wsStats`): 학생마다 모든 쪽의 자기 획·글자(by = 학생, 지운 것 제외) 중 가장 늦은 ts. 20초 안이면 작성 중, 하나라도 있으면 작성함. 서버 왕복 없이 records만으로 계산(broadcast 없음).
+- **기록·복습·인쇄**: 기록 상세(슬라이드별·학생별)와 학생 '내 기록'은 슬라이드 뒤에 `학습지 n` 섹션을 이어 붙인다(태그 pill '학습지'). 복습 화면도 뒤에 이어서(내 개별 칸에 계속 필기). 학생 인쇄·빈 학습지 인쇄의 선택 격자에 학습지 쪽이 '학습지 · n쪽'으로 함께 나온다.
+- **005 전 DB**: `worksheet_pages`가 없으면 `wsTableMissing` → 학습지 조회·저장을 건너뛰고 편집기 창은 '학습지를 불러오지 못했어요'. `session_snapshots.worksheet`가 없으면 세션 시작·조회가 `slides`만으로 동작.
 
 ### 9.3 실시간 규칙 요약
 - 교사 변경 → broadcast 선반영(즉시) + DB 디바운스 확정. 수신은 rev 비교.

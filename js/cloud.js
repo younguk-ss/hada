@@ -106,6 +106,7 @@ const SLIDE_COLS = "id,lesson_id,position,type,title,config,bg_url,bg_path,thumb
 const SESSION_COLS = "id,lesson_id,teacher_id,title,status,flow,current_slide,groups,activity,rev,started_at,ended_at";
 const RECORD_COLS = "id,session_id,slide_id,scope,scope_id,strokes,texts,removed,last_writer,updated_at";
 const RESPONSE_COLS = "id,session_id,slide_id,student_id,item_key,payload,score,correct,time_ms,updated_at";
+const WS_COLS = "id,lesson_id,position,title,bg_url,bg_path,thumb_url,base_strokes,base_texts"; // 학습지 페이지(005)
 
 function toTeacher(r, withHash = true) {
   const t = { id: r.id, name: r.name, joinCode: r.join_code || null };
@@ -149,6 +150,47 @@ function normSlide(s) {
   if (o.type === "ink") { o.strokes ||= []; o.texts ||= []; o.mode ||= "none"; o.bg ??= null; o.thumb ??= null; }
   return o;
 }
+// ── 학습지 페이지(worksheet_pages, 005) ↔ ink 슬라이드 모양 객체. 모드는 늘 '개별' ──
+// 가정: 005 마이그레이션 전 DB에서도 앱이 죽지 않게 — 테이블/열이 없으면 플래그를 세우고 학습지 기능만 조용히 건너뛴다.
+let wsTableMissing = false; // worksheet_pages 테이블 없음
+let snapHasWs = true;       // session_snapshots.worksheet 열 있음
+const isMissingRel = (e) => !!e && (e.code === "42P01" || e.code === "PGRST205" || /relation .* does not exist|could not find the table/i.test(e.message || ""));
+const isMissingCol = (e) => !!e && (e.code === "42703" || e.code === "PGRST204" || /column .* does not exist|could not find the .* column/i.test(e.message || ""));
+function toWsPage(r) {
+  return {
+    id: r.id, type: "ink", title: r.title ?? null, config: {},
+    bg: r.bg_url || null, bgPath: r.bg_path || null, thumb: r.thumb_url || null,
+    mode: "individual", strokes: r.base_strokes || [], texts: r.base_texts || [],
+  };
+}
+function fromWsPage(p, lessonId, i) {
+  return {
+    id: p.id, lesson_id: lessonId, position: i, title: p.title ?? null,
+    bg_url: p.bg || null, bg_path: p.bgPath || null, thumb_url: p.thumb || null,
+    base_strokes: p.strokes || [], base_texts: p.texts || [],
+  };
+}
+// 수업 자료의 학습지 페이지 → Slide[] | null(못 읽음·테이블 없음 — 호출 쪽은 null을 '모름'으로 두고 저장하지 않는다)
+async function fetchWorksheetPages(lessonId) {
+  if (!isCloud || wsTableMissing || !lessonId) return null;
+  const { data, error } = await supa.from("worksheet_pages").select(WS_COLS).eq("lesson_id", lessonId).order("position", { ascending: true });
+  if (error) {
+    if (isMissingRel(error)) wsTableMissing = true;
+    warn("fetchWorksheetPages", error);
+    return null;
+  }
+  return (data || []).map(toWsPage);
+}
+// 세션 스냅샷 행(slides + worksheet). worksheet 열이 없는 DB면 slides만
+async function fetchSnapRow(sessionId) {
+  if (snapHasWs) {
+    const r = await supa.from("session_snapshots").select("slides,worksheet").eq("session_id", sessionId).maybeSingle();
+    if (!r.error || !isMissingCol(r.error)) return r;
+    snapHasWs = false;
+  }
+  return await supa.from("session_snapshots").select("slides").eq("session_id", sessionId).maybeSingle();
+}
+
 function sessionMeta(r) {
   return {
     id: r.id, lessonId: r.lesson_id, teacherId: r.teacher_id, title: r.title,
@@ -464,6 +506,19 @@ function setLessonSlides(lesson, slides) {
 export function cloudFetchLessonSlides(lessonId, onProgress) {
   return fetchLessonSlides(lessonId, onProgress, true);
 }
+// 학습지 페이지가 아직 안 불러와졌으면(lesson.worksheet === null) 읽어서 채움 → Slide[] | null(못 읽음)
+export async function cloudEnsureWorksheet(lessonId) {
+  await ready();
+  const l = findLesson(lessonId);
+  if (!l) return null;
+  if (Array.isArray(l.worksheet)) return l.worksheet;
+  if (!isCloud) { l.worksheet = []; return l.worksheet; }
+  const pages = await fetchWorksheetPages(lessonId);
+  if (!pages) return null;
+  const cur = findLesson(lessonId);
+  if (cur) { cur.worksheet = pages; store.save(); }
+  return pages;
+}
 // persist=false: base64 이전 결과를 slides 행에 쓰지 않음(학생 기기의 스냅샷 대체 조회용)
 async function fetchLessonSlides(lessonId, onProgress, persist) {
   await ready();
@@ -471,6 +526,7 @@ async function fetchLessonSlides(lessonId, onProgress, persist) {
   const report = (d, t) => { try { onProgress && onProgress(d, t); } catch (_) {} };
   if (!isCloud) {
     const slides = (lesson && Array.isArray(lesson.slides)) ? lesson.slides : [];
+    if (lesson && !Array.isArray(lesson.worksheet)) lesson.worksheet = [];
     if (lesson && !Array.isArray(lesson.slides)) { lesson.slides = slides; store.set(s => s); }
     report(slides.length, slides.length);
     return slides;
@@ -496,8 +552,14 @@ async function fetchLessonSlides(lessonId, onProgress, persist) {
   const slides = rows.map(toSlide);
   if (persist) {
     await migrateDataUrls(lessonId, slides, true);
+    // 학습지 페이지도 함께(실패하면 null로 두어 저장이 DB 페이지를 지우지 않게)
+    const pages = await fetchWorksheetPages(lessonId);
     const l = findLesson(lessonId);
-    if (l) { setLessonSlides(l, slides); store.set(s => s); }
+    if (l) {
+      setLessonSlides(l, slides);
+      if (pages) l.worksheet = pages;
+      store.set(s => s);
+    }
   }
   return slides;
 }
@@ -508,6 +570,7 @@ export async function cloudCreateLesson(lesson) {
   lesson.createdAt ||= now;
   lesson.updatedAt = now;
   if (!Array.isArray(lesson.slides)) lesson.slides = [];
+  if (!Array.isArray(lesson.worksheet)) lesson.worksheet = []; // 새 자료: 학습지 없음(복제는 채워서 넘어옴)
   if (!isCloud) {
     setLessonSlides(lesson, lesson.slides);
     store.set(s => { upsertById(s.lessons, lesson); });
@@ -522,6 +585,11 @@ export async function cloudCreateLesson(lesson) {
     if (lesson.slides.length) {
       const { error: e2 } = await supa.from("slides").upsert(lesson.slides.map((s, i) => fromSlide(s, lesson.id, i)), { onConflict: "id" });
       if (e2) throw e2;
+    }
+    if (lesson.worksheet.length && !wsTableMissing) {
+      // 학습지는 자료 생성을 막지 않는다(실패 시 경고만)
+      const { error: e3 } = await supa.from("worksheet_pages").upsert(lesson.worksheet.map((p, i) => fromWsPage(p, lesson.id, i)), { onConflict: "id" });
+      if (e3) { if (isMissingRel(e3)) wsTableMissing = true; warn("createLesson worksheet", e3); }
     }
     setLessonSlides(lesson, lesson.slides);
     const l = findLesson(lesson.id);
@@ -590,6 +658,22 @@ async function saveLessonNow(lesson) {
     const { error: e1 } = await supa.from("slides").upsert(slides.map((s, i) => fromSlide(s, lesson.id, i)), { onConflict: "id" });
     if (e1) { warn("saveLesson slides", e1); return { error: "저장 실패" }; }
   }
+  // ④ 학습지 페이지 — 불러온 적이 있을 때만(null = 모름 → 건드리지 않음). 삭제 → upsert 순서는 slides와 같다
+  const ws = Array.isArray(lesson.worksheet) ? lesson.worksheet : null;
+  if (ws && !wsTableMissing) {
+    if (gone()) return { ok: true, deleted: true };
+    let delW = supa.from("worksheet_pages").delete().eq("lesson_id", lesson.id);
+    if (ws.length) delW = delW.not("id", "in", `(${ws.map(p => `"${p.id}"`).join(",")})`);
+    const { error: e3 } = await delW;
+    if (e3) {
+      if (isMissingRel(e3)) { wsTableMissing = true; return { ok: true }; }
+      warn("saveLesson worksheet delete", e3); return { error: "저장 실패" };
+    }
+    if (ws.length) {
+      const { error: e4 } = await supa.from("worksheet_pages").upsert(ws.map((p, i) => fromWsPage(p, lesson.id, i)), { onConflict: "id" });
+      if (e4) { warn("saveLesson worksheet", e4); return { error: "저장 실패" }; }
+    }
+  }
   return { ok: true };
 }
 
@@ -623,17 +707,24 @@ export async function cloudDuplicateLesson(lessonId) {
   if (!Array.isArray(slides)) {
     try { slides = await cloudFetchLessonSlides(lessonId); } catch (e) { return { error: e.message }; }
   }
+  // 학습지도 함께 복제(아직 안 불러왔으면 읽음, 못 읽으면 없는 것으로)
+  let ws = Array.isArray(src.worksheet) ? src.worksheet : null;
+  if (!ws) {
+    ws = isCloud ? await fetchWorksheetPages(lessonId) : [];
+    if (ws) { const l = findLesson(lessonId); if (l) l.worksheet = ws; }
+  }
   const nid = newId("lesson");
   const copy = structuredClone(slides).map(s => ({ ...s, id: newId("slide") }));
+  const wsCopy = structuredClone(ws || []).map(p => ({ ...p, id: newId("slide") }));
   if (isCloud) {
-    await Promise.all(copy.map(s => upLimit(async () => {
+    await Promise.all([...copy, ...wsCopy].map(s => upLimit(async () => {
       if (!s.bgPath) return;
       const img = await copySlideImage(s.bgPath, nid, s.id);
       if (img) { s.bg = img.url; s.bgPath = img.path; s.thumb = img.thumb; }
       else s.bgPath = null; // 복사 실패 시 URL만 공유(원본 삭제 시 함께 사라질 수 있음)
     })));
   }
-  const lesson = { id: nid, teacherId: src.teacherId, title: `${src.title} (복사본)`, createdAt: Date.now(), updatedAt: Date.now(), slides: copy };
+  const lesson = { id: nid, teacherId: src.teacherId, title: `${src.title} (복사본)`, createdAt: Date.now(), updatedAt: Date.now(), slides: copy, worksheet: wsCopy };
   const r = await cloudCreateLesson(lesson);
   return r;
 }
@@ -653,6 +744,10 @@ export async function cloudStartSession({ lesson, teacher, title }) {
     if (!slides.length) return { error: "슬라이드를 먼저 추가하세요" };
     await migrateDataUrls(lesson.id, slides, true);
     const snapshot = structuredClone(slides).map(normSlide);
+    // 학습지 스냅샷(있으면) — 아직 안 불러왔으면 지금 읽는다. 못 읽으면 학습지 없는 수업으로 시작
+    let ws = Array.isArray(lesson.worksheet) ? lesson.worksheet : null;
+    if (!ws && isCloud) { ws = await fetchWorksheetPages(lesson.id); if (ws) { const l = findLesson(lesson.id); if (l) l.worksheet = ws; } }
+    const wsSnap = structuredClone(ws || []).map(p => ({ ...normSlide(p), mode: "individual" }));
     const teacherId = teacher?.id || lesson.teacherId;
     const now = Date.now();
     // 기존 LIVE 정리
@@ -666,7 +761,7 @@ export async function cloudStartSession({ lesson, teacher, title }) {
     const session = ensureSessionShape({
       id: newId("ses"), lessonId: lesson.id, teacherId, title: (String(title || "").trim() || lesson.title).slice(0, 60),
       status: "live", flow: "teacher", currentSlide: 0, rev: now, groups: [], activity: {},
-      startedAt: now, endedAt: null, participants: [], slidesSnapshot: snapshot,
+      startedAt: now, endedAt: null, participants: [], slidesSnapshot: snapshot, worksheet: wsSnap,
       records: { __whole: {}, __groups: {} }, responses: {}, _full: true,
     });
     if (isCloud) {
@@ -683,8 +778,12 @@ export async function cloudStartSession({ lesson, teacher, title }) {
         try { await supa.from("sessions").delete().eq("id", session.id); } catch (_) {}
         return { error: "수업을 시작하지 못했어요" };
       };
-      const { error: e2 } = await supa.from("session_snapshots").insert({ session_id: session.id, slides: snapshot });
-      if (e2) return await fail("startSession snapshot", e2);
+      let ins = snapHasWs ? await supa.from("session_snapshots").insert({ session_id: session.id, slides: snapshot, worksheet: wsSnap }) : null;
+      if (!ins || (ins.error && isMissingCol(ins.error))) {
+        snapHasWs = false; // worksheet 열이 없는 DB(005 전) → 슬라이드만
+        ins = await supa.from("session_snapshots").insert({ session_id: session.id, slides: snapshot });
+      }
+      if (ins.error) return await fail("startSession snapshot", ins.error);
       const { error: e3 } = await supa.from("sessions").update({ status: "live", rev: now, last_writer: CLIENT_ID }).eq("id", session.id);
       if (e3) return await fail("startSession live", e3);
     }
@@ -746,11 +845,11 @@ export async function cloudFetchSession(sessionId, { forStudentId } = {}) {
     const ex = findSession(sessionId);
     // 수업 중 슬라이드 추가로 스냅샷 버전(activity.__snap)이 바뀌었으면 다시 읽는다
     const verChanged = !!ex && snapVerOf(meta.activity) !== (ex._snapVer || 0);
-    const needSnap = !ex || !(ex.slidesSnapshot && ex.slidesSnapshot.length) || snapFallback.has(sessionId) || verChanged;
+    const needSnap = !ex || !(ex.slidesSnapshot && ex.slidesSnapshot.length) || !Array.isArray(ex.worksheet) || snapFallback.has(sessionId) || verChanged;
     // 학생이면 내 scope만
     const scopeIds = forStudentId ? [forStudentId, sessionId, myGroupId(meta, forStudentId)].filter(Boolean) : null;
     const [snapR, parts, recs, resps] = await Promise.all([
-      needSnap ? supa.from("session_snapshots").select("slides").eq("session_id", sessionId).maybeSingle() : Promise.resolve({ data: null }),
+      needSnap ? fetchSnapRow(sessionId) : Promise.resolve({ data: null }),
       fetchAll(() => supa.from("session_participants").select(`student_id,joined_at,students(${STUDENT_COLS})`)
         .eq("session_id", sessionId).order("student_id")),
       fetchAll(() => {
@@ -761,15 +860,18 @@ export async function cloudFetchSession(sessionId, { forStudentId } = {}) {
       fetchAll(() => supa.from("responses").select(RESPONSE_COLS).eq("session_id", sessionId).order("id")),
     ]);
     // 스냅샷: session_snapshots → 레거시 slides_snapshot → lesson slides
-    let snapshot = null, fromFallback = false;
+    let snapshot = null, fromFallback = false, snapRow = null;
     if (needSnap) {
       if (snapR.error) warn("fetch snapshot", snapR.error);
       const snapOf = r => (r && r.data && Array.isArray(r.data.slides) ? r.data.slides : []);
+      snapRow = snapR && snapR.data ? snapR.data : null;
       snapshot = snapOf(snapR);
       // 막 시작한 세션: 스냅샷 insert가 아직 안 끝났을 수 있음 → 잠깐 다시 읽기
       for (let i = 0; !snapshot.length && meta.startedAt && Date.now() - meta.startedAt < 15000 && i < 3; i++) {
         await new Promise(r => setTimeout(r, 500));
-        snapshot = snapOf(await supa.from("session_snapshots").select("slides").eq("session_id", sessionId).maybeSingle());
+        const r2 = await fetchSnapRow(sessionId);
+        if (r2 && r2.data) snapRow = r2.data;
+        snapshot = snapOf(r2);
       }
       if (!snapshot.length) {
         const { data: legacy } = await supa.from("sessions").select("slides_snapshot").eq("id", sessionId).maybeSingle();
@@ -792,6 +894,10 @@ export async function cloudFetchSession(sessionId, { forStudentId } = {}) {
       setSnapVer(s, snapVerOf(meta.activity)); // 행을 먼저 읽고 스냅샷을 읽었으므로 스냅샷은 이 버전 이상
       // 대체 스냅샷이면 다음 조회 때 진짜 스냅샷을 다시 시도
       if (fromFallback) snapFallback.add(sessionId); else snapFallback.delete(sessionId);
+    }
+    // 학습지 스냅샷: 행을 읽었을 때(또는 아직 없을 때)만 — 읽기 실패로 있던 학습지를 비우지 않게
+    if (needSnap && (snapRow || !Array.isArray(s.worksheet))) {
+      s.worksheet = (snapRow && Array.isArray(snapRow.worksheet) ? snapRow.worksheet : []).map(p => ({ ...normSlide(p), mode: "individual" }));
     }
     addStudentsToStore(parts.map(p => p.students).filter(Boolean));
     // 조회 중 realtime으로 들어온 참여자를 잃지 않게 합집합(참여자 삭제는 앱에서 하지 않음)

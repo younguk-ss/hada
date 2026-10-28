@@ -14,7 +14,10 @@
 //       수업 화면이 '끝남'을 본 세션은 sessionStorage 'hada:ended'에 {id, rev}로 기억하고, 대기 화면은
 //       store가 그 세션을 live 아님 + 더 높은 rev로 들고 있거나 기억된 rev 이하인 live 알림을 무시한다(대기↔수업 왕복 루프 방지).
 //       watchTeacherLive는 같은 id를 한 번만 알리므로, 무시한 뒤에는 15초 뒤 감시를 다시 시작해(재개된 수업은 rev가 올라감) 다시 확인한다.
-import { el, mount, icon, fmtDate } from "./ui.js";
+// 가정: 학습지(js/worksheet.js) — 수업에 학습지가 있으면 오른쪽 가장자리 📝 탭. 누르면 슬라이드 스테이지를 숨기고(호스트는 유지) 학습지 스테이지를
+//       보인다(내 개별 칸에 필기, 쪽은 ◀ ▶·←/→). 선생님이 띄우면(activity.__ws.force) 자동으로 열리고 닫을 수 없다(쪽 이동은 자유).
+//       띄우기를 풀어도 열린 채 두고, 탭을 다시 눌러 닫는다. 마지막 쪽은 sessionStorage 'hada:ws:<세션>'.
+import { el, mount, icon, fmtDate, toast } from "./ui.js";
 import { store, findSession, findStudent, studentLabel, normCode } from "./store.js";
 import { go } from "./router.js";
 import {
@@ -25,6 +28,7 @@ import { joinSessionChannel } from "./realtime.js";
 import { mountSlideHost } from "./slides/host.js";
 import { getSlideType, effectiveMode, injectCss } from "./slides/registry.js";
 import { renderSlide } from "./lesson-view.js";
+import { wsPages, wsForced, wsPageTitle, makeWsSessionView, wsTab } from "./worksheet.js";
 
 const CSS = `
 .stu-page { min-height:100vh; min-height:100dvh; max-width:760px; margin:0 auto; display:grid; gap:16px; align-content:start;
@@ -52,6 +56,7 @@ const LEFT_KEY = "hada:left";
 const ENDED_KEY = "hada:ended";
 const ENDED_TTL = 3 * 60 * 60 * 1000; // 끝난 수업 기억 시간(새로고침 대비)
 const RECHECK_MS = 15000;
+const WS_POS = "hada:ws:"; // + sessionId → 마지막으로 본 학습지 쪽
 
 function css() { injectCss("student-view", CSS); }
 function ssGet(k) { try { return sessionStorage.getItem(k); } catch { return null; } }
@@ -226,7 +231,23 @@ export function studentLiveView({ id } = {}) {
     exitBtn,
   ]);
   const stage = el("div", { class: "stu-stage" }, [el("div", { class: "center" }, el("span", { class: "spinner", "aria-label": "불러오는 중" }))]);
-  const root = el("div", { class: "stu" }, [top, stage]);
+  // 학습지: 오른쪽 📝 탭으로 열고 닫음(선생님이 띄운 동안은 닫기 불가), 쪽은 자유롭게
+  const wsView = makeWsSessionView();
+  let wsOpen = false, wsIdx = parseInt(ssGet(WS_POS + id) || "0", 10) || 0, wsHost = null, wsHostPage = null, lastForced = false;
+  const wsPrev = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "이전 쪽", onClick: () => wsGo(-1) }, icon("chevron-left"));
+  const wsNext = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "다음 쪽", onClick: () => wsGo(1) }, icon("chevron-right"));
+  const wsCount = el("span", { class: "slide-count" }, "");
+  const wsBody = el("div", { class: "ws-body" });
+  const wsStage = el("div", { class: "stu-stage ws-stage", hidden: true, "aria-label": "학습지" }, [el("div", { class: "ws-view" }, [
+    el("div", { class: "ws-head" }, [
+      el("span", { class: "ws-title" }, [el("span", { "aria-hidden": "true" }, "📝"), "학습지"]),
+      el("span", { class: "spacer" }),
+      el("div", { class: "slide-nav" }, [wsPrev, wsCount, wsNext]),
+    ]),
+    wsBody,
+  ])]);
+  const wsTabEl = wsTab({ onClick: toggleWs });
+  const root = el("div", { class: "stu" }, [top, stage, wsStage, wsTabEl]);
   mount(root);
 
   function setText(node, key, text) {
@@ -238,6 +259,62 @@ export function studentLiveView({ id } = {}) {
   function destroyHost() {
     if (host) { try { host.destroy(); } catch (e) { console.warn("[student] host.destroy", e); } }
     host = null;
+  }
+
+  // ── 학습지 ──
+  function destroyWsHost() {
+    if (wsHost) { try { wsHost.destroy(); } catch (e) { console.warn("[student] 학습지 host.destroy", e); } }
+    wsHost = null; wsHostPage = null;
+    wsBody.replaceChildren();
+  }
+  function toggleWs() {
+    const s = findSession(id);
+    if (!s || !wsPages(s).length) return;
+    if (wsForced(s)) { toast("선생님이 학습지를 띄운 동안에는 닫을 수 없어요"); return; }
+    wsOpen = !wsOpen;
+    render();
+  }
+  function wsGo(d) {
+    const s = findSession(id);
+    const n = wsPages(s).length;
+    if (!n) return;
+    const next = clamp(wsIdx + d, 0, n - 1);
+    if (next === wsIdx) return;
+    wsIdx = next;
+    ssSet(WS_POS + id, String(wsIdx));
+    render();
+  }
+  // 학습지 스테이지 동기화. 열려 있으면 슬라이드 스테이지는 숨김(호스트는 그대로 두어 상태 유지)
+  function syncWs(s) {
+    const pages = wsPages(s);
+    const forced = wsForced(s);
+    if (!pages.length) {
+      wsTabEl.set({ hidden: true });
+      if (!wsStage.hidden) { wsStage.hidden = true; stage.hidden = false; }
+      destroyWsHost();
+      lastForced = false;
+      return;
+    }
+    if (forced && !lastForced) { if (!wsOpen) toast("선생님이 학습지를 띄웠어요"); wsOpen = true; }
+    lastForced = forced;
+    const open = wsOpen;
+    wsTabEl.set({ hidden: false, open, forced, label: open && !forced ? "슬라이드" : "학습지" });
+    if (stage.hidden !== open) stage.hidden = open;
+    if (wsStage.hidden !== !open) wsStage.hidden = !open;
+    if (!open) { destroyWsHost(); return; }
+    wsIdx = clamp(wsIdx, 0, pages.length - 1);
+    setText(wsCount, "ws", `${wsIdx + 1} / ${pages.length}`);
+    wsPrev.disabled = wsIdx <= 0;
+    wsNext.disabled = wsIdx >= pages.length - 1;
+    const page = pages[wsIdx];
+    if (wsHost && wsHostPage === page.id) { wsHost.update({ slide: page, session: s }); return; }
+    destroyWsHost();
+    wsHostPage = page.id;
+    mounting = true;
+    try { wsHost = mountSlideHost({ role: "student", root: wsBody, slide: page, session: s, me, sessionView: wsView }); }
+    catch (e) { console.error("[student] 학습지 표시 실패", e); wsHost = null; }
+    finally { mounting = false; }
+    if (!wsHost) wsBody.replaceChildren(el("div", { class: "empty" }, "학습지를 불러오지 못했어요"));
   }
 
   function showMsg(text) {
@@ -286,6 +363,7 @@ export function studentLiveView({ id } = {}) {
     const n = slides.length;
     if (!n) {
       updateBar(s, null, 0, 0);
+      syncWs(s);
       showMsg("수업 자료를 불러오는 중이에요");
       if (!retried) {
         retried = true;
@@ -310,6 +388,7 @@ export function studentLiveView({ id } = {}) {
     if (s.flow === "student") localIdx = idx;
     const slide = slides[idx];
     updateBar(s, slide, idx, n);
+    syncWs(s);
     if (!slide) { showMsg("수업 자료를 불러오는 중이에요"); return; }
     // host는 유지: 같은 슬라이드면 훅만, 다른 슬라이드면 host가 내부에서 재마운트
     if (host) { host.update({ slide, session: s }); return; }
@@ -351,6 +430,8 @@ export function studentLiveView({ id } = {}) {
     if (document.documentElement.classList.contains("has-layer")) return;
     const t = e.target;
     if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    // 학습지가 열려 있으면 ←/→는 학습지 쪽
+    if (!wsStage.hidden) { e.preventDefault(); wsGo(e.key === "ArrowLeft" ? -1 : 1); return; }
     const s = findSession(id);
     if (!s || s.flow !== "student") return;
     e.preventDefault();
@@ -410,6 +491,7 @@ export function studentLiveView({ id } = {}) {
     try { offStore && offStore(); } catch (e) { console.warn(e); }
     try { unsub && unsub(); } catch (e) { console.warn(e); }
     if (ch) { try { ch.leave(); } catch (e) { console.warn(e); } ch = null; }
+    destroyWsHost();
     destroyHost();
   };
 }
@@ -467,7 +549,7 @@ export function studentReviewView({ id } = {}) {
 
   let dead = false, host = null, offStore = null, started = false, mounting = false, dirty = false;
   let loadTimer = null, loadTries = 0, idx = 0;
-  let slides = null, slidesSrc = null; // 복습용 슬라이드(필기는 바닥 그림 합침) — 스냅샷마다 1회
+  let slides = null, slidesSrc = null, slidesWs = null; // 복습용 슬라이드(필기는 바닥 그림 합침) + 학습지 쪽 — 스냅샷마다 1회
   const answers = new Set();             // [정답 보기]를 켠 슬라이드 id
   let ansVer = 0, viewCache = null;
   const shown = {};
@@ -499,22 +581,27 @@ export function studentReviewView({ id } = {}) {
 
   function reviewSlides(s) {
     const snap = Array.isArray(s.slidesSnapshot) ? s.slidesSnapshot : [];
-    if (slidesSrc !== snap) {
-      slidesSrc = snap;
-      slides = snap.map(sl => (sl && sl.type === "ink" ? reviewInkSlide(s, sl, me.id) : sl));
+    const ws = wsPages(s);
+    if (slidesSrc !== snap || slidesWs !== ws) {
+      slidesSrc = snap; slidesWs = ws;
+      slides = [
+        ...snap.map(sl => (sl && sl.type === "ink" ? reviewInkSlide(s, sl, me.id) : sl)),
+        // 학습지 쪽도 뒤에 이어서 복습(수업 때처럼 내 개별 칸에 저장)
+        ...ws.map((p, i) => reviewInkSlide(s, { ...p, title: wsPageTitle(p, i), mode: "individual" }, me.id)),
+      ];
     }
     return slides;
   }
   // 플러그인에게 보여 줄 세션: 활동 상태·모드·흐름만 복습용으로, 나머지(응답·필기·참여자)는 진짜 세션 그대로
   function sessionView(real) {
     const c = viewCache;
-    if (c && c.real === real && c.act === real.activity && c.snap === real.slidesSnapshot && c.ans === ansVer) return c.view;
+    if (c && c.real === real && c.act === real.activity && c.snap === real.slidesSnapshot && c.ws === real.worksheet && c.ans === ansVer) return c.view;
     const list = reviewSlides(real);
     const activity = {};
     for (const sl of list) if (sl) activity[sl.id] = reviewActivity(sl, real.activity?.[sl.id], answers.has(sl.id));
     const over = { activity, flow: "student", slidesSnapshot: list };
     const view = new Proxy(real, { get: (t, k) => (Object.hasOwn(over, k) ? over[k] : Reflect.get(t, k)) });
-    viewCache = { real, act: real.activity, snap: real.slidesSnapshot, ans: ansVer, view };
+    viewCache = { real, act: real.activity, snap: real.slidesSnapshot, ws: real.worksheet, ans: ansVer, view };
     return view;
   }
 
@@ -757,6 +844,8 @@ export function studentRecordsView() {
             : el("button", { class: "btn btn-primary", type: "button", onClick: () => go("/student/review/" + s.id) }, [icon("pen", 18), "복습하기"]),
         ]),
         ...(slides.length ? slides.map((sl, i) => slideBlock(sl, i, s)) : [el("div", { class: "empty" }, "슬라이드가 없어요")]),
+        // 학습지 쪽(내 개별 필기)
+        ...wsPages(s).map((p, i) => slideBlock({ ...p, title: wsPageTitle(p, i), mode: "individual" }, slides.length + i, s)),
       );
     }, e => {
       console.warn("[student] 기록 상세 조회 실패", e);

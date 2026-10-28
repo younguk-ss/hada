@@ -13,6 +13,7 @@ import { drawStroke, strokeKey } from "./canvas.js";
 import { getSlideType, effectiveMode, injectCss } from "./slides/index.js";
 import { cloudEnsureReviewCode } from "./cloud.js";
 import { pageRectFor } from "./zoom-view.js";
+import { wsPages } from "./worksheet.js";
 
 const MARK = "assets/print-mark.png";
 const FRAME = 16 / 10;        // 슬라이드 프레임 비율
@@ -21,6 +22,15 @@ const PAGE_W = 200;           // A4 210mm - 좌우 5mm
 const BODY_H = 272;           // A4 297mm - 위 5 - 머리 13 - 아래 5 - 여유 2
 const GAP = 4;                // 슬라이드 사이(mm)
 const PX_W = 1600;            // 출력 이미지 폭(px) ≈ 200dpi
+
+// 인쇄 대상 = 세션 슬라이드 + 학습지 쪽(뒤에 이어서, 모드 '개별' → 그 학생 칸의 필기). _ws = 학습지 표시(선택 창 번호 자리에 '학습지')
+// 가정: 학습지는 ink 슬라이드 모양이라 renderInk/recordFor 를 그대로 쓴다.
+function sheetSources(session) {
+  const slides = (session && session.slidesSnapshot) || [];
+  const ws = wsPages(session).map((p, i) => ({ ...p, title: `${i + 1}쪽`, mode: "individual", _ws: true }));
+  return { slides, ws, all: [...slides, ...ws] };
+}
+const numOfIn = (deck) => (sl) => (sl._ws ? "학습지" : deck.indexOf(sl) + 1);
 
 injectCss("print", `
 #print-root{display:none}
@@ -356,7 +366,7 @@ async function printSheets({ session, sets, slides, teacher }) {
 // ── 학생 개별 결과 인쇄 ──
 // slideIds 순서는 세션 슬라이드 순서를 따른다.
 export async function printStudents({ session, studentIds, slideIds, teacher }) {
-  const slides = (session.slidesSnapshot || []).filter(s => slideIds.includes(s.id));
+  const slides = sheetSources(session).all.filter(s => slideIds.includes(s.id));
   if (!slides.length || !studentIds.length) { toast("인쇄할 슬라이드와 학생을 고르세요"); return; }
   const sets = studentIds.map(sid => { const st = findStudent(sid); return { studentId: sid, who: st ? studentLabel(st) : "학생" }; });
   await printSheets({ session, sets, slides, teacher });
@@ -364,7 +374,7 @@ export async function printStudents({ session, studentIds, slideIds, teacher }) 
 
 // ── 빈 학습지 인쇄 (수업 전·중에 나눠 줄 종이: 기본 필기만 + 이름 칸 + 복습 QR) ──
 export async function printBlank({ session, slideIds, teacher }) {
-  const slides = (session.slidesSnapshot || []).filter(s => s.type === "ink" && slideIds.includes(s.id));
+  const slides = sheetSources(session).all.filter(s => s.type === "ink" && slideIds.includes(s.id));
   if (!slides.length) { toast("인쇄할 슬라이드를 고르세요"); return; }
   const name = el("span", { class: "pp-name" }, [
     el("i"), "학년", el("i"), "반", el("i"), "번", " 이름", el("i", { class: "w" }),
@@ -403,7 +413,7 @@ function slideGrid(slides, pick, onChange, numOf = (sl, i) => i + 1) {
 
 // ── 빈 학습지 인쇄 선택 창: 필기 슬라이드 고르기 → 인쇄 ──
 export function openBlankPrint({ session, teacher } = {}) {
-  const all = (session && session.slidesSnapshot) || [];
+  const { slides: deck, all } = sheetSources(session);
   const slides = all.filter(sl => sl.type === "ink");
   if (!slides.length) { toast("인쇄할 필기 슬라이드가 없어요"); return null; }
   const pick = new Set(slides.map(sl => sl.id));
@@ -423,7 +433,7 @@ export function openBlankPrint({ session, teacher } = {}) {
         el("button", { class: "btn btn-sm", type: "button", onClick: () => { slides.forEach(sl => pick.add(sl.id)); render(); } }, "전체 선택"),
         el("button", { class: "btn btn-sm btn-ghost", type: "button", onClick: () => { pick.clear(); render(); } }, "해제"),
       ]),
-      slideGrid(slides, pick, upd, (sl) => all.indexOf(sl) + 1), // 번호는 수업 슬라이드 순서
+      slideGrid(slides, pick, upd, numOfIn(deck)), // 번호는 수업 슬라이드 순서, 학습지 쪽은 '학습지'
       el("div", { class: "pp-foot" }, [info, el("button", { class: "btn", type: "button", onClick: () => m.close() }, "취소"), goBtn]),
     );
     upd();
@@ -434,7 +444,7 @@ export function openBlankPrint({ session, teacher } = {}) {
 
 // ── 학생 인쇄 선택 창: 1) 슬라이드 2) 학생 ──
 export function openStudentPrint({ session, teacher, studentIds: preset } = {}) {
-  const slides = session.slidesSnapshot || [];
+  const { slides: deck, all: slides } = sheetSources(session);
   const students = sessionStudents(session);
   if (!slides.length) { toast("슬라이드가 없어요"); return; }
   if (!students.length) { toast("참여한 학생이 없어요"); return; }
@@ -452,7 +462,7 @@ export function openStudentPrint({ session, teacher, studentIds: preset } = {}) 
       el(step === 1 ? "b" : "span", {}, "1. 슬라이드"), el("span", {}, "›"), el(step === 2 ? "b" : "span", {}, "2. 학생"),
     ]));
     if (step === 1) {
-      const grid = slideGrid(slides, pickSlides, () => upd());
+      const grid = slideGrid(slides, pickSlides, () => upd(), numOfIn(deck));
       const all = el("button", { class: "btn btn-sm", type: "button", onClick: () => { slides.forEach(s => pickSlides.add(s.id)); render(); } }, "전체 선택");
       const ink = el("button", { class: "btn btn-sm", type: "button", onClick: () => { pickSlides.clear(); slides.filter(s => s.type === "ink").forEach(s => pickSlides.add(s.id)); render(); } }, "필기만");
       const none = el("button", { class: "btn btn-sm btn-ghost", type: "button", onClick: () => { pickSlides.clear(); render(); } }, "해제");

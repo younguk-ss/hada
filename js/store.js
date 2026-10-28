@@ -53,6 +53,7 @@ function normalize(state, fromDisk) {
   }
   state.lessons.forEach(l => {
     if (!Array.isArray(l.slides) || cloudMode && fromDisk) l.slides = null;
+    if (!Array.isArray(l.worksheet) || cloudMode && fromDisk) l.worksheet = null; // 학습지 페이지(slides와 함께 열 때 불러옴)
     if (l.slides) l.slideCount = l.slides.length;
     l.slideCount ??= 0;
     l.cover ??= null;
@@ -60,7 +61,7 @@ function normalize(state, fromDisk) {
   });
   state.sessions.forEach(s => {
     if (cloudMode && fromDisk) {
-      delete s.records; delete s.responses; delete s.slidesSnapshot;
+      delete s.records; delete s.responses; delete s.slidesSnapshot; delete s.worksheet;
       s._full = false;
     }
     ensureSessionShape(s);
@@ -94,8 +95,8 @@ function slim(state) {
     studentProfile: state.studentProfile,
     teachers: state.teachers,
     students: state.students,
-    lessons: (state.lessons || []).map(({ slides, ...meta }) => meta),
-    sessions: (state.sessions || []).map(({ records, responses, slidesSnapshot, _full, ...meta }) => meta),
+    lessons: (state.lessons || []).map(({ slides, worksheet, ...meta }) => meta),
+    sessions: (state.sessions || []).map(({ records, responses, slidesSnapshot, worksheet, _full, ...meta }) => meta),
   };
 }
 
