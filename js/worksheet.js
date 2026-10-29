@@ -1,9 +1,11 @@
 // 학습지(worksheet) 공용 — 교사·학생 화면이 함께 쓰는 헬퍼·CSS (docs/ARCHITECTURE.md §9.5)
 // 학습지 = 수업 자료에 미리 올려 둔 PDF·이미지 페이지(ink 슬라이드 모양, lesson.worksheet / DB worksheet_pages).
+// 가정(v2.7): 교사는 수업 진행 오른쪽 레일의 📝 학습지로 열고(teacher.js railItem), 띄우기는 학습지 머리 줄의 '학생 화면 고정' 스위치 하나.
+//       wsTab(가장자리 📝 탭)은 학생 화면만 쓴다.
 // 수업(세션) 시작 때 스냅샷(session.worksheet, session_snapshots.worksheet)으로 고정되고, 학생은 수업 중 언제든
 // 오른쪽 가장자리 📝 탭으로 열어 자기 칸(scope individual, records[studentId][pageId])에 쓴다.
-// 교사는 같은 탭으로 학생들의 학습지 필기 갤러리를 보고(ink 플러그인 '개별' 갤러리 재사용), [학생 화면에 띄우기]로
-// 모든 학생 화면을 학습지로 바꿀 수 있다(activity.__ws.force). 띄운 동안 학생은 닫을 수 없지만 쪽은 자유롭게 넘긴다.
+// 교사는 레일 📝로 학생들의 학습지 필기 갤러리를 보고(ink 플러그인 '개별' 갤러리 재사용), '학생 화면 고정' 스위치로
+// 모든 학생 화면을 학습지로 바꿀 수 있다(activity.__ws.force). 고정된 동안 학생은 닫을 수 없지만 쪽은 자유롭게 넘긴다.
 // 가정: 학습지 페이지의 모드는 늘 '개별' — 플러그인에게는 activity[pageId].mode='individual'인 세션 보기(Proxy)를 넘긴다.
 //       쓰기(필기 저장·setActivity)는 Proxy를 지나 진짜 세션 객체에 닿는다(복습 화면 sessionView와 같은 방식).
 // 가정: '작성 중' = 그 학생이 최근 20초 안에 쓴 획·글자가 있음(교사 첨삭 by≠학생 제외). '작성함' = 학습지 어느 쪽에든 필기가 있음.
@@ -30,8 +32,6 @@ const CSS = `
 .ws-tab.forced { background:var(--accent); color:#fff; border-color:var(--accent); }
 .ws-tab.forced .ws-lock { display:block; }
 @media (hover:hover) { .ws-tab:not(.open):not(.forced):hover { border-color:var(--line-strong); background:var(--surface-2); } }
-/* 교사: 드로어가 흐름 배치(≥1025px)로 열려 있으면 탭을 드로어 왼쪽에 */
-@media (min-width:1025px) { .live-body:has(> .drawer:not(.closed)) > .ws-tab { right:340px; } }
 /* 학습지 화면(교사 갤러리 · 학생 필기) */
 .ws-view { display:flex; flex-direction:column; gap:10px; min-height:0; min-width:0; }
 .ws-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; flex:none; min-width:0; }
@@ -45,19 +45,21 @@ const CSS = `
 .ws-pages .ws-dot[hidden] { display:none; }
 .ws-body { flex:1; min-height:0; min-width:0; display:flex; flex-direction:column; position:relative; }
 .ws-body > .slide-host, .ws-body > .slide-host[data-type="ink"] { flex:1; min-height:0; height:auto; }
-.ws-force.btn[aria-pressed="true"] { background:var(--accent); border-color:var(--accent); color:#fff; }
-.ws-force.btn[aria-pressed="true"] .icon { color:inherit; }
+/* 교사: '학생 화면 고정' 스위치(켜짐·꺼짐이 한눈에) */
+.ws-switch { display:inline-flex; align-items:center; gap:8px; height:34px; padding:0 4px 0 12px; border:0; border-radius:999px; background:transparent;
+  font:inherit; font-size:13px; font-weight:600; color:var(--ink-2); white-space:nowrap; cursor:pointer; flex:none; }
+.ws-switch-track { position:relative; width:40px; height:24px; border-radius:12px; background:var(--line-strong); transition:background .15s; flex:none; }
+.ws-switch-knob { position:absolute; top:3px; left:3px; width:18px; height:18px; border-radius:50%; background:#fff; box-shadow:0 1px 2px rgba(0,0,0,.25); transition:transform .15s; }
+.ws-switch[aria-checked="true"] { color:var(--accent-ink); }
+.ws-switch[aria-checked="true"] .ws-switch-track { background:var(--accent); }
+.ws-switch[aria-checked="true"] .ws-switch-knob { transform:translateX(16px); }
+@media (hover:hover) { .ws-switch:hover { background:var(--surface-2); } }
 /* 학생: 스테이지 전체가 학습지, 머리 줄은 얇게 */
 .stu .ws-stage { padding:0 var(--sar) var(--sab) var(--sal); }
 .stu .ws-view { gap:0; }
 .stu .ws-head { height:42px; padding:0 8px 0 12px; gap:6px; flex-wrap:nowrap; border-bottom:1px solid var(--line); background:var(--surface); }
 .stu .ws-head .btn { --btn-h:36px; font-size:14px; }
 .stu .ws-head .slide-count { min-width:56px; font-size:14px; }
-/* 교사 드로어 학습지 칸 */
-.ws-pane { display:grid; gap:8px; padding-bottom:14px; border-bottom:1px solid var(--line); }
-.ws-pane-head { display:flex; align-items:center; gap:6px; font-size:13px; color:var(--ink-2); min-width:0; flex-wrap:wrap; }
-.ws-pane-head b { color:var(--ink); }
-.ws-pane-row { display:flex; gap:6px; flex-wrap:wrap; }
 /* 편집기 학습지 창 */
 .ws-tools { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
 .ws-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:10px; }

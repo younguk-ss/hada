@@ -155,9 +155,6 @@ const CSS = `
 .ink-tile-name .dot.on { background:var(--ok); }
 .ink-tile-name .ink-cnt { margin-left:auto; color:var(--muted); font-variant-numeric:tabular-nums; }
 .ink-zoom { display:flex; flex-direction:column; gap:10px; height:min(72dvh, 640px); min-height:280px; }
-.ink-panel { display:flex; flex-direction:column; gap:14px; }
-.ink-panel .ink-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-.ink-panel .ink-note { font-size:13px; color:var(--muted); }
 .ink-insp-bg { position:relative; aspect-ratio:16/10; border:1px solid var(--line); border-radius:var(--radius-sm); background:#fff; overflow:hidden;
   display:grid; place-items:center; color:var(--muted); font-size:13px; }
 .ink-insp-bg img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
@@ -976,28 +973,8 @@ function TeacherLive({ slide, session, ctx }) {
     });
   }
 
-  // ── 패널: 모드 seg + 모둠 편성 ──
-  const modeSeg = seg(MODES, curMode(), (m) => { ctx.setActivity({ mode: m }); segSet(modeSeg, m); });
-  const groupNote = el("span", { class: "ink-note" });
-  const groupRow = el("div", { class: "ink-row" }, [
-    el("button", { type: "button", class: "btn btn-sm", onClick: openGroupBuilder }, [icon("users"), " 모둠 편성"]),
-    groupNote,
-  ]);
-  const panel = el("div", { class: "ink-panel" }, [
-    el("div", { class: "field" }, [el("label", {}, "모드"), modeSeg]),
-    groupRow,
-  ]);
-  function syncPanel() {
-    const m = curMode();
-    segSet(modeSeg, m);
-    groupRow.style.display = m === "group" ? "" : "none";
-    if (m === "group") {
-      const gs = ctx.groups() || [];
-      const assigned = new Set(gs.flatMap(g => g.memberIds || []));
-      const left = (ctx.participants() || []).filter(id => !assigned.has(id)).length;
-      groupNote.textContent = gs.length ? `${gs.length}모둠${left ? ` · 미배정 ${left}명` : ""}` : "";
-    }
-  }
+  // 가정(v2.7): 필기 슬라이드는 교사 패널을 두지 않는다 — 모드 전환은 수업 진행 상단 바에만 있고(중복 제거),
+  //       모둠 편성은 상단 바의 [모둠] 버튼이 actions.groups()로 연다.
 
   // 온라인 점 (presence)
   function attachPresence() {
@@ -1017,17 +994,15 @@ function TeacherLive({ slide, session, ctx }) {
     else if (viewer) viewer.refresh();
     else gal?.update();
     zoom?.viewer?.refresh();
-    syncPanel();
     attachPresence();
   }
 
   mountBody();
-  syncPanel();
   attachPresence();
 
   return {
     el: wrap,
-    panel,
+    actions: { groups: openGroupBuilder }, // 코어(수업 진행 상단 바)가 부르는 동작
     onActivity: update,
     onSession: update,
     destroy() {

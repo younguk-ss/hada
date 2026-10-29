@@ -364,6 +364,8 @@ export function mountSlideHost({ role = "student", root, slide, session, me, les
     update,
     destroy,
     get panel() { return role === "teacher" ? (cur?.inst?.panel || null) : null; },
+    // 플러그인이 코어 화면(상단 바 등)에 내주는 동작 { 이름: fn } — 예: ink { groups: 모둠 편성 창 }
+    get actions() { return role === "teacher" ? (cur?.inst?.actions || null) : null; },
     get inspector() { return role === "editor" ? (cur?.inst?.inspector || null) : null; },
     get ctx() { return cur?.ctx || null; },
   };

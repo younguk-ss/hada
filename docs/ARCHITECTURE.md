@@ -301,7 +301,8 @@ def = {
   thumb?(slide) → HTMLElement // 없으면 아이콘+제목 기본 썸네일
   Editor({ slide, lesson, update, ctx }) → { el, destroy? }
   Student({ slide, session, me, ctx }) → { el, destroy?, onActivity?, onResponses?, onSession? }
-  TeacherLive({ slide, session, ctx }) → { el, destroy?, onActivity?, onResponses?, onSession?, panel? }
+  TeacherLive({ slide, session, ctx }) → { el, destroy?, onActivity?, onResponses?, onSession?, panel?, actions? }
+      // panel = 수업 진행 레일 '도구' 패널 내용(있을 때만 '도구'가 보임), actions = 코어 화면이 부르는 동작 { 이름: fn } (ink: { groups })
   summary?(slide, responses, session, ctx) → HTMLElement      // 기록 화면(읽기 전용)
   validate?(slide) → string|null   // 편집기 경고 문구(예: '정답을 선택하세요'), 시작 시에도 표시
 }
@@ -314,7 +315,7 @@ def = {
 ```js
 mountSlideHost({ role /*'student'|'teacher'|'editor'*/, root, slide, session, me, lesson, onEditorUpdate, sessionView? })
 // sessionView(session) → 플러그인에게 보여 줄 세션(학생 복습: 활동 상태·모드만 바꾼 Proxy). 응답·필기 쓰기는 진짜 세션에.
-  → { update({ slide, session }), destroy(), panel /*TeacherLive.panel|null*/, ctx }
+  → { update({ slide, session }), destroy(), panel /*TeacherLive.panel|null*/, actions /*TeacherLive.actions|null*/, ctx }
 ```
 - 키 `${slide.id}|${role}` 가 같으면 DOM 보존: `onActivity(state)`(activity[slide.id]가 바뀌었을 때, JSON 비교), `onResponses(list)`(responses[slide.id] 배열이 바뀌었을 때), `onSession(session)`(그 외 모든 세션 변경 — 싸고 멱등이어야 함)만 호출. 키가 바뀌면 `destroy()` 후 재마운트.
 - 플러그인 예외는 try/catch로 감싸 `.empty` 메시지('이 슬라이드를 불러오지 못했어요')로 대체(앱 전체가 죽지 않게).
@@ -393,7 +394,7 @@ ctx = {
 **ink** (`js/slides/ink.js`)
 - 모드: `none`(발표) 학생 readOnly — **교사 필기는 whole scope에 저장되어 학생에게 실시간 표시**; `whole` 모두 같은 캔버스(scope whole); `individual` 학생 각자(scope individual/studentId); `group` 모둠 공유(scope group/groupId), 미배정 학생은 `모둠을 기다리고 있어요` 한 줄 → 배정되면 자동 전환.
 - Student: 캔버스 + (쓰기 가능 모드에서만) 하단 플로팅 도구바: 펜·형광·지우개·텍스트 | 색 6 | 굵기 S/M/L | 되돌리기. 모드 바뀌면 재마운트(키에 모드 포함 — ink는 자체적으로 onActivity에서 scope 키 비교 후 내부 재마운트).
-- TeacherLive: 스테이지 = 캔버스(none/whole → whole scope에 교사 필기, 도구바 동일 + `전체 지우기`). individual/group → 스테이지는 배경만 + **갤러리**(학생/모둠 타일 그리드, 이름·온라인 점·미니 캔버스, 레코드 변경 시만 다시 그림) — 타일 탭 → 모달로 크게(교사 첨삭 가능, 해당 scope에 기록). panel: 모드 seg(발표·전체·개별·모둠) + 모둠일 때 `[모둠 편성]`.
+- TeacherLive: 스테이지 = 캔버스(none/whole → whole scope에 교사 필기, 도구바 동일 + `전체 지우기`). individual/group → 스테이지는 배경만 + **갤러리**(학생/모둠 타일 그리드, 이름·온라인 점·미니 캔버스, 레코드 변경 시만 다시 그림) — 타일 탭 → 모달로 크게(교사 첨삭 가능, 해당 scope에 기록). panel 없음(v2.7 — 모드 seg는 수업 진행 상단 바에만). `actions.groups()` = 모둠 편성 창(상단 바 [모둠] 버튼이 부름).
 - **모둠 편성 모달**: 조 크기 seg `2·3·4·5`(기본 4) + `[랜덤 편성]`(groupStudents(online∪participants, size)) + 칩 **탭→탭** 이동(드래그 금지). 저장 = `patchSession(session, { groups })`.
 - Editor: 스테이지에 캔버스 + 도구바(교사 기본 필기), 인스펙터(코어)에 배경 교체·기본 모드 seg를 ink가 `inspector` 필드로 제공(`Editor()` 반환에 `inspector?: HTMLElement` 허용).
 - summary: whole 레코드 미니 캔버스 / individual 학생 수 표기 + 갤러리(읽기 전용).
@@ -521,10 +522,10 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 - **수업 자료 카드**: 썸네일(cover) · 제목 · `n장 · 날짜` · `[시작]`(primary) · `⋯` 메뉴(편집, 복제(선택), 삭제). 카드 탭 = 편집기. 새 수업: `[+ 새 수업]` → 제목 promptDialog → 빈 ink 1장으로 생성 → 편집기. `[PDF·이미지로 만들기]` → 파일 선택 → `fileToSlides` 진행률 → 생성 → 편집기.
 - **편집기**: 열 때 `lesson.slides===null`이면 `cloudFetchLessonSlides`(진행률 pill). 레일: 썸네일(`def.thumb`), 탭=선택, 길게 누르기/`⋯`=복제·삭제·위/아래(드래그 정렬은 pointer 이벤트로, HTML5 DnD 금지). 레일 하단 `[+ 슬라이드]` → 모달 그리드(카테고리 섹션, 아이콘+라벨, 탭 즉시 현재 뒤에 삽입) · `[+ 파일]`(PDF/이미지 → ink 여러 장). 스테이지 = `mountSlideHost({role:'editor'})`. 인스펙터 = 제목 input + `def.Editor().inspector`(있으면) + validate 경고. 변경 → 300ms 디바운스 `cloudSaveLesson` + 상단 pill `저장됨/저장 중…/저장 실패 [다시]`.
 - **시작**: `수업 이름` 입력 창(기본값 = 같은 자료의 직전 수업 이름 또는 자료 제목, 예: '임진왜란 3학년 2반') → `cloudStartSession({lesson, teacher, title})` await → 성공 `/live/:id`, 실패 toast. flow 기본 teacher. 기록 화면에서 이름 바꾸기(patchSession title).
-- **수업 진행 `/live/:id`**: 상단 바(좌→우) `←`(대시보드, 수업은 계속) · 제목 · **코드 pill `ABC123`**(탭 → QR 모달: 큰 코드 + QR + URL 복사 + 아래 줄 `복습 코드 XYZ789 [복습 QR] [빈 학습지]`) · `● 12`(온라인 수, 탭 → drawer 참여 탭) · `◀ 3/12 ▶`(가운데 숫자 탭 → 썸네일 스트립 팝오버로 점프) · (ink일 때만) 모드 seg `발표·전체·개별·모둠` · flow 토글 아이콘(`교사 진행`/`자유 이동`) · `[패널]` · `[종료]`.
-  - 스테이지 = `mountSlideHost({role:'teacher'})`. drawer 탭: `활동`(= host.panel(필기면 모드 seg) + 아래 **[상호작용 추가]**, 늘 보임) · `참여`(참가자 목록: 온라인 점, 이름, 미응답 표시(응답형일 때), 모둠).
+- **수업 진행 `/live/:id`** (v2.7 정리 — 한 기능은 한 자리): 상단 바는 수업 흐름만 — `←`(대시보드, 수업은 계속) · 제목 · **코드 pill `ABC123`**(탭 → QR 모달: 큰 코드 + QR + URL 복사 + 아래 줄 `복습 코드 XYZ789 [복습 QR] [빈 학습지]`) · `◀ 3/12 ▶`(가운데 숫자 탭 → 썸네일 스트립 팝오버로 점프) · (ink일 때만) 모드 seg `발표·전체·개별·모둠` · (모둠 모드일 때만) `[👥 2모둠 · 미배정 n]`(= ink `actions.groups()` 모둠 편성 창, 모둠이 없을 때 모둠으로 바꾸면 창이 바로 뜸) · flow 토글(`교사 진행`/`자유 이동`) · `[종료]`. 학습지 화면에서는 모드 seg·모둠 버튼을 숨기고, ◀ ▶·스트립을 누르면 슬라이드 화면으로 돌아간다.
+  - 본문 = 스테이지 | 패널(한 번에 하나) | **오른쪽 아이콘 레일**(64px, 이름표 달린 칸): `📝 학습지`(있을 때만, 배지 = 지금 쓰는 학생 수, 고정 중이면 자물쇠) · `참여`(배지 = 접속 수 → 패널: 참가자 목록 — 온라인 점, 이름, 미제출(응답형), 모둠) · `추가`(레일 왼쪽 작은 창: 지금 슬라이드 다음에 끼워 넣을 8종) · `도구`(그 슬라이드 플러그인의 `panel`이 있을 때만 — 마감·정답 공개·타이머·응답자 등. 패널 제목 `도구 · 객관식`). 같은 칸을 다시 누르거나 ×·Esc → 닫힘. 넓은 화면(진입 시 ≥1100px)은 도구가 있는 슬라이드로 오면 도구를 저절로 펼치고(교사가 직접 닫으면 다시 열 때까지 멈춤), 도구가 없는 슬라이드(필기 등)에서는 닫혀 스테이지가 넓다. ≤1024px에서 패널은 레일 옆에 겹쳐 뜬다. 필기 슬라이드(ink)는 panel이 없다(모드는 상단 바에만).
   - **상호작용 추가**(맨 앞 `[빈 슬라이드]` = 흰 필기 슬라이드(모드 전체)를 창 없이 바로 끼워 넣고 이동, 0.7초 연타 방지 · 정답 없는 상호작용·미디어: 담벼락·주관식 서술형·워드클라우드·설문·웹 링크·임베드·동영상): 타입 탭 → 그 타입의 `Editor`를 창에 띄워 내용 입력 → `[추가하고 이동]`(validate 경고면 toast 후 창 유지) → `cloudInsertSessionSlide`로 현재 슬라이드 **다음**에 끼워 넣고 바로 그 슬라이드로(진행 중 게임이면 이동과 같은 확인). 이 수업에만 들어가고 수업 자료에는 저장하지 않는다. 학생은 자유 이동 중이어도 새 슬라이드로 옮겨진다(새로 생긴 id 기준).
-  - 키보드: ←/→ 이동, F 전체화면, Esc 팝오버 닫기.
+  - 키보드: ←/→ 이동(학습지 화면이면 학습지 쪽), F 전체화면, Esc = 팝오버 → 학습지 화면 → 패널 순으로 닫기.
   - 이동/모드/flow = `patchSession`. 이 화면은 store 구독 → host.update만 호출(재마운트 금지). 1초 interval 금지.
   - `[종료]` → confirmDialog → `cloudEndSession(session,'completed')` → `/teacher/session/:id`.
 - **기록 `/teacher/session/:id`**: `cloudFetchSession` → 요약(날짜·참여 n명·슬라이드 n장) + seg `슬라이드별 / 학생별`. 슬라이드별 = 각 슬라이드 `def.summary`. 학생별 = 학생 선택 → 그 학생 ink(읽기 전용) + 응답(정오) 슬라이드 순. `[인쇄]`(슬라이드별 = 화면 그대로, 학생별 = 그 학생 학습지 인쇄) · `[학생 인쇄]`(js/print.js: 1) 슬라이드 선택 2) 학생 선택 → 학생마다 A4 세로, @page 여백 0 + 시트 안 패딩 5mm(프린터가 찍을 수 있는 안쪽), 머리글 작게, 오른쪽 위 워터마크 `assets/print-mark.png`. 필기 슬라이드는 16:10 틀에서 학습지 이미지 영역만 잘라 JPEG로 렌더 — 세로 학습지는 PDF 자체의 흰 여백도 잘라(zoom-view `pageRectFor` 내용 영역 ∪ 필기 범위) 종이 폭을 꽉 채움, 가로 슬라이드는 한 장에 2개). 기록 화면 그대로 인쇄도 @page 여백 5mm. `[이어서]`(stopped/completed → `cloudResumeSession` → `/live/:id`) · `[삭제]`.
@@ -551,8 +552,8 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 - **무엇**: 수업 자료에 미리 올려 둔 PDF·이미지 쪽(`lesson.worksheet`, DB `worksheet_pages`). 슬라이드 진행과 별개로 학생이 수업 중 언제든 열어 **각자** 필기한다. 쪽은 ink 슬라이드 모양(`mode:'individual'`), 필기는 기존 `slide_records`(slide_id = 쪽 id, scope individual)에 저장 → 실시간·병합·기록·인쇄가 그대로 동작.
 - **편집기**: 상단 `[📝 학습지 n]` → 창: 쪽 썸네일 격자(앞으로·뒤로·삭제) + `[PDF·이미지 추가]`(여러 파일, `fileToSlides` → mode individual). 변경은 slides와 같은 300ms 디바운스 `cloudSaveLesson`(④ worksheet_pages 삭제→upsert, `lesson.worksheet===null`이면 건드리지 않음). 복제 시 함께 복사.
 - **세션**: 시작 때 `session.worksheet` 스냅샷(`session_snapshots.worksheet`, 불변). `cloudFetchSession`은 `slides,worksheet`를 읽고 열이 없는 DB면 `slides`만(`snapHasWs`). 수업 중 슬라이드 끼워 넣기는 `slides`만 upsert하므로 학습지는 보존.
-- **교사 `/live/:id`**: 학습지가 있으면 스테이지 오른쪽 가장자리 **📝 탭**(배지 = 지금 쓰는 학생 수, 5초마다 다시 셈). 탭 → 슬라이드 호스트는 숨긴 채(상태 유지) 스테이지를 **학습지 화면**으로: 머리 줄 `📝 학습지 · [1][2][3](쪽 버튼, 쪽마다 작성 중 배지; 13쪽 이상은 ◀ n/N ▶) · 작성 중 n · 작성함 m/전체 · [학생 화면에 띄우기] · [슬라이드로]` + 본문 = `mountSlideHost({ role:'teacher', sessionView: makeWsSessionView() })` → ink `TeacherLive` **개별 갤러리** 재사용(필기 부분/전체 보기, 칸 탭 → 크게 보기·첨삭). 열려 있을 때 ←/→는 학습지 쪽, Esc는 닫기. 드로어 활동 탭 맨 위에도 `학습지 n쪽 · 작성 중 · 작성함 [학생 필기 보기] [학생 화면에 띄우기]`.
-- **띄우기(강제 배정)**: `activity.__ws = { force:boolean, at }`(`__snap`처럼 예약 키, `patchSession`으로 broadcast+DB). 켜면 모든 학생 화면이 학습지로 바뀌고 닫기 버튼이 잠긴다(쪽 이동은 자유). 끄면 학생 화면은 열린 채 남고 탭으로 닫을 수 있다.
+- **교사 `/live/:id`**: 학습지가 있으면 오른쪽 레일에 **📝 학습지**(배지 = 지금 쓰는 학생 수, 5초마다 다시 셈, 고정 중이면 자물쇠). 누르면 슬라이드 호스트는 숨긴 채(상태 유지) 스테이지를 **학습지 화면**으로(열려 있던 도구 패널은 접고, 닫으면 다시 펼침): 머리 줄 `📝 학습지 · [1][2][3](쪽 버튼, 쪽마다 작성 중 배지; 13쪽 이상은 ◀ n/N ▶) · 작성 중 n · 작성함 m/전체 · 학생 화면 고정 (스위치)` + 본문 = `mountSlideHost({ role:'teacher', sessionView: makeWsSessionView() })` → ink `TeacherLive` **개별 갤러리** 재사용(필기 부분/전체 보기, 칸 탭 → 크게 보기·첨삭). 열려 있을 때 ←/→는 학습지 쪽. 닫기 = 레일 📝 다시 누르기 · Esc · 상단 ◀ ▶.
+- **띄우기(강제 배정) = '학생 화면 고정' 스위치**: `activity.__ws = { force:boolean, at }`(`__snap`처럼 예약 키, `patchSession`으로 broadcast+DB). 켜면 모든 학생 화면이 학습지로 바뀌고 닫기 버튼이 잠긴다(쪽 이동은 자유). 끄면 학생 화면은 열린 채 남고 탭으로 닫을 수 있다.
 - **학생 `/student/live/:id`**: 학습지가 있으면 오른쪽 가장자리 📝 탭. 탭 → 슬라이드 스테이지 숨김(호스트 유지, 비디오 등 상태 보존) + 학습지 스테이지(머리 줄 `📝 학습지 · ◀ n/N ▶`, 본문 = ink `Student` 개별 모드: 도구바·확대). 탭을 다시 누르면 닫고 슬라이드로. 띄워진 동안은 탭이 잠금 표시(누르면 toast). `activity.__ws.force`가 켜지는 순간 자동으로 열리고 toast. 쪽 기억 `sessionStorage hada:ws:<세션>`. ←/→는 학습지가 열려 있으면 쪽 이동.
 - **'작성 중'/'작성함'**(`wsStats`): 학생마다 모든 쪽의 자기 획·글자(by = 학생, 지운 것 제외) 중 가장 늦은 ts. 20초 안이면 작성 중, 하나라도 있으면 작성함. 서버 왕복 없이 records만으로 계산(broadcast 없음).
 - **기록·복습·인쇄**: 기록 상세(슬라이드별·학생별)와 학생 '내 기록'은 슬라이드 뒤에 `학습지 n` 섹션을 이어 붙인다(태그 pill '학습지'). 복습 화면도 뒤에 이어서(내 개별 칸에 계속 필기). 학생 인쇄·빈 학습지 인쇄의 선택 격자에 학습지 쪽이 '학습지 · n쪽'으로 함께 나온다.

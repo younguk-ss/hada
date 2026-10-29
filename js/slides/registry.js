@@ -12,7 +12,9 @@
 //       config 를 바꿀 땐 전체 객체로: update({ config: { ...slide.config, question } })
 //       inspector: 코어 인스펙터(제목 아래)에 붙는 타입별 설정 영역 (선택)
 //   Student({ slide, session, me, ctx })             → { el, destroy?, onActivity?, onResponses?, onSession? }
-//   TeacherLive({ slide, session, ctx })             → { el, destroy?, onActivity?, onResponses?, onSession?, panel? }
+//   TeacherLive({ slide, session, ctx })             → { el, destroy?, onActivity?, onResponses?, onSession?, panel?, actions? }
+//       panel: 수업 진행 오른쪽 '도구' 패널에 들어갈 조작(마감·정답 공개·타이머·응답자 등). 있을 때만 레일에 '도구'가 보인다.
+//       actions: 코어 화면이 부르는 동작 { 이름: fn } (예: ink { groups } = 상단 바 [모둠] 버튼이 모둠 편성 창을 연다)
 //   summary?(slide, responses, session, ctx)         → HTMLElement  (기록 화면·인쇄, 읽기 전용)
 //   validate?(slide)                                 → string | null  (편집기 경고 문구, 시작 시에도 표시)
 // }

@@ -15,8 +15,14 @@
 //       [추가하고 이동] → 이 수업 스냅샷의 현재 슬라이드 다음에 끼워 넣고 바로 그 슬라이드로(수업 자료에는 저장하지 않음).
 //       맨 앞 [빈 슬라이드]는 채울 내용이 없어 창 없이 바로 — 흰 필기 슬라이드(모드 '전체', 수업 중 모드 seg로 바꿈).
 // 가정: 학습지(js/worksheet.js) — 편집기 상단 [📝 학습지] 창에서 PDF·이미지를 올려 자료에 붙인다(lesson.worksheet, 저장은 cloudSaveLesson).
-//       수업 진행에서는 오른쪽 가장자리 📝 탭(작성 중 인원 배지) → 스테이지를 학습지 갤러리로 바꿈(ink '개별' 갤러리 재사용, 칸 탭 → 첨삭).
-//       [학생 화면에 띄우기] = activity.__ws.force. 학습지 화면이 열려 있을 때 ←/→는 학습지 쪽을 넘긴다(슬라이드 호스트는 숨긴 채 유지).
+//       수업 진행에서는 레일 📝 학습지(작성 중 인원 배지) → 스테이지를 학습지 갤러리로 바꿈(ink '개별' 갤러리 재사용, 칸 탭 → 첨삭).
+//       '학생 화면 고정' 스위치 = activity.__ws.force. 학습지 화면이 열려 있을 때 ←/→는 학습지 쪽을 넘긴다(슬라이드 호스트는 숨긴 채 유지).
+// 가정(v2.7 수업 진행 화면 정리 — 한 기능은 한 자리): 상단 바는 수업 흐름만(코드·이동·모드(+모둠)·진행 방식·종료).
+//       오른쪽은 이름표 달린 아이콘 레일(학습지·참여·추가·도구)만 두고, 누를 때 그 하나만 펼친다(패널은 한 번에 하나).
+//       '도구' = 그 슬라이드 플러그인의 panel(마감·정답 공개·타이머·응답자 등) — 있을 때만 보이고, 넓은 화면(≥1100px)에서는
+//       그런 슬라이드로 오면 저절로 펼친다(직접 닫으면 다시 열 때까지 자동으로 펼치지 않음). 필기 슬라이드는 패널이 없어 화면이 넓다.
+//       '추가' = 지금 슬라이드 다음에 끼워 넣을 상호작용을 고르는 작은 창. 접속 수는 레일 '참여' 배지.
+//       학습지 화면에서 상단 ◀ ▶·슬라이드 번호를 누르면 슬라이드 화면으로 돌아간다.
 import { store, findLesson, findSession, findStudent, findTeacher, studentLabel, newId } from "./store.js";
 import { go } from "./router.js";
 import { el, mount, template, toast, confirmDialog, promptDialog, modal, sheet, icon, fmtDate, debounce, copyText } from "./ui.js";
@@ -30,12 +36,13 @@ import { joinSessionChannel } from "./realtime.js";
 import { getSlideType, listSlideTypes, createSlide, CATEGORIES, effectiveMode, injectCss, mountSlideHost } from "./slides/index.js";
 import { renderSlide } from "./lesson-view.js";
 import { openStudentPrint, openBlankPrint, printStudents, printRecordView, reviewUrl } from "./print.js";
-import { wsPages, wsForced, setWsForce, wsPageTitle, wsStats, makeWsSessionView, wsTab, wsCss } from "./worksheet.js";
+import { wsPages, wsForced, setWsForce, wsPageTitle, wsStats, makeWsSessionView, wsCss } from "./worksheet.js";
 
 const TABS = ["lessons", "records", "students", "code"];
 // 수업 중 바로 추가할 수 있는 타입 (정답 없는 상호작용 · 미디어)
 const QUICK_TYPES = ["wall", "short", "wordcloud", "poll", "link", "embed", "video"];
 const BLANK_ICON = '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/></svg>';
+const TOOLS_ICON = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h9"/><path d="M19 6h1"/><circle cx="16" cy="6" r="2.5"/><path d="M4 12h3"/><path d="M13 12h7"/><circle cx="10" cy="12" r="2.5"/><path d="M4 18h11"/><circle cx="18" cy="18" r="2.5"/></svg>';
 const MODES = [["none", "발표"], ["whole", "전체"], ["individual", "개별"], ["group", "모둠"]];
 const STATUS = { live: ["진행 중", "pill-live"], completed: ["끝남", "pill-ok"], stopped: ["중단", "pill-warn"] };
 const ACCEPT = ".pdf,.png,.jpg,.jpeg,.webp,application/pdf,image/png,image/jpeg,image/webp";
@@ -61,15 +68,16 @@ const TEACHER_CSS = `
 .drawer-head { border-bottom:1px solid var(--line); }
 .drawer-head .tabs { flex:1; min-width:0; border-bottom:0; padding:0; }
 .t-pane { display:grid; gap:12px; align-content:start; min-width:0; }
-.t-quick { display:grid; gap:10px; margin-top:6px; padding-top:16px; border-top:1px solid var(--line); }
-.t-plugin-panel[hidden] + .t-quick { margin-top:0; padding-top:0; border-top:0; }
-.t-quick-head { font-size:12px; color:var(--muted); }
-.t-quick-grid { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px; }
-.t-quick-btn { display:flex; align-items:center; gap:8px; min-height:40px; padding:6px 10px; border:1px solid var(--line); border-radius:var(--radius-sm); background:var(--surface); color:var(--ink); font-size:13px; text-align:left; cursor:pointer; min-width:0; }
-.t-quick-btn span:last-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.t-quick-btn .icon { flex:none; display:inline-flex; color:var(--ink-2); }
-.t-quick-btn .icon svg { width:18px; height:18px; }
-@media (hover: hover) { .t-quick-btn:hover { border-color:var(--line-strong); background:var(--surface-2); } }
+.lr-add-pop { padding:8px; }
+.lr-add { width:min(344px, calc(100vw - 32px)); }
+.lr-add-head { font-size:12px; color:var(--muted); padding:2px 6px 8px; }
+.lr-add-grid { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:2px; }
+.lr-add-btn { display:flex; flex-direction:column; align-items:center; gap:5px; min-height:72px; padding:10px 2px 8px; border:0; border-radius:var(--radius-sm);
+  background:transparent; color:var(--ink); font-size:12px; line-height:1.25; text-align:center; word-break:keep-all; cursor:pointer; }
+.lr-add-btn .icon { display:inline-flex; color:var(--ink-2); }
+.lr-add-btn .icon svg { width:22px; height:22px; }
+@media (hover: hover) { .lr-add-btn:hover { background:var(--surface-2); } }
+.t-group-btn .t-group-left { color:var(--warn); font-weight:600; }
 .t-quick-editor { position:relative; min-height:220px; max-height:min(62vh, 560px); overflow:auto; margin:0 -4px; }
 .t-quick-editor > .slide-host { height:auto; }
 .person .pill { height:20px; padding:0 8px; font-size:11px; }
@@ -193,17 +201,25 @@ function closePop() {
   openPop = null;
   if (p) p.close();
 }
-function popover(anchor, content, { className = "", align = "end" } = {}) {
+// side: 'bottom'(기본, 아래 → 넘치면 위) | 'left'(앵커 왼쪽, 세로 가운데 — 오른쪽 레일용)
+function popover(anchor, content, { className = "", align = "end", side = "bottom" } = {}) {
   closePop();
   const pop = el("div", { class: "popover " + className }, content);
   Object.assign(pop.style, { position: "fixed", left: "0px", top: "0px", visibility: "hidden" });
   document.body.appendChild(pop);
   const r = anchor.getBoundingClientRect();
   const pw = pop.offsetWidth, ph = pop.offsetHeight, vw = window.innerWidth, vh = window.innerHeight;
-  let left = align === "center" ? r.left + r.width / 2 - pw / 2 : align === "start" ? r.left : r.right - pw;
-  left = Math.max(8, Math.min(left, vw - pw - 8));
-  let top = r.bottom + 6;
-  if (top + ph > vh - 8 && r.top - ph - 6 >= 8) top = r.top - ph - 6;
+  let left, top;
+  if (side === "left") {
+    left = r.left - pw - 8;
+    if (left < 8) left = Math.max(8, Math.min(r.right + 8, vw - pw - 8));
+    top = Math.min(Math.max(8, r.top + r.height / 2 - ph / 2), vh - ph - 8);
+  } else {
+    left = align === "center" ? r.left + r.width / 2 - pw / 2 : align === "start" ? r.left : r.right - pw;
+    left = Math.max(8, Math.min(left, vw - pw - 8));
+    top = r.bottom + 6;
+    if (top + ph > vh - 8 && r.top - ph - 6 >= 8) top = r.top - ph - 6;
+  }
   pop.style.left = left + "px";
   pop.style.top = Math.max(8, top) + "px";
   pop.style.visibility = "";
@@ -1286,6 +1302,31 @@ function buildEditor(lessonId, teacher) {
 }
 
 // ───────────────────────── 수업 진행 /live/:id ─────────────────────────
+// 오른쪽 레일 칸: 아이콘(또는 이모지) + 이름표 + 배지 + 자물쇠. item.set({ hidden, active, hint, badge, tone, lock, title })
+function railItem({ label, icon: ic, emoji, html, onClick }) {
+  const badge = el("span", { class: "lr-badge", hidden: true });
+  const lock = el("span", { class: "lr-lock", hidden: true, "aria-hidden": "true" }, icon("lock", 12));
+  const glyph = emoji ? el("span", { class: "lr-ic lr-emoji", "aria-hidden": "true" }, emoji)
+    : html ? el("span", { class: "lr-ic", "aria-hidden": "true", html })
+    : el("span", { class: "lr-ic", "aria-hidden": "true" }, icon(ic, 22));
+  const b = el("button", { class: "lr-item", type: "button", title: label, "aria-label": label, "aria-pressed": "false", onClick },
+    [glyph, el("span", { class: "lr-label" }, label), badge, lock]);
+  b.set = ({ hidden = false, active = false, hint = false, badge: n = 0, tone = "ok", lock: lk = false, title = null } = {}) => {
+    b.hidden = !!hidden;
+    b.classList.toggle("active", !!active);
+    b.classList.toggle("hint", !!hint && !active);
+    b.setAttribute("aria-pressed", String(!!active));
+    const t = n > 0 ? String(n) : "";
+    badge.hidden = !t;
+    if (badge.textContent !== t) badge.textContent = t;
+    badge.classList.toggle("muted", tone === "muted");
+    lock.hidden = !lk;
+    const tt = title || label;
+    if (b.title !== tt) { b.title = tt; b.setAttribute("aria-label", tt); }
+  };
+  return b;
+}
+
 export function liveView({ id } = {}) {
   return withTeacher(async (teacher) => {
     ensureCss();
@@ -1301,45 +1342,43 @@ export function liveView({ id } = {}) {
 }
 
 function buildLive(sessionId, teacher) {
+  wsCss(); // 학습지 머리 줄·스위치 스타일(이 화면으로 바로 들어와도)
   let disposed = false, leaving = false, navBusy = false;
   let host = null, hostSlideId = null;
-  let drawerOpen = window.innerWidth >= 1100;
-  let userTab = "activity";
-  let lastFlow = null, peopleSig = null;
+  // 오른쪽 패널: 레일에서 고른 하나만 — 'tools'(이 슬라이드 도구) | 'people'(참여) | null(닫힘)
+  let panel = null;
+  let autoTools = window.innerWidth >= 1100; // 넓은 화면: 도구가 있는 슬라이드로 오면 저절로 펼침(직접 닫으면 멈춤)
+  let lastFlow = null, peopleSig = null, groupSig = null;
   const S = () => findSession(sessionId);
   const curSlide = (s = S()) => (s ? (s.slidesSnapshot || [])[s.currentSlide || 0] || null : null);
 
   const ch = joinSessionChannel(sessionId, { id: teacher.id, name: teacher.name, role: "teacher" });
   const unsub = subscribeSession(sessionId, { role: "teacher" });
 
-  // ── 상단 바 ──
+  // ── 상단 바: 수업 흐름만 (코드 · 이동 · 모드(+모둠) · 진행 방식 · 종료) ──
   const code = (currentTeacher() || teacher).joinCode || "";
   const titleEl = el("div", { class: "topbar-title" });
   const codeBtn = el("button", { class: "code-pill", type: "button", title: "참여 코드", onClick: () => openCodeModal(code, { sessionId, teacher }) }, code || "코드");
-  const onlineNum = el("span", {}, "0");
-  const onlineBtn = el("button", {
-    class: "online-pill", type: "button", title: "접속 중",
-    onClick: () => { userTab = "people"; setDrawer(true); renderDrawerTabs(); },
-  }, [el("span", { class: "dot on" }), onlineNum]);
-  const prevBtn = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "이전 슬라이드", onClick: () => step(-1) }, icon("chevron-left"));
-  const nextBtn = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "다음 슬라이드", onClick: () => step(1) }, icon("chevron-right"));
+  // 학습지 화면에서 슬라이드 이동을 누르면 슬라이드 화면으로 돌아간다
+  const prevBtn = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "이전 슬라이드", onClick: () => { setWsOpen(false); step(-1); } }, icon("chevron-left"));
+  const nextBtn = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "다음 슬라이드", onClick: () => { setWsOpen(false); step(1); } }, icon("chevron-right"));
   const countBtn = el("button", { class: "slide-count", type: "button", title: "슬라이드 이동", onClick: openStrip });
   const modeSeg = el("div", { class: "seg", role: "group", "aria-label": "모드" },
     MODES.map(([m, label]) => el("button", { type: "button", "data-mode": m, onClick: () => setMode(m) }, label)));
+  const groupBtn = el("button", { class: "btn btn-sm btn-ghost t-group-btn", type: "button", hidden: true, onClick: openGroups });
   const flowBtn = el("button", { class: "btn btn-sm btn-ghost", type: "button", onClick: toggleFlow });
-  const panelBtn = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "패널", title: "패널", onClick: () => setDrawer(!drawerOpen) }, icon("panel"));
   const endBtn = el("button", { class: "btn btn-sm btn-danger", type: "button", onClick: endClass }, "종료");
   const savingPill = el("span", { class: "pill pill-warn", role: "status", hidden: true }, "저장 중…");
   const top = el("header", { class: "topbar live-top" }, [
     el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "대시보드", title: "대시보드 (수업은 계속돼요)", onClick: () => go("/teacher") }, icon("arrow-left")),
-    titleEl, codeBtn, onlineBtn,
+    titleEl, codeBtn,
     el("div", { class: "slide-nav" }, [prevBtn, countBtn, nextBtn]),
-    modeSeg, flowBtn, panelBtn, savingPill, endBtn,
+    modeSeg, groupBtn, flowBtn, savingPill, endBtn,
   ]);
 
-  // ── 본문: 스테이지 + 드로어 ──
+  // ── 본문: 스테이지 | (패널) | 레일 ──
   const stage = el("section", { class: "stage live-stage" });
-  // 학습지: 오른쪽 가장자리 📝 탭 → 스테이지를 학생 필기 갤러리로(슬라이드 호스트는 숨긴 채 유지) · [학생 화면에 띄우기]
+  // 학습지: 레일 📝 → 스테이지를 학생 필기 갤러리로(슬라이드 호스트는 숨긴 채 유지) · '학생 화면 고정' 스위치
   const wsView = makeWsSessionView();
   let wsOpen = false, wsIdx = 0, wsHost = null, wsHostPage = null, wsSegN = -1, wsTimer = null, wsForceBusy = false;
   const wsPrev = el("button", { class: "btn btn-icon btn-ghost btn-sm", type: "button", "aria-label": "이전 쪽", onClick: () => wsGo(wsIdx - 1) }, icon("chevron-left", 18));
@@ -1347,52 +1386,38 @@ function buildLive(sessionId, teacher) {
   const wsPagesSeg = el("div", { class: "seg ws-pages", role: "group", "aria-label": "학습지 쪽" });
   const wsCount = el("span", { class: "slide-count", hidden: true });
   const wsStat = el("span", { class: "ws-stat" });
-  const wsForceBtn = el("button", { class: "btn btn-sm ws-force", type: "button", "aria-pressed": "false", onClick: toggleWsForce });
-  const wsCloseBtn = el("button", { class: "btn btn-sm btn-ghost", type: "button", title: "슬라이드 화면으로", onClick: () => setWsOpen(false) }, [icon("x", 16), "슬라이드로"]);
+  const wsForceSw = el("button", { class: "ws-switch", type: "button", role: "switch", "aria-checked": "false", onClick: toggleWsForce }, [
+    el("span", {}, "학생 화면 고정"),
+    el("span", { class: "ws-switch-track", "aria-hidden": "true" }, el("span", { class: "ws-switch-knob" })),
+  ]);
   const wsHead = el("div", { class: "ws-head" }, [
     el("span", { class: "ws-title" }, [el("span", { "aria-hidden": "true" }, "📝"), "학습지"]),
-    wsPrev, wsPagesSeg, wsCount, wsNext, wsStat, el("span", { class: "spacer" }), wsForceBtn, wsCloseBtn,
+    wsPrev, wsPagesSeg, wsCount, wsNext, wsStat, el("span", { class: "spacer" }), wsForceSw,
   ]);
   const wsBody = el("div", { class: "ws-body" });
   const wsStage = el("section", { class: "stage live-stage ws-stage", hidden: true, "aria-label": "학습지" }, [el("div", { class: "ws-view" }, [wsHead, wsBody])]);
-  const wsTabEl = wsTab({ onClick: () => setWsOpen(!wsOpen) });
-  // 드로어 활동 탭 맨 위: 상태 한 줄 + [학생 필기 보기] [학생 화면에 띄우기]
-  const wsPaneStat = el("span", {});
-  const wsPaneForce = el("button", { class: "btn btn-sm ws-force", type: "button", "aria-pressed": "false", onClick: toggleWsForce });
-  const wsPane = el("section", { class: "ws-pane", hidden: true, "aria-label": "학습지" }, [
-    el("div", { class: "ws-pane-head" }, [el("span", { "aria-hidden": "true" }, "📝"), el("b", {}, "학습지"), wsPaneStat]),
-    el("div", { class: "ws-pane-row" }, [
-      el("button", { class: "btn btn-sm", type: "button", onClick: () => setWsOpen(true) }, [icon("eye", 16), "학생 필기 보기"]),
-      wsPaneForce,
-    ]),
-  ]);
-  const tabAct = el("button", { type: "button", onClick: () => { userTab = "activity"; renderDrawerTabs(); } }, "활동");
-  const tabPeople = el("button", { type: "button", onClick: () => { userTab = "people"; renderDrawerTabs(); } }, "참여");
-  const pluginBox = el("div", { class: "t-plugin-panel", hidden: true });
-  const quickBox = el("section", { class: "t-quick", "aria-label": "상호작용 추가" }, [
-    el("div", { class: "t-quick-head" }, "상호작용 추가"),
-    el("div", { class: "t-quick-grid" }, [
-      el("button", { class: "t-quick-btn", type: "button", title: "흰 필기 슬라이드를 바로 추가", onClick: addBlank }, [
-        el("span", { class: "icon", html: BLANK_ICON }), el("span", {}, "빈 슬라이드"),
-      ]),
-      ...QUICK_TYPES.map(t => getSlideType(t)).filter((d, i) => d && d.type === QUICK_TYPES[i])
-        .map(d => el("button", { class: "t-quick-btn", type: "button", title: d.desc || d.label, onClick: () => openQuickAdd(d.type) }, [
-          el("span", { class: "icon", html: d.icon || "" }), el("span", {}, d.label),
-        ])),
-    ]),
-  ]);
-  const actBox = el("div", { class: "t-pane" }, [wsPane, pluginBox, quickBox]);
+  // 오른쪽 레일: 학습지 · 참여 · 추가 · 도구 — 누를 때만 그 하나를 펼친다
+  const railWs = railItem({ label: "학습지", emoji: "📝", onClick: () => setWsOpen(!wsOpen) });
+  const railPeople = railItem({ label: "참여", icon: "users", onClick: () => togglePanel("people") });
+  const railAdd = railItem({ label: "추가", icon: "plus", onClick: openAddPop });
+  const railTools = railItem({ label: "도구", html: TOOLS_ICON, onClick: () => togglePanel("tools") });
+  railWs.set({ hidden: true });
+  railTools.set({ hidden: true });
+  const rail = el("nav", { class: "live-rail", "aria-label": "수업 도구" }, [railWs, railPeople, railAdd, railTools]);
+  // 패널(한 번에 하나): 도구 = 플러그인 panel, 참여 = 참가자 목록
+  const drawerTitle = el("div", { class: "drawer-title" });
+  const pluginBox = el("div", { class: "t-pane t-plugin-panel", hidden: true });
   const peopleHead = el("div", { class: "muted" });
   const peopleList = el("div", { class: "people" });
-  const peopleBox = el("div", { class: "t-pane" }, [peopleHead, peopleList]);
-  const drawer = el("aside", { class: "drawer", "aria-label": "패널" }, [
+  const peopleBox = el("div", { class: "t-pane", hidden: true }, [peopleHead, peopleList]);
+  const drawer = el("aside", { class: "drawer closed", "aria-label": "패널" }, [
     el("div", { class: "drawer-head" }, [
-      el("div", { class: "tabs drawer-tabs" }, [tabAct, tabPeople]),
-      el("button", { class: "btn btn-icon btn-ghost btn-sm", type: "button", "aria-label": "닫기", onClick: () => setDrawer(false) }, icon("x", 18)),
+      drawerTitle,
+      el("button", { class: "btn btn-icon btn-ghost btn-sm", type: "button", "aria-label": "닫기", onClick: () => setPanel(null, { user: true }) }, icon("x", 18)),
     ]),
-    el("div", { class: "drawer-body" }, [actBox, peopleBox]),
+    el("div", { class: "drawer-body" }, [pluginBox, peopleBox]),
   ]);
-  const root = el("div", { class: "live" }, [top, el("div", { class: "live-body" }, [stage, wsStage, drawer, wsTabEl])]);
+  const root = el("div", { class: "live" }, [top, el("div", { class: "live-body" }, [stage, wsStage, drawer, rail])]);
   mount(root);
 
   // ── 동기화 ──
@@ -1403,38 +1428,63 @@ function buildLive(sessionId, teacher) {
       if (host) { try { host.destroy(); } catch (e) { console.warn(e); } host = null; }
       hostSlideId = null;
       stage.replaceChildren(el("div", { class: "empty" }, "슬라이드가 없어요"));
-      syncPanel();
+      syncPanel(true);
       return;
     }
     // 같은 슬라이드: DOM 보존, 훅만 (플러그인이 panel을 바꿨을 수도 있어 패널만 가볍게 맞춤)
-    if (host && hostSlideId === slide.id) { host.update({ slide, session: s }); syncPanel(); return; }
+    if (host && hostSlideId === slide.id) { host.update({ slide, session: s }); syncPanel(false); return; }
     closePop();
     if (host) { try { host.destroy(); } catch (e) { console.warn("[live] host destroy", e); } host = null; }
     stage.replaceChildren();
     hostSlideId = slide.id;
     host = mountSlideHost({ role: "teacher", root: stage, slide, session: s, me: teacher });
-    syncPanel();
+    syncPanel(true);
   }
-  function syncPanel() {
+  // 플러그인 panel → '도구'. changed = 슬라이드가 바뀜(넓은 화면이면 도구를 저절로 펼침)
+  function syncPanel(changed) {
     const p = host ? host.panel : null;
     if (p instanceof Node) { if (pluginBox.firstChild !== p || pluginBox.childNodes.length !== 1) pluginBox.replaceChildren(p); }
     else if (pluginBox.firstChild) pluginBox.replaceChildren();
-    pluginBox.hidden = !pluginBox.firstChild;
-    renderDrawerTabs();
+    const has = !!pluginBox.firstChild;
+    if (!has && panel === "tools") setPanel(null);
+    else if (changed && has && autoTools && panel !== "people" && !wsOpen) setPanel("tools");
+    else syncDrawer();
   }
-  // 활동 탭은 늘 있다(플러그인 패널이 없어도 [상호작용 추가])
-  function renderDrawerTabs() {
-    const tab = userTab === "activity" ? "activity" : "people";
-    tabAct.classList.toggle("active", tab === "activity");
-    tabPeople.classList.toggle("active", tab === "people");
-    actBox.hidden = tab !== "activity";
-    peopleBox.hidden = tab !== "people";
+  // user = 교사가 직접 열고 닫음 → 도구 자동 펼침 켜고 끄기
+  function setPanel(kind, { user = false } = {}) {
+    if (kind === "tools" && !pluginBox.firstChild) kind = null;
+    if (user) {
+      if (kind === "tools") autoTools = true;
+      else if (panel === "tools") autoTools = false;
+    }
+    panel = kind;
+    syncDrawer();
   }
-  function setDrawer(open) {
-    drawerOpen = !!open;
-    drawer.classList.toggle("closed", !drawerOpen);
-    panelBtn.classList.toggle("btn-soft", drawerOpen);
-    panelBtn.setAttribute("aria-pressed", String(drawerOpen));
+  function togglePanel(kind) { closePop(); setPanel(panel === kind ? null : kind, { user: true }); }
+  function syncDrawer() {
+    drawer.classList.toggle("closed", !panel);
+    pluginBox.hidden = panel !== "tools";
+    peopleBox.hidden = panel !== "people";
+    const slide = curSlide();
+    const t = panel === "people" ? "참여" : panel === "tools" ? `도구 · ${slide ? slideLabel(slide) : ""}` : "";
+    if (drawerTitle.textContent !== t) drawerTitle.textContent = t;
+    syncRail();
+  }
+  function syncRail() {
+    const has = !!pluginBox.firstChild;
+    const on = onlineSet().size;
+    railPeople.set({ active: panel === "people", badge: on, tone: "muted", title: `참여 · 접속 ${on}명` });
+    railAdd.set({ title: "추가 · 지금 슬라이드 다음에 끼워 넣기" });
+    const slide = curSlide();
+    railTools.set({
+      hidden: !has, active: panel === "tools", hint: has && panel !== "tools",
+      title: has && slide ? `도구 · ${getSlideType(slide.type).label} (마감·공개·응답)` : "도구",
+    });
+  }
+  // 상단 바 [모둠]: 필기 슬라이드가 모둠 모드일 때만 — 모둠 편성 창(ink actions.groups)
+  function openGroups() {
+    const a = host && host.actions;
+    if (a && typeof a.groups === "function") a.groups();
   }
   function syncTop() {
     const s = S();
@@ -1447,14 +1497,27 @@ function buildLive(sessionId, teacher) {
     prevBtn.disabled = i <= 0;
     nextBtn.disabled = i >= n - 1;
     const isInk = !!slide && slide.type === "ink";
-    modeSeg.hidden = !isInk;
+    const m = isInk ? effectiveMode(slide, s) : null;
+    modeSeg.hidden = !isInk || wsOpen; // 학습지 화면에서는 숨김(가려진 슬라이드의 모드라 헷갈림)
     if (isInk) {
-      const m = effectiveMode(slide, s);
       modeSeg.querySelectorAll("button").forEach(b => {
         const on = b.dataset.mode === m;
         b.classList.toggle("active", on);
         b.setAttribute("aria-pressed", String(on));
       });
+    }
+    groupBtn.hidden = m !== "group" || wsOpen;
+    if (m === "group") {
+      const gs = s.groups || [];
+      const assigned = new Set(gs.flatMap(g => g.memberIds || []));
+      const left = [...new Set([...(s.participants || []), ...onlineSet()])].filter(id => !assigned.has(id)).length;
+      const sig = `${gs.length}|${left}`;
+      if (sig !== groupSig) {
+        groupSig = sig;
+        groupBtn.replaceChildren(...[icon("users", 16), el("span", {}, gs.length ? `${gs.length}모둠` : "모둠 편성"),
+          gs.length && left ? el("span", { class: "t-group-left" }, `미배정 ${left}`) : null].filter(Boolean));
+        groupBtn.title = gs.length ? `모둠 편성 · ${gs.length}모둠${left ? ` · 미배정 ${left}명` : ""}` : "모둠 편성";
+      }
     }
     const flow = s.flow === "student" ? "student" : "teacher";
     if (flow !== lastFlow) {
@@ -1468,7 +1531,7 @@ function buildLive(sessionId, teacher) {
   function onlineSet() {
     try { return new Set(ch.online() || []); } catch (_) { return new Set(); }
   }
-  function syncOnline() { onlineNum.textContent = String(onlineSet().size); }
+  function syncOnline() { syncRail(); }
   function syncPeople() {
     const s = S();
     if (!s) return;
@@ -1513,7 +1576,9 @@ function buildLive(sessionId, teacher) {
     closePop();
     stage.hidden = on;
     wsStage.hidden = !on;
-    if (!on) destroyWsHost();
+    if (on && panel === "tools") setPanel(null);                 // 학습지 화면을 넓게(도구는 가려진 슬라이드 것)
+    if (!on) { destroyWsHost(); if (autoTools && pluginBox.firstChild && !panel) setPanel("tools"); }
+    syncTop();
     syncWs();
   }
   function wsGo(i) {
@@ -1552,24 +1617,20 @@ function buildLive(sessionId, teacher) {
     const pages = wsPages(s);
     const n = pages.length;
     if (!n) {
-      wsPane.hidden = true;
-      wsTabEl.set({ hidden: true });
+      railWs.set({ hidden: true });
       if (wsOpen) setWsOpen(false);
       return;
     }
     const st = wsStats(s, wsStudentIds(s));
     const forced = wsForced(s);
-    wsPane.hidden = false;
-    wsTabEl.set({ hidden: false, open: wsOpen, forced, badge: st.writing, label: wsOpen ? "슬라이드" : "학습지" });
     const statTxt = `작성 중 ${st.writing} · 작성함 ${st.written}/${st.total}`;
-    wsPaneStat.textContent = `${n}쪽 · ${statTxt}`;
-    for (const b of [wsForceBtn, wsPaneForce]) {
-      if (b.getAttribute("aria-pressed") !== String(forced) || !b.firstChild) {
-        b.setAttribute("aria-pressed", String(forced));
-        b.replaceChildren(icon(forced ? "lock" : "unlock", 16), forced ? "학생 화면에 띄움" : "학생 화면에 띄우기");
-        b.title = forced ? "학생 화면이 학습지로 고정돼요 · 누르면 풀기(학생이 닫을 수 있음)" : "모든 학생 화면을 학습지로 바꿔요(쪽은 학생이 자유롭게)";
-      }
-    }
+    railWs.set({
+      active: wsOpen, badge: st.writing, lock: forced,
+      title: `${wsOpen ? "학습지 닫기" : "학습지"} · ${n}쪽 · ${statTxt}${forced ? " · 학생 화면 고정 중" : ""}`,
+    });
+    if (wsForceSw.getAttribute("aria-checked") !== String(forced)) wsForceSw.setAttribute("aria-checked", String(forced));
+    const swTitle = forced ? "켜짐: 모든 학생 화면이 학습지로 고정돼요(쪽은 자유) · 끄면 학생이 닫을 수 있어요" : "켜면 모든 학생 화면이 학습지로 바뀌고 고정돼요(쪽은 자유)";
+    if (wsForceSw.title !== swTitle) wsForceSw.title = swTitle;
     if (!wsOpen) return;
     wsIdx = Math.max(0, Math.min(n - 1, wsIdx));
     if (wsSegN !== n) buildWsSeg(n);
@@ -1627,7 +1688,8 @@ function buildLive(sessionId, teacher) {
     if (!s || !slide || effectiveMode(slide, s) === m) return;
     const act = s.activity || {};
     patchSession(s, { activity: { ...act, [slide.id]: { ...(act[slide.id] || {}), mode: m } } });
-    if (m === "group" && !(s.groups || []).length) { userTab = "activity"; setDrawer(true); renderDrawerTabs(); }
+    // 모둠으로 바꿨는데 모둠이 없으면 바로 편성 창
+    if (m === "group" && !(s.groups || []).length) setTimeout(() => { if (!disposed) openGroups(); }, 0);
   }
   function toggleFlow() {
     const s = S();
@@ -1661,6 +1723,7 @@ function buildLive(sessionId, teacher) {
   async function insertNext(draft) {
     let s = S();
     if (!s || disposed) return false;
+    setWsOpen(false); // 새 슬라이드가 보이게
     // 진행 중인 게임에서 떠날 때는 이동과 같은 확인
     const cur = curSlide(s);
     if (cur && getSlideType(cur.type).category === "game" && ((s.activity || {})[cur.id] || {}).phase === "running") {
@@ -1706,6 +1769,23 @@ function buildLive(sessionId, teacher) {
     catch (e) { console.warn("[live] 편집기 표시 실패", e); box.replaceChildren(el("div", { class: "empty" }, "편집기를 불러오지 못했어요")); }
   }
 
+  // 레일 [추가]: 지금 슬라이드 다음에 끼워 넣을 상호작용 고르기(작은 창, 고르면 닫힘)
+  function openAddPop() {
+    if (openPop && openPop.anchor === railAdd) { closePop(); return; }
+    const item = (iconHtml, label, title, fn) => el("button", {
+      class: "lr-add-btn", type: "button", title, onClick: () => { closePop(); fn(); },
+    }, [el("span", { class: "icon", html: iconHtml }), el("span", {}, label)]);
+    const box = el("div", { class: "lr-add" }, [
+      el("div", { class: "lr-add-head" }, "지금 슬라이드 다음에 추가"),
+      el("div", { class: "lr-add-grid" }, [
+        item(BLANK_ICON, "빈 슬라이드", "흰 필기 슬라이드를 바로 추가", addBlank),
+        ...QUICK_TYPES.map(t => getSlideType(t)).filter((d, i) => d && d.type === QUICK_TYPES[i])
+          .map(d => item(d.icon || "", d.label, d.desc || d.label, () => openQuickAdd(d.type))),
+      ]),
+    ]);
+    popover(railAdd, box, { className: "lr-add-pop", side: "left" });
+  }
+
   // 썸네일 스트립으로 점프
   function openStrip() {
     if (openPop && openPop.anchor === countBtn) { closePop(); return; }
@@ -1714,7 +1794,7 @@ function buildLive(sessionId, teacher) {
     const cur = s.currentSlide || 0;
     const strip = el("div", { class: "thumb-strip" }, (s.slidesSnapshot || []).map((sl, i) => el("button", {
       class: "rail-item" + (i === cur ? " active" : ""), type: "button", title: slideLabel(sl),
-      onClick: () => { closePop(); goTo(i); },
+      onClick: () => { closePop(); setWsOpen(false); goTo(i); },
     }, [el("div", { class: "t-thumb" }, thumbOf(sl)), el("span", { class: "rail-num" }, String(i + 1))])));
     popover(countBtn, strip, { className: "t-strip-pop", align: "center" });
     const a = strip.querySelector(".active");
@@ -1736,7 +1816,9 @@ function buildLive(sessionId, teacher) {
     else if (e.code === "KeyF" || e.key === "f" || e.key === "F") { e.preventDefault(); toggleFullscreen(); }
     else if (e.key === "Escape") {
       if (openPop) closePop();
-      else if (wsOpen && !document.documentElement.classList.contains("has-layer")) setWsOpen(false);
+      else if (document.documentElement.classList.contains("has-layer")) return;
+      else if (wsOpen) setWsOpen(false);
+      else if (panel) setPanel(null, { user: true });
     }
   };
   document.addEventListener("keydown", onKey);
@@ -1757,7 +1839,6 @@ function buildLive(sessionId, teacher) {
     syncWs();
   });
 
-  setDrawer(drawerOpen);
   syncTop();
   syncHost();
   syncOnline();
