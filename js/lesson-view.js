@@ -16,6 +16,8 @@
 //       기본 획은 지우개로 지우면 그 scope의 removed에만 기록(원본 불변). 전체 지우기는 Rec만 비운다.
 // 가정: id 없는 레거시 기본 획은 '#<i>'(i < 기본 획 수, 순서 불변)로 removed에 기록 가능. Rec 쪽 '#' 키는 불안정해 기록 안 함.
 // 가정: individual/group인데 scopeId가 없으면(구버전 호출) 빈 읽기 전용으로 그린다.
+// 가정(v2.6.1): 텍스트 블록은 텍스트 도구일 때만 편집 가능(contenteditable). 펜 도구일 때 편집 가능한 칸이 화면에 있으면
+//       iPad의 Scribble(펜 손글씨 → 글자 입력)이 근처 필기를 가로채 글자 칸이 선택되는 일이 있어서 끈다.
 // zoom: true → root(스테이지)가 확대·이동 뷰포트가 된다(js/zoom-view.js). 캔버스는 프레임 밖에서 뷰포트 전체를 덮고
 //       보기 변환으로 그리며, 프레임(배경·텍스트)은 확대된 실제 크기로 배치된다. 호출 쪽은 fitFrame을 쓰지 않는다.
 
@@ -194,11 +196,21 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
     node.style.fontSize = ((t.size || 18) / 9.6).toFixed(3) + "cqw";
     node.style.color = t.color || "#1c1c22";
   }
+  // 텍스트 도구일 때만 편집 가능(그 밖에는 iPad Scribble이 펜 필기를 가로채지 않게)
+  function setEditable(node, on) {
+    if (!writable || !node || node.classList.contains("is-base")) return;
+    if (on) {
+      try { node.contentEditable = "plaintext-only"; } catch (_) {}
+      if (node.contentEditable !== "plaintext-only") node.contentEditable = "true";
+    } else {
+      if (document.activeElement === node) node.blur(); // 입력 중이던 글자 저장(blur 처리)
+      node.contentEditable = "false";
+    }
+  }
   function makeTextEl(key, t) {
     const tb = el("div", { class: "text-block" });
     if (writable) {
-      tb.contentEditable = "plaintext-only";
-      if (tb.contentEditable !== "plaintext-only") tb.contentEditable = "true";
+      setEditable(tb, textMode);
       tb.addEventListener("input", () => {
         if (destroyed) return;
         const cur = findText(key);
@@ -327,6 +339,7 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
     zoom: zv,
     setTool(t) {
       textMode = t === "text";
+      for (const node of [...textEls.values()]) setEditable(node, textMode);
       frame.classList.toggle("tool-text", textMode && writable);
       ink.setTool(textMode ? "pen" : t);
       ink.setReadOnly(!writable || textMode);

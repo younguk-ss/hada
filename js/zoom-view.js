@@ -12,6 +12,11 @@
 //       Ctrl(⌘)+휠·트랙패드 핀치 = 확대, 휠·두 손가락 스크롤 = 이동, 가운데 버튼 끌기 = 이동.
 // 가정: 내용 영역 분석은 같은 주소의 썸네일(없으면 배경)을 작게 그려 흰색(밝기 ≥ 236)이 아닌 픽셀의 범위를 찾는다.
 //       교차 출처로 읽을 수 없거나 내용이 종이의 25% 미만이면 종이 전체를 맞춤 대상으로 쓴다(제목만 있는 슬라이드 등).
+// 펜·손바닥(v2.6.1, js/pen-input.js): 펜이 닿으면 먼저 닿아 있던 터치(손바닥)가 긋던 선은 버리고, 그 터치로 시작된 확대·이동은
+//       그 자리에서 멈춘 뒤 펜으로 쓴다(보이는 곳에 써지게). 손바닥으로 본 터치는 뗄 때까지 무시한다. 펜을 쓰는 기기에서는 두 손가락 확대·이동이
+//       10px 넘게 움직여야 시작된다(가만히 얹은 손바닥으로 화면이 흔들리지 않게). 캔버스의 touchstart·touchmove를 막아
+//       iPad Safari의 길게 누르기 글자 선택·확대경·콜아웃과 두 번 탭 확대를 끈다(포인터 이벤트는 그대로 온다).
+import { isPalmTouch, penKnown, fingerDraws } from "./pen-input.js";
 
 const ASPECT = 1.6;          // 슬라이드 16:10
 const MARGIN = 10;           // 맞춤 시 가장자리 여백(px)
@@ -19,7 +24,6 @@ const STEP = 1.25;           // 버튼 확대 배율
 const PAD = 0.02;            // 내용 영역 둘레 여유(종이 크기 비율)
 const LIVE_POINTS = 6000;    // 획 점이 이 이하면 확대 중에도 필기를 실제로 다시 그림(선 굵기가 출렁이지 않게)
 const focusCache = new Map(); // 분석 주소 → 내용 영역(이미지 정규화) | null
-let penSeen = false;          // 이 기기에서 펜을 쓴 적이 있으면 한 손가락은 필기하지 않음
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const FULL = { x0: 0, y0: 0, x1: 1, y1: 1 };
@@ -183,9 +187,9 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
   }
 
   // ── 입력 ──
-  const pts = new Map();   // 터치 pointerId → {x, y}
-  const pens = new Set();  // 닿아 있는 펜
-  let g = null;            // { kind:'pinch'|'pan', ... }
+  const pts = new Map();     // 확대·이동에 쓰는 터치 pointerId → {x, y}
+  const ignored = new Set(); // 손바닥으로 본 터치(뗄 때까지 무시)
+  let g = null;              // { kind:'pinch'|'pan', touch, ... }
   let suppressClick = false;
   const drawable = () => !ink.readOnly;
   function local(e) {
@@ -196,19 +200,31 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
   const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
   function startPinch() {
     const [[ia, a], [ib, b]] = [...pts].slice(0, 2);
-    g = { kind: "pinch", ids: [ia, ib], d0: dist(a, b), m0: mid(a, b), v0: { ...live } };
+    g = { kind: "pinch", touch: true, ids: [ia, ib], d0: dist(a, b), m0: mid(a, b), v0: { ...live }, live: false };
   }
-  function startPan(id, p, moved = false) { g = { kind: "pan", id, sx: p.x, sy: p.y, v0: { ...live }, moved }; }
+  function startPan(id, p, moved = false, touch = false) { g = { kind: "pan", touch, id, sx: p.x, sy: p.y, v0: { ...live }, moved }; }
   function endGesture() {
     const was = g;
     g = null;
     if (was && (was.kind === "pinch" || was.moved)) commit();
   }
+  // 펜이 닿음: 손바닥(터치)이 시작한 확대·이동을 그 자리에서 멈춘다.
+  // 가정: 되돌리지 않는다 — 사용자는 지금 보이는 화면을 보고 펜을 댔으므로, 되돌리면 펜 아래 내용이 바뀌어 엉뚱한 곳에 써진다.
+  function abortTouchGesture() {
+    const was = g;
+    if (!was || !was.touch) return;
+    g = null;
+    if (was.live || was.moved) commit();
+  }
 
   function onDown(e) {
     if (e.pointerType === "pen") {
-      penSeen = true; pens.add(e.pointerId);
-      if (g) e.stopPropagation(); // 확대·이동 중에는 쓰지 않음(화면이 아직 확정 전)
+      // 펜 우선: 먼저 닿아 있던 터치는 손바닥 — 그 선·확대·이동을 취소하고 펜을 받는다
+      for (const id of pts.keys()) ignored.add(id);
+      pts.clear();
+      abortTouchGesture();
+      if (ink.isDrawing() && ink.pointerType() !== "pen") ink.cancelStroke();
+      if (g) e.stopPropagation(); // 마우스로 끄는 중이면 쓰지 않음
       return;
     }
     if (e.target.closest?.(".text-block:focus, button, input, textarea")) return;
@@ -224,9 +240,9 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
       }
       return;
     }
-    // 터치
+    // 터치: 펜이 닿아 있거나 막 떼거나 띄워 둔 동안·접촉면이 큰 터치는 손바닥 → 뗄 때까지 무시
+    if (isPalmTouch(e)) { ignored.add(e.pointerId); e.stopPropagation(); return; }
     pts.set(e.pointerId, p);
-    if (pens.size) { e.stopPropagation(); return; }        // 펜으로 쓰는 중 손바닥
     if (pts.size >= 2) {
       ink.cancelStroke();                                    // 첫 손가락이 긋던 선은 버림
       startPinch();
@@ -235,19 +251,27 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
       return;
     }
     if (drawable()) {
-      if (penSeen) e.stopPropagation();                       // 펜 사용자: 한 손가락은 무시(손바닥)
+      if (!fingerDraws()) e.stopPropagation();               // 펜 기기: 한 손가락은 쓰지 않음(손바닥 오인 방지)
       return;                                                 // 아니면 한 손가락 필기
     }
-    startPan(e.pointerId, p);                                 // 읽기 전용·텍스트: 한 손가락 이동
+    startPan(e.pointerId, p, false, true);                    // 읽기 전용·텍스트: 한 손가락 이동
   }
   function onMove(e) {
+    if (ignored.has(e.pointerId)) { e.stopPropagation(); return; }
     if (pts.has(e.pointerId)) pts.set(e.pointerId, local(e));
     if (!g) return;
     if (g.kind === "pinch") {
       if (!g.ids.includes(e.pointerId)) return;
       const a = pts.get(g.ids[0]), b = pts.get(g.ids[1]);
       if (!a || !b) return;
-      const m = mid(a, b), k = clamp(g.v0.z * dist(a, b) / g.d0, 1, zMax()) / g.v0.z;
+      const m = mid(a, b), d = dist(a, b);
+      if (!g.live) {
+        // 펜 기기: 10px 넘게 움직여야 확대·이동 시작(얹어 둔 손바닥이 화면을 흔들지 않게), 시작점은 지금 위치로
+        const dead = penKnown() ? 10 : 3;
+        if (Math.abs(d - g.d0) < dead && dist(m, g.m0) < dead) { e.stopPropagation(); return; }
+        g.live = true; g.d0 = d; g.m0 = m; g.v0 = { ...live };
+      }
+      const k = clamp(g.v0.z * d / g.d0, 1, zMax()) / g.v0.z;
       fitMode = false;
       setLive({ z: g.v0.z * k, ox: m.x - (g.m0.x - g.v0.ox) * k, oy: m.y - (g.m0.y - g.v0.oy) * k });
       e.stopPropagation();
@@ -261,13 +285,15 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
     }
   }
   function onUp(e) {
-    if (e.pointerType === "pen") { pens.delete(e.pointerId); return; }
+    if (e.pointerType === "pen") return;
+    if (ignored.delete(e.pointerId)) { e.stopPropagation(); return; }
     const wasPt = pts.delete(e.pointerId);
     if (!g) return;
     if (g.kind === "pinch") {
       if (!g.ids.includes(e.pointerId) && wasPt) return;
       if (pts.size >= 2) { startPinch(); return; }
-      if (pts.size === 1) { const [[id, p]] = [...pts]; startPan(id, p, true); return; } // 남은 손가락으로 이어서 이동
+      if (pts.size === 1 && g.live) { const [[id, p]] = [...pts]; startPan(id, p, true, true); return; } // 남은 손가락으로 이어서 이동
+      if (pts.size === 1) { g = null; return; } // 움직이지 않은 두 접점(얹은 손 등) → 아무 일 없음
       endGesture();
       e.stopPropagation();
     } else if (g.kind === "pan" && e.pointerId === g.id) {
@@ -308,12 +334,17 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
     zoomAt(gz.z * (e.scale || 1), gz.p.x, gz.p.y, { now: false });
   }
   function onGestureEnd(e) { e.preventDefault(); if (gz) { gz = null; commit(); } }
+  // iPad Safari: 캔버스에서 시작한 터치(펜 포함)는 브라우저 기본 동작(길게 누르기 글자 선택·확대경·콜아웃·두 번 탭 확대·스크롤)을 끈다.
+  // 포인터 이벤트는 그대로 오므로 필기·확대·이동은 영향 없음. 텍스트 도구일 때는 캔버스가 포인터를 받지 않아(대상이 프레임) 탭·편집이 그대로 동작.
+  function onTouch(e) { if (e.target === canvas && e.cancelable) e.preventDefault(); }
 
   const opt = { capture: true, passive: false };
   viewport.addEventListener("pointerdown", onDown, opt);
   viewport.addEventListener("pointermove", onMove, opt);
   viewport.addEventListener("pointerup", onUp, opt);
   viewport.addEventListener("pointercancel", onUp, opt);
+  viewport.addEventListener("touchstart", onTouch, { passive: false });
+  viewport.addEventListener("touchmove", onTouch, { passive: false });
   viewport.addEventListener("click", onClick, true);
   viewport.addEventListener("wheel", onWheel, { passive: false });
   viewport.addEventListener("gesturestart", onGestureStart, { passive: false });
@@ -365,6 +396,8 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
       viewport.removeEventListener("pointermove", onMove, opt);
       viewport.removeEventListener("pointerup", onUp, opt);
       viewport.removeEventListener("pointercancel", onUp, opt);
+      viewport.removeEventListener("touchstart", onTouch, { passive: false });
+      viewport.removeEventListener("touchmove", onTouch, { passive: false });
       viewport.removeEventListener("click", onClick, true);
       viewport.removeEventListener("wheel", onWheel);
       viewport.removeEventListener("gesturestart", onGestureStart);

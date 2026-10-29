@@ -15,7 +15,10 @@
 //       학생 화면은 스테이지 전체가 보기 영역이고, 도구바가 덮는 만큼만 맞춤에서 비운다(이동하면 도구바 뒤로도 보임).
 //       가로로 남는 화면이면 도구바를 왼쪽 세로 2열로 옮겨 슬라이드를 키운다(어느 쪽이 더 크게 보이는지 계산해 선택).
 // 가정: 갤러리 온라인 점은 realtime.currentChannel().onPresence로 갱신(없으면 onSession 때만).
+// 펜 기기(v2.6.1, js/pen-input.js): 펜을 처음 쓰면 그 기기에서는 손가락 필기를 끈다(손바닥 오인 방지). 도구바 끝 ✋ 버튼(펜 기기에서만 보임)으로
+//       손가락 필기를 다시 켜고 끈다. 도구바는 두 번 탭 확대를 막고(touch-action: manipulation), 글자 선택이 생기지 않는다.
 import * as ui from "../ui.js";
+import { penKnown, fingerDraws, setFingerDraw, onPenModeChange } from "../pen-input.js";
 import * as cloud from "../cloud.js";
 import * as storage from "../storage.js";
 import * as realtime from "../realtime.js";
@@ -47,10 +50,11 @@ const SVG = {
   zoomIn: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.4-4.4"/><path d="M8.2 11h5.6M11 8.2v5.6"/>',
   zoomOut: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.4-4.4"/><path d="M8.2 11h5.6"/>',
   users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0113 0"/><path d="M16 4.5a3.5 3.5 0 010 7"/><path d="M18 14a6 6 0 013.5 6"/>',
+  hand: '<path d="M18 11V6a2 2 0 00-4 0v5"/><path d="M14 10V4a2 2 0 00-4 0v6"/><path d="M10 10.5V6a2 2 0 00-4 0v8"/><path d="M18 8a2 2 0 114 0v6a8 8 0 01-8 8h-2c-2.8 0-4.5-.86-6-2.34l-3.6-3.6a2 2 0 012.83-2.82L7 15"/>',
 };
 const PEN_ICON = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${SVG.pen}</svg>`;
 
-const LOCAL_ICONS = new Set(["zoomIn", "zoomOut"]); // 앱 공용 아이콘에 없는 것
+const LOCAL_ICONS = new Set(["zoomIn", "zoomOut", "hand"]); // 앱 공용 아이콘에 없는 것
 function icon(name) {
   if (typeof ui.icon === "function" && !LOCAL_ICONS.has(name)) {
     try { const n = ui.icon(name); if (n) return n; } catch (_) {}
@@ -65,7 +69,11 @@ const CSS = `
 .ink-wrap .ink-stage > .slide-frame { flex:none; max-width:100%; margin:0 auto; }
 .ink-wrap.has-float .ink-stage { padding-bottom:76px; }
 .ink-toolbar { display:flex; align-items:center; gap:4px; padding:6px 8px; background:var(--surface); border:1px solid var(--line);
-  border-radius:var(--radius); box-shadow:var(--shadow-1); flex-wrap:wrap; align-self:center; max-width:100%; }
+  border-radius:var(--radius); box-shadow:var(--shadow-1); flex-wrap:wrap; align-self:center; max-width:100%;
+  touch-action:manipulation; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+.ink-hand { position:relative; }
+.ink-hand:not(.active)::after { content:""; position:absolute; left:9px; right:9px; top:50%; height:2px; border-radius:2px;
+  background:currentColor; transform:rotate(-45deg); opacity:.85; } /* 꺼짐 = 빗금 */
 .ink-toolbar .ink-grp { display:flex; align-items:center; gap:2px; }
 .ink-toolbar .ink-sep { width:1px; height:22px; background:var(--line); margin:0 4px; flex:none; }
 .ink-tool, .ink-size { width:36px; height:36px; border:0; border-radius:var(--radius-sm); background:transparent; color:var(--ink-2);
@@ -109,6 +117,18 @@ const CSS = `
 .ink-float .ink-tool, .ink-float .ink-size, .ink-float .ink-swatch { width:44px; height:44px; }
 @media (max-width:520px) { .ink-float { overflow-x:auto; max-width:calc(100vw - 16px); }
   .ink-float .ink-tool, .ink-float .ink-size, .ink-float .ink-swatch { width:44px; height:44px; min-width:44px; min-height:44px; } }
+/* 세로 태블릿(아이패드 744~834px, 갤럭시탭 800px): 아래 도구바가 한 줄에 다 들어가게 폭만 줄임(높이 44px 유지) */
+@media (max-width:940px) {
+  .ink-wrap:not(.bar-side) .ink-float { gap:2px; padding:4px 6px; }
+  .ink-wrap:not(.bar-side) .ink-float .ink-tool, .ink-wrap:not(.bar-side) .ink-float .ink-size { width:40px; }
+  .ink-wrap:not(.bar-side) .ink-float .ink-swatch { width:36px; min-width:36px; }
+  .ink-wrap:not(.bar-side) .ink-float .ink-sep { margin:0 2px; }
+  .ink-wrap:not(.bar-side) .ink-float .ink-zlbl { min-width:44px; padding:0 2px; }
+}
+@media (max-width:790px) {
+  .ink-wrap:not(.bar-side) .ink-float .ink-tool, .ink-wrap:not(.bar-side) .ink-float .ink-size { width:37px; }
+  .ink-wrap:not(.bar-side) .ink-float .ink-swatch { width:32px; min-width:32px; }
+}
 .ink-wait { flex:1; display:grid; place-items:center; }
 .ink-gallery { flex:1; min-height:0; overflow:auto; padding:2px; display:flex; flex-direction:column; gap:12px; }
 .ink-tiles { display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:12px; }
@@ -269,6 +289,17 @@ function makeToolbar(getViewer, { float = false, extras = [], zoom = false } = {
   const undoBtn = el("button", { type: "button", class: "ink-tool", title: "되돌리기", "aria-label": "되돌리기", onClick: () => getViewer()?.undo() }, [icon("undo")]);
   // 색 칸에 style 객체의 커스텀 속성 반영(el()은 Object.assign이라 --c가 안 들어감)
   colorBtns.forEach(b => b.style.setProperty("--c", b.dataset.id));
+  // ✋ 손가락 필기 켜기/끄기 — 펜을 쓴 기기에서만 보임
+  const handBtn = el("button", {
+    type: "button", class: "ink-tool ink-hand",
+    onClick: () => {
+      const on = !fingerDraws();
+      setFingerDraw(on);
+      ui.toast?.(on ? "손가락으로도 쓸 수 있어요" : "펜으로만 써요 · 손가락은 두 손가락 확대·이동");
+    },
+  }, [icon("hand")]);
+  const handSep = el("span", { class: "ink-sep sep-hand" });
+  syncHand(handBtn, handSep);
 
   const zg = zoom ? zoomGroup(getViewer) : null;
   const bar = el("div", { class: "ink-toolbar" + (float ? " ink-float" : "") }, [
@@ -280,6 +311,7 @@ function makeToolbar(getViewer, { float = false, extras = [], zoom = false } = {
     el("span", { class: "ink-sep sep-undo" }),
     undoBtn,
     ...(zg ? [el("span", { class: "ink-sep" }), zg] : []),
+    handSep, handBtn,
     ...extras,
   ]);
   function sync() {
@@ -293,6 +325,25 @@ function makeToolbar(getViewer, { float = false, extras = [], zoom = false } = {
   bar.bindZoom = (viewer) => zg?.bindZoom(viewer);
   return bar;
 }
+
+// ✋ 버튼 상태: 펜을 쓴 기기에서만 보이고, 손가락 필기가 켜져 있으면 active
+function syncHand(btn, sep) {
+  const show = penKnown();
+  btn.hidden = !show;
+  if (sep) sep.hidden = !show;
+  const on = fingerDraws();
+  btn.classList.toggle("active", show && on);
+  btn.setAttribute("aria-pressed", String(on));
+  const t = on ? "손가락 필기 켜짐 · 누르면 펜으로만" : "펜으로만 쓰는 중 · 누르면 손가락으로도 쓰기";
+  btn.title = t;
+  btn.setAttribute("aria-label", t);
+}
+// 펜을 처음 쓰거나 설정이 바뀌면 화면의 모든 도구바 ✋ 갱신(구독 해제가 필요 없게 DOM에서 찾음)
+onPenModeChange((mode, prev) => {
+  const btns = document.querySelectorAll(".ink-hand");
+  btns.forEach(b => syncHand(b, b.previousElementSibling?.classList.contains("sep-hand") ? b.previousElementSibling : null));
+  if (prev === null && mode === "pen" && btns.length) ui.toast?.("펜으로 쓰는 기기예요 · 손바닥 인식을 막으려고 손가락 필기를 껐어요(✋로 켜기)");
+});
 
 // 모달 열기 + 닫힘 감지
 function openModal(ctx, { title, body, actions = [], onClose }) {

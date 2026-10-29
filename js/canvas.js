@@ -17,8 +17,13 @@
 //    확대·이동 화면에서는 size × min(보는 배율, zw)로 그린다 →
 //      쓸 때와 같은 배율: 쓸 때 본 굵기 그대로 / 축소: 글씨와 함께 가늘어짐(굵어 보이지 않게) / 더 확대: 쓸 때보다 굵어지지 않음.
 //    기록·썸네일·인쇄 같은 정적 그림은 size(실제 굵기) × 그림 폭/960. zw 없는 이전 획은 zw = 1.
+// 8) 펜 입력(v2.6.1): 손바닥으로 본 터치는 받지 않는다(js/pen-input.js). 펜 지우개 끝·S펜 옆 버튼을 누른 채 쓰면 그 획은 지우개.
+//    그리는 중인 펜 획은 확정된 구간(뒤 점 2개가 정해진 구간)을 캐시에 바로 그려 두고 매 프레임 끝부분만 다시 그린다
+//    → 획이 길어져도 프레임 비용이 일정(저사양 크롬북·태블릿). 브라우저가 주는 예측 점(getPredictedEvents)으로 펜 끝을 조금 앞서 그려
+//    지연을 줄이고(저장하지 않음), 화면에서 0.6px보다 가까운 점은 버려 저장 크기를 줄인다. 위치 계산은 이벤트 묶음마다 한 번만.
 
 import { newId } from "./slides/registry.js";
+import { isPalmTouch } from "./pen-input.js";
 
 const REF_W = 960; // 선 굵기·글자 크기 기준 프레임 폭(px)
 
@@ -55,6 +60,9 @@ export class InkCanvas {
     this._k = this.dpr;
     this.view = null;            // 보기 변환 (없으면 캔버스 전체)
     this._cssW = 0; this._cssH = 0;
+    this._ptype = null;          // 그리는 중인 포인터 종류(pen|touch|mouse)
+    this._liveN = 0;             // 그리는 중인 펜 획에서 캐시에 이미 그린 구간 수(8)
+    this._pred = null;           // 예측 점(그리기만, 저장 안 함)
 
     this._ro = new ResizeObserver(() => this.resize());
     this._ro.observe(canvas);
@@ -82,6 +90,7 @@ export class InkCanvas {
     this._scheduleDraw();
   }
   isDrawing() { return !!this.current; }
+  pointerType() { return this.current ? this._ptype : null; }
   appendStroke(s) {
     this.strokes.push(s);
     this._keys.push(strokeKey(s, this.strokes.length - 1));
@@ -173,11 +182,14 @@ export class InkCanvas {
   // 이 보기에서 화면 1px이 슬라이드 폭의 몇 배로 커 보이는지(1 = 확대 안 함)
   zoomFactor() { const v = this._v(); return (v.cw || 1) / (v.baseW || v.cw || 1); }
 
-  _toNorm(ev) {
+  // 좌표 변환 기준(이벤트 묶음마다 한 번만 레이아웃을 읽는다)
+  _frame() {
     const c = this.canvas;
     const r = c.getBoundingClientRect();
-    const sx = (c.clientWidth || r.width) / (r.width || 1), sy = (c.clientHeight || r.height) / (r.height || 1);
-    const v = this._v();
+    return { r, sx: (c.clientWidth || r.width) / (r.width || 1), sy: (c.clientHeight || r.height) / (r.height || 1), v: this._v() };
+  }
+  _toNorm(ev, f = this._frame()) {
+    const { r, sx, sy, v } = f;
     return {
       x: ((ev.clientX - r.left) * sx - v.ox) / (v.cw || 1),
       y: ((ev.clientY - r.top) * sy - v.oy) / (v.ch || 1),
@@ -190,6 +202,9 @@ export class InkCanvas {
   _cancelCurrent() {
     if (!this.current) return;
     this.current = null;
+    this._pred = null;
+    // 캐시에 미리 그려 둔 구간이 있으면 캐시를 다시 만든다(8)
+    if (this._liveN > 0) { this._liveN = 0; this.cacheValid = false; }
     this._scheduleDraw();
   }
 
@@ -203,17 +218,24 @@ export class InkCanvas {
     on("pointerdown", (e) => {
       if (this.readOnly || this._destroyed) return;
       if (e.pointerType === "mouse" && e.button !== 0) return;
-      if (this.current) return; // 멀티터치: 첫 포인터만
+      if (e.pointerType === "touch" && isPalmTouch(e)) return; // 손바닥(8) — zoom-view가 먼저 거르지만 한 번 더
+      if (this.current) return; // 멀티터치: 첫 포인터만 (펜이 닿으면 zoom-view가 손바닥 획을 먼저 취소)
       const pt = this._toNorm(e);
       if (!this._inside(pt)) return;
       pid = e.pointerId;
       this._pid = pid;
+      this._ptype = e.pointerType || "mouse";
+      this._liveN = 0;
+      this._pred = null;
       try { c.setPointerCapture(pid); } catch (_) {}
+      // 펜 지우개 끝(button 5 / buttons 32)·옆 버튼(S펜 등, button 2 / buttons 2)을 누른 채 쓰면 지우개
+      const penErase = e.pointerType === "pen" && (e.button === 5 || e.button === 2 || (e.buttons & 34) !== 0);
+      const tool = penErase ? "eraser" : this.tool;
       this.current = {
-        tool: this.tool,
+        tool,
         color: this.color,
         // 형광펜은 굵게. 슬라이드 위 실제 굵기 = 펜 값 ÷ 쓰는 배율(7)
-        size: Math.max(0.05, r2((this.tool === "highlight" ? this.size * 4 : this.size) / this.zoomFactor())),
+        size: Math.max(0.05, r2((tool === "highlight" ? this.size * 4 : this.size) / this.zoomFactor())),
         ...(this.zoomFactor() > 1.01 ? { zw: r2(this.zoomFactor()) } : {}),
         points: [pt],
         ts: Date.now(),
@@ -224,15 +246,28 @@ export class InkCanvas {
 
     on("pointermove", (e) => {
       if (!this.current || e.pointerId !== pid) return;
-      // coalesced 이벤트로 중간 점 보충 → 부드러운 선
+      // coalesced 이벤트로 중간 점 보충 → 부드러운 선. 위치 기준은 한 번만 읽는다(8)
       const events = (typeof e.getCoalescedEvents === "function") ? e.getCoalescedEvents() : [e];
+      const f = this._frame();
+      const cw = f.v.cw || 1, ch = f.v.ch || 1;
       const pts = this.current.points;
       for (const ev of (events.length ? events : [e])) {
-        const pt = this._toNorm(ev);
+        const pt = this._toNorm(ev, f);
         const last = pts[pts.length - 1];
-        const dx = pt.x - last.x, dy = pt.y - last.y;
-        if ((dx * dx + dy * dy) < 0.0000001) continue;
+        const dx = (pt.x - last.x) * cw, dy = (pt.y - last.y) * ch;
+        if ((dx * dx + dy * dy) < 0.36) continue; // 화면에서 0.6px 안쪽 점은 버림
         pts.push(pt);
+      }
+      // 예측 점: 펜 끝을 조금 앞서 그려 지연을 줄인다(가까운 것만, 저장 안 함)
+      this._pred = null;
+      if (typeof e.getPredictedEvents === "function") {
+        try {
+          const pr = e.getPredictedEvents();
+          if (pr && pr.length) {
+            const q = this._toNorm(pr[pr.length - 1], f), last = pts[pts.length - 1];
+            if (Math.hypot((q.x - last.x) * cw, (q.y - last.y) * ch) < 40) this._pred = [{ x: q.x, y: q.y, p: last.p }];
+          }
+        } catch (_) { this._pred = null; }
       }
       this._scheduleDraw();
       this._maybeBroadcastLive();
@@ -241,7 +276,10 @@ export class InkCanvas {
     const finish = (e) => {
       if (!this.current || e.pointerId !== pid) return;
       const s = this.current;
+      const liveN = this._liveN;
       this.current = null;
+      this._liveN = 0;
+      this._pred = null;
       try { c.releasePointerCapture(pid); } catch (_) {}
       pid = null; this._pid = null;
       if (s.tool === "eraser") {
@@ -266,8 +304,12 @@ export class InkCanvas {
         this.strokes.push(s);
         this._keys.push(s.id);
         this._mine.push(s.id);
-        this._appendToCache(s);
+        // 앞 구간은 이미 캐시에 있음(8) → 남은 끝 구간만. 캐시가 무효면 다음 렌더가 통째로 다시 그림
+        if (liveN > 0 && this.cacheValid) this._paint(this.cacheCtx, [s], { from: liveN, to: s.points.length - 1, pts: s.points });
+        else this._appendToCache(s);
         this.onCommit({ type: "add", stroke: s });
+      } else if (liveN > 0) {
+        this.cacheValid = false;
       }
       this._scheduleDraw();
       try { this.onEnd(); } catch (_) {}
@@ -311,15 +353,30 @@ export class InkCanvas {
     if (this._destroyed) return;
     const { ctx, canvas } = this;
     if (!this.cacheValid) this._rebuildCache();
+    const cur = this.current;
+    // 펜 획: 뒤 점 2개가 정해진 구간(i ≤ 점 수 - 3)은 모양이 바뀌지 않으므로 캐시에 바로 그려 둔다(8)
+    const inc = !!cur && cur.tool === "pen" && cur.points.length >= 4;
+    if (inc) {
+      const upto = cur.points.length - 2;
+      if (upto > this._liveN) {
+        this._paint(this.cacheCtx, [cur], { from: this._liveN, to: upto, pts: cur.points });
+        this._liveN = upto;
+      }
+    }
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(this.cache, 0, 0);
-    if (this.current) this._paint(ctx, [this.current]);
+    if (cur) {
+      const pts = this._pred ? cur.points.concat(this._pred) : cur.points;
+      if (inc) this._paint(ctx, [cur], { from: this._liveN, to: pts.length - 1, pts });
+      else this._paint(ctx, [pts === cur.points ? cur : { ...cur, points: pts }]);
+    }
   }
 
-  // 보기 변환을 적용해 획 그리기(슬라이드 영역 밖은 잘라냄)
-  _paint(g, list) {
+  // 보기 변환을 적용해 획 그리기(슬라이드 영역 밖은 잘라냄). range = { from, to, pts } → 그 구간만(8)
+  _paint(g, list, range = null) {
+    const draw = (s, W, H, k) => (range ? drawStrokeRange(g, s, W, H, k, range.from, range.to, range.pts) : drawStroke(g, s, W, H, k));
     if (!this.view) {
-      for (const s of list) drawStroke(g, s, g.canvas.width, g.canvas.height, this._k);  // 보기 없음 = 배율 1(실제 굵기)
+      for (const s of list) draw(s, g.canvas.width, g.canvas.height, this._k);  // 보기 없음 = 배율 1(실제 굵기)
       return;
     }
     const v = this.view, d = g.canvas.width / (this._cssW || 1);
@@ -330,7 +387,7 @@ export class InkCanvas {
     g.translate(v.ox * d, v.oy * d);
     const zv = (v.cw || 1) / (v.baseW || v.cw || 1);
     // 7) 쓸 때 배율까지만 함께 커짐 — 축소하면 가늘어지고, 더 확대해도 쓸 때보다 굵어지지 않음
-    for (const s of list) drawStroke(g, s, v.cw * d, v.ch * d, this._k * Math.min(zv, s.zw || 1));
+    for (const s of list) draw(s, v.cw * d, v.ch * d, this._k * Math.min(zv, s.zw || 1));
     g.restore();
   }
 
@@ -339,6 +396,7 @@ export class InkCanvas {
     cacheCtx.clearRect(0, 0, cache.width, cache.height);
     this._paint(cacheCtx, this.strokes);
     this.cacheValid = true;
+    this._liveN = 0; // 그리는 중인 획의 확정 구간은 다음 렌더에서 다시 캐시에 그린다
   }
 
   _appendToCache(stroke) {
@@ -359,11 +417,8 @@ function sigOf(list, keys) {
   return s;
 }
 
-// 획 하나 그리기. k = 굵기 배율(디바이스 px)
-export function drawStroke(ctx, s, W, H, k = 1) {
-  if (!s || !s.points || s.points.length === 0) return;
-  const baseW = (s.size || 2) * k;
-  ctx.save();
+// 획 종류별 선 모양
+function strokeStyle(ctx, s) {
   if (s.tool === "highlight") {
     ctx.globalAlpha = 0.32;
     ctx.lineCap = "butt";
@@ -385,6 +440,46 @@ export function drawStroke(ctx, s, W, H, k = 1) {
     ctx.fillStyle = s.color || "#1c1c22";
   }
   ctx.lineJoin = "round";
+}
+
+// 구간 [from, to)를 압력 가변 굵기 + Catmull-Rom 보간으로 (이웃 점은 pts 전체에서)
+function strokeSegments(ctx, pts, W, H, baseW, from, to) {
+  const N = 8;
+  for (let i = from; i < to; i++) {
+    const p0 = pts[Math.max(0, i - 1)];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[Math.min(pts.length - 1, i + 2)];
+    const pr = ((p1.p || 0.5) + (p2.p || 0.5)) / 2;
+    ctx.lineWidth = baseW * (0.55 + 0.9 * pr);
+    ctx.beginPath();
+    ctx.moveTo(p1.x * W, p1.y * H);
+    for (let t = 1; t <= N; t++) {
+      const u = t / N;
+      const u2 = u * u, u3 = u2 * u;
+      const x = 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * u + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * u2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * u3);
+      const y = 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * u + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * u2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * u3);
+      ctx.lineTo(x * W, y * H);
+    }
+    ctx.stroke();
+  }
+}
+
+// 그리는 중인 펜 획의 일부 구간만 그리기(증분 렌더, canvas 8). pts = 이웃 점까지 포함한 점 목록(예측 점 포함 가능)
+export function drawStrokeRange(ctx, s, W, H, k, from, to, pts = s.points) {
+  if (!s || !pts || to <= from) return;
+  ctx.save();
+  strokeStyle(ctx, s);
+  strokeSegments(ctx, pts, W, H, (s.size || 2) * k, Math.max(0, from), Math.min(to, pts.length - 1));
+  ctx.restore();
+}
+
+// 획 하나 그리기. k = 굵기 배율(디바이스 px)
+export function drawStroke(ctx, s, W, H, k = 1) {
+  if (!s || !s.points || s.points.length === 0) return;
+  const baseW = (s.size || 2) * k;
+  ctx.save();
+  strokeStyle(ctx, s);
 
   const pts = s.points;
 
@@ -430,24 +525,7 @@ export function drawStroke(ctx, s, W, H, k = 1) {
   }
 
   // 구간별 가변 굵기 + Catmull-Rom 보간
-  for (let i = 0; i < pts.length - 1; i++) {
-    const p0 = pts[Math.max(0, i - 1)];
-    const p1 = pts[i];
-    const p2 = pts[i + 1];
-    const p3 = pts[Math.min(pts.length - 1, i + 2)];
-    const pr = ((p1.p || 0.5) + (p2.p || 0.5)) / 2;
-    ctx.lineWidth = baseW * (0.55 + 0.9 * pr);
-    ctx.beginPath();
-    ctx.moveTo(p1.x * W, p1.y * H);
-    for (let t = 1; t <= N; t++) {
-      const u = t / N;
-      const u2 = u * u, u3 = u2 * u;
-      const x = 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * u + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * u2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * u3);
-      const y = 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * u + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * u2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * u3);
-      ctx.lineTo(x * W, y * H);
-    }
-    ctx.stroke();
-  }
+  strokeSegments(ctx, pts, W, H, baseW, 0, pts.length - 1);
   ctx.restore();
 }
 

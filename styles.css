@@ -1274,6 +1274,21 @@ body:has(.float-toolbar, .stu-toolbar, .ink-float) .toast-stack { bottom: calc(8
 .stu-stage:has(> .slide-host[data-type="ink"]) { padding: 0 var(--sar) var(--sab) var(--sal); }
 /* 필기 화면에서는 페이지 자체 확대를 막는다(슬라이드만 두 손가락으로 확대) */
 .stu:has(.zoom-view) { touch-action: pan-x pan-y; }
+
+/* ── 펜 필기 화면 공통(v2.6.1, js/pen-input.js): 펜·손바닥으로 글자 선택·길게 누르기 메뉴·이미지 끌기·두 번 탭 확대·고무줄 스크롤이
+      생기지 않게 (iPad Safari·Android Chrome/삼성 인터넷·Chromebook). 입력칸·편집 중인 글자는 그대로 선택 가능 ── */
+.stu, .live, .editor, .ink-wrap, .ws-view, .ws-tab {
+  -webkit-user-select: none; user-select: none;
+  -webkit-touch-callout: none;
+}
+:is(.stu, .live, .editor, .ink-wrap) :is(input, textarea, select, [contenteditable="true"], [contenteditable="plaintext-only"]) {
+  -webkit-user-select: text; user-select: text;
+  -webkit-touch-callout: default;
+}
+:is(.stu, .live, .editor, .ink-wrap) img { -webkit-user-drag: none; }
+.stu, .live, .editor { touch-action: manipulation; } /* 두 번 탭 확대 끔(필기 화면은 아래·위 규칙으로 페이지 확대도 끔) */
+.live:has(.zoom-view), .editor:has(.zoom-view), .modal-back:has(.zoom-view) { touch-action: pan-x pan-y; }
+html:has(.zoom-view), html:has(.zoom-view) body { overscroll-behavior: none; } /* 손바닥으로 페이지가 고무줄처럼 끌리지 않게 */
 .stu.has-toolbar .stage, .stu.has-toolbar .stu-stage { padding-bottom: calc(80px + var(--sab)); }
 .stu .stage:has(.float-toolbar, .stu-toolbar) { padding-bottom: calc(80px + var(--sab)); }
 .stu-stage:has(.float-toolbar, .stu-toolbar) { padding-bottom: calc(80px + var(--sab)); }
