@@ -137,10 +137,21 @@ export function makeWsSessionView() {
     const activity = { ...(real.activity || {}) };
     for (const p of wsPages(real)) if (p && p.id) activity[p.id] = { ...(activity[p.id] || {}), phase: "idle", mode: "individual" };
     const over = { activity };
-    const view = new Proxy(real, { get: (t, k) => (Object.hasOwn(over, k) ? over[k] : Reflect.get(t, k)) });
+    const view = new Proxy(real, { get: (t, k) => (Object.prototype.hasOwnProperty.call(over, k) ? over[k] : Reflect.get(t, k)) });
     cache = { real, act: real.activity, ws: real.worksheet, view };
     return view;
   };
+}
+
+// 앞뒤 쪽 배경을 미리 받아 둔다(쪽 넘김이 빠르게 — 저사양 태블릿·느린 와이파이). 받기만 하고 그림은 그릴 때 푼다. 같은 주소는 한 번만.
+const prefetched = new Set();
+export function wsPrefetch(pages, i) {
+  for (const j of [i + 1, i - 1]) {
+    const src = pages && pages[j] && pages[j].bg;
+    if (!src || prefetched.has(src) || prefetched.size > 300) continue;
+    prefetched.add(src);
+    try { const im = new Image(); im.decoding = "async"; im.src = src; } catch (_) { /* 무시 */ }
+  }
 }
 
 // 오른칽 가장자리 📝 탭. tab.set({ hidden, open, forced, badge, label })

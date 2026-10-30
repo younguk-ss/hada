@@ -9,7 +9,7 @@
 //       못 읽거나 가로 슬라이드면 종이 전체. 필기·텍스트가 내용 영역 밖(학습지 흰 여백)에 있으면 그만큼 넓힌다.
 import { el, modal, toast, icon } from "./ui.js";
 import { findStudent, studentLabel } from "./store.js";
-import { drawStroke, strokeKey } from "./canvas.js";
+import { drawStroke, drawTextBox, strokeKey } from "./canvas.js";
 import { getSlideType, effectiveMode, injectCss } from "./slides/index.js";
 import { cloudEnsureReviewCode } from "./cloud.js";
 import { pageRectFor } from "./zoom-view.js";
@@ -140,8 +140,10 @@ function inkBounds(strokes, texts, removed) {
     if (!t || !t.value || (t.id && removed.has(t.id))) continue;
     const fs = (t.size || 18) / REF_W;
     const lines = String(t.value).split("\n");
-    const w = Math.max(...lines.map(l => l.length)) * fs * 1.05 + fs;
-    add(t.x, t.y, t.x + w, t.y + (lines.length * 1.3 + 0.6) * fs * FRAME);
+    // 칸 크기(t.w·t.h, v2.8)가 있으면 그 칸, 없으면 글자 수로 어림
+    const w = t.w > 0 ? t.w : Math.max(...lines.map(l => l.length)) * fs * 1.05 + fs;
+    const h = Math.max(t.h > 0 ? t.h : 0, (lines.length * 1.3 + 0.6) * fs * FRAME);
+    add(t.x, t.y, t.x + w, t.y + h);
   }
   return x1 > x0 ? { x0, y0, x1, y1 } : null;
 }
@@ -194,13 +196,7 @@ async function renderInk(session, slide, studentId) {
   strokes.forEach((s, i) => { if (!removed.has(strokeKey(s, i))) drawStroke(ctx, s, FW, FH, k); });
   for (const t of texts) {
     if (!t || !t.value || (t.id && removed.has(t.id))) continue;
-    const fs = Math.max(4, (t.size || 18) * k);
-    ctx.save();
-    ctx.fillStyle = t.color || "#1c1c22";
-    ctx.font = `${fs}px "Pretendard Variable", Pretendard, -apple-system, system-ui, sans-serif`;
-    ctx.textBaseline = "top";
-    String(t.value).split("\n").forEach((line, li) => ctx.fillText(line, t.x * FW + fs * 0.45, t.y * FH + fs * 0.3 + li * fs * 1.3));
-    ctx.restore();
+    drawTextBox(ctx, t, FW, FH, Math.max(4, (t.size || 18) * k), '"Pretendard Variable", Pretendard, -apple-system, system-ui, sans-serif');
   }
   ctx.restore();
   const aspect = W / H;

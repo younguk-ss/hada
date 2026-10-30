@@ -440,7 +440,9 @@ function writingRegion(rec, page, aspect, ignoreBy) {
   }
   for (const t of rec.texts || []) {
     if (!t || !String(t.value || "").trim() || (t.id && rm.has(t.id)) || (ignoreBy && t.by === ignoreBy)) continue;
-    const fw = String(t.value).length * (t.size || 18) / 960 * 0.6, fh = (t.size || 18) * 1.4 / 600;
+    // 칸 크기(t.w·t.h, v2.8)가 있으면 그 칸
+    const fw = t.w > 0 ? t.w : String(t.value).length * (t.size || 18) / 960 * 0.6;
+    const fh = Math.max(t.h > 0 ? t.h : 0, (t.size || 18) * 1.4 / 600);
     items.push({ ts: t.ts || 0, pts: [{ x: t.x, y: t.y }, { x: t.x + fw, y: t.y + fh }] });
   }
   if (!items.length) return null;
@@ -520,7 +522,7 @@ function Editor({ slide, lesson, update, ctx }) {
   const fileIn = el("input", { type: "file", accept: "image/*,application/pdf", style: { display: "none" } });
   const btnReplace = el("button", { type: "button", class: "btn btn-sm", onClick: () => fileIn.click() }, "교체");
   const btnRemove = el("button", { type: "button", class: "btn btn-sm btn-ghost", onClick: removeBg }, "제거");
-  const modeSeg = seg(MODES, slide.mode || "whole", (m) => { update({ mode: m }); segSet(modeSeg, m); });
+  const modeSeg = seg(MODES, slide.mode || "none", (m) => { update({ mode: m }); segSet(modeSeg, m); });
   const inspector = el("div", { class: "ink-inspector" }, [
     el("div", { class: "field" }, [el("label", {}, "배경 이미지"), bgBox, el("div", { class: "ink-insp-row" }, [btnReplace, btnRemove]), fileIn]),
     el("div", { class: "field" }, [el("label", {}, "기본 모드"), modeSeg]),
@@ -1070,7 +1072,8 @@ registerSlideType({
   desc: "배경 위에 함께 필기",
   icon: PEN_ICON,
   create() {
-    return { type: "ink", title: null, config: {}, bg: null, bgPath: null, thumb: null, mode: "whole", strokes: [], texts: [] };
+    // 새 필기 슬라이드의 기본 모드 = 발표(수업 중 상단 모드 seg로 전체·개별·모둠으로 바꿈)
+    return { type: "ink", title: null, config: {}, bg: null, bgPath: null, thumb: null, mode: "none", strokes: [], texts: [] };
   },
   thumb,
   Editor,

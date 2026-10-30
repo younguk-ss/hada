@@ -20,6 +20,11 @@
 //       iPad의 Scribble(펜 손글씨 → 글자 입력)이 근처 필기를 가로채 글자 칸이 선택되는 일이 있어서 끈다.
 // zoom: true → root(스테이지)가 확대·이동 뷰포트가 된다(js/zoom-view.js). 캔버스는 프레임 밖에서 뷰포트 전체를 덮고
 //       보기 변환으로 그리며, 프레임(배경·텍스트)은 확대된 실제 크기로 배치된다. 호출 쪽은 fitFrame을 쓰지 않는다.
+// 텍스트 상자(v2.8, 학생·교사 공통 — 텍스트 도구일 때): 글자 칸을 누르면 선택 테두리가 생기고
+//       왼쪽 위 ✥ 끌기 = 옮기기, 오른쪽 아래 ↘ 끌기 = 칸 크기(폭 w · 최소 높이 h, 프레임 비율), 위 작은 막대 = 글자 작게·크게·지우기.
+//       선택한 칸은 도구바의 색·S/M/L도 바로 따른다. 옮기기·크기는 손을 뗄 때 저장(ts 갱신 → 병합에서 최신이 이김).
+//       w가 없으면 예전처럼 글자에 맞춰 늘어남(최대 70%). 미니·인쇄(canvas.js drawTextBox)도 같은 칸 폭으로 줄바꿈.
+// 가정: 컨테이너 단위(cqw)를 모르는 구형 브라우저는 글자 크기를 프레임 폭 기준 px로 계산해 넣고 프레임 크기가 바뀌면 다시 맞춘다.
 
 import { el } from "./ui.js";
 import { InkCanvas, strokeKey } from "./canvas.js";
@@ -39,6 +44,27 @@ const BASE_CSS = `
 .slide-frame.tool-text .text-block { pointer-events:auto; }
 .slide-frame.tool-text .text-block.is-base { pointer-events:none; }
 .slide-frame.tool-text .text-block:hover, .slide-frame .text-block:focus { border-color:var(--accent); background:rgba(255,255,255,.65); }
+.slide-frame.tool-text .text-block.is-sel { background:rgba(255,255,255,.65); }
+/* 텍스트 상자 선택 테두리 · 옮기기/칸 크기 손잡이 · 글자 크기 막대 (화면 px 고정 — 프레임은 확대된 실제 크기로 배치됨) */
+.slide-frame .tx-sel { position:absolute; z-index:3; pointer-events:none; border:2px solid var(--accent); border-radius:7px; }
+.slide-frame .tx-sel[hidden] { display:none; }
+.tx-sel .tx-h { position:absolute; width:32px; height:32px; margin:0; padding:0; border:2px solid #fff; border-radius:50%; background:var(--accent); color:#fff;
+  display:grid; place-items:center; pointer-events:auto; touch-action:none; box-shadow:0 1px 5px rgba(0,0,0,.28); }
+.tx-sel .tx-h svg { width:16px; height:16px; pointer-events:none; }
+.tx-sel .tx-move { left:-17px; top:-17px; cursor:move; }
+.tx-sel .tx-resize { right:-17px; bottom:-17px; cursor:nwse-resize; }
+.tx-sel .tx-bar { position:absolute; left:20px; bottom:calc(100% + 10px); display:flex; align-items:center; gap:2px; padding:3px; border-radius:10px;
+  background:var(--surface, #fff); border:1px solid var(--line, #e5e5e5); box-shadow:0 4px 16px rgba(20,20,30,.16); pointer-events:auto; white-space:nowrap; }
+.tx-sel.bar-below .tx-bar { bottom:auto; top:calc(100% + 10px); }
+.tx-sel .tx-bar button { min-width:36px; height:36px; padding:0 6px; border:0; border-radius:8px; background:transparent; color:var(--ink-2, #333);
+  font:700 14px/1 var(--font, sans-serif); display:grid; place-items:center; cursor:pointer; touch-action:manipulation; }
+.tx-sel .tx-bar button svg { width:18px; height:18px; pointer-events:none; }
+.tx-sel .tx-bar .tx-small { font-size:12px; }
+.tx-sel .tx-bar .tx-big { font-size:18px; }
+.tx-sel .tx-bar .tx-del { color:var(--danger, #b91c1c); }
+.tx-sel .tx-fs { min-width:28px; text-align:center; font:600 12px/1 var(--font, sans-serif); color:var(--muted, #888); font-variant-numeric:tabular-nums; }
+.tx-sel .tx-sep { width:1px; height:20px; background:var(--line, #e5e5e5); margin:0 2px; }
+@media (hover:hover) { .tx-sel .tx-bar button:hover { background:var(--surface-2, #f3f3f3); } }
 .zoom-view { position:relative; overflow:hidden; display:block !important; padding:0 !important; touch-action:none; -webkit-user-select:none; user-select:none; }
 .zoom-view, .zoom-view * { touch-action:none !important; }
 .zoom-view > .slide-frame { position:absolute; margin:0 !important; max-width:none !important; transform-origin:0 0; }
@@ -47,6 +73,19 @@ const BASE_CSS = `
 
 // 펜 굵기 → 글자 크기(기준 폭 960px)
 function textSizeFor(size) { return size <= 2.5 ? 18 : size <= 4 ? 24 : 32; }
+
+// 텍스트 상자(v2.8)
+const CQ_OK = typeof CSS !== "undefined" && typeof CSS.supports === "function" && CSS.supports("width", "1cqw");
+const TX_MIN_W = 0.05, TX_MIN_H = 0.04; // 칸 최소 크기(프레임 비율)
+const TX_MIN_FS = 2, TX_MAX_FS = 160;   // 글자 크기 범위(기준 폭 960px)
+const r4 = (v) => Math.round(v * 10000) / 10000;
+const clampN = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const svg = (d) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+const TX_ICON = {
+  move: svg('<path d="M12 3v18M3 12h18"/><path d="M9 6l3-3 3 3M9 18l3 3 3-3M6 9l-3 3 3 3M18 9l3 3-3 3"/>'),
+  size: svg('<path d="M9 20h11V9"/><path d="M20 20L9 9"/>'),
+  trash: svg('<path d="M4 7h16"/><path d="M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/>'),
+};
 
 const EMPTY = () => ({ strokes: [], texts: [], removed: [] });
 
@@ -87,6 +126,25 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
 
   const zv = zoom ? createZoomView({ viewport: root, frame, canvas, ink, getImg: () => img, src: slide.thumb || slide.bg }) : null;
   let zvSrc = slide.bg || null;
+
+  // 텍스트 상자 선택(v2.8) — 쓸 수 있는 화면에서만
+  let selKey = null;      // 선택한 텍스트 id
+  let txDrag = null;      // 옮기기·칸 크기 끄는 중 { kind, id, key, sx, sy, kx, ky, x, y, w, h, moved }
+  let barDown = false;    // 막대 버튼을 누르는 중(그 사이 blur로 빈 칸이 지워지지 않게)
+  const selBox = writable ? makeSelBox() : null;
+  if (selBox) textLayer.appendChild(selBox);
+  const selRO = selBox ? new ResizeObserver(() => placeSel()) : null;
+  if (selRO) selRO.observe(textLayer);
+  // cqw를 모르는 브라우저: 프레임 크기가 바뀌면 글자 크기(px)를 다시 맞춤
+  const fontRO = CQ_OK ? null : new ResizeObserver(() => {
+    const rec = pathFor(false);
+    const byKey = new Map();
+    base.texts.forEach((t, i) => { if (t) byKey.set("b:" + (t.id || i), t); });
+    (rec.texts || []).forEach((t, i) => { if (t) byKey.set(t.id || ("#t" + i), t); });
+    for (const [k, node] of textEls) { const t = byKey.get(k); if (t) placeText(node, t); }
+    placeSel();
+  });
+  if (fontRO) fontRO.observe(frame);
 
   doRefresh();
 
@@ -193,8 +251,149 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
   function placeText(node, t) {
     node.style.left = (t.x * 100) + "%";
     node.style.top = (t.y * 100) + "%";
-    node.style.fontSize = ((t.size || 18) / 9.6).toFixed(3) + "cqw";
+    node.style.fontSize = CQ_OK ? ((t.size || 18) / 9.6).toFixed(3) + "cqw"
+      : ((t.size || 18) * (frame.clientWidth || 960) / 960).toFixed(2) + "px";
     node.style.color = t.color || "#1c1c22";
+    // 칸 크기(v2.8): w = 칸 폭, h = 최소 높이(프레임 비율). 없으면 글자에 맞춰 늘어남(최대 70%)
+    node.style.width = t.w > 0 ? (t.w * 100) + "%" : "";
+    node.style.maxWidth = t.w > 0 ? "none" : "";
+    node.style.minHeight = t.h > 0 ? (t.h * 100) + "%" : "";
+  }
+
+  // ── 텍스트 상자 선택·옮기기·칸 크기·글자 크기(v2.8) ──
+  function makeSelBox() {
+    // 막대 버튼: 누르는 동안 입력 중인 글자 칸의 포커스를 지키고(키보드가 내려가지 않게), click에서 실행
+    const btn = (cls, label, html, run) => {
+      const b = el("button", { type: "button", class: cls, title: label, "aria-label": label, html });
+      b.addEventListener("pointerdown", (e) => { e.preventDefault(); e.stopPropagation(); barDown = true; });
+      b.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); try { run(); } finally { barDown = false; } });
+      b.addEventListener("pointercancel", () => { barDown = false; });
+      return b;
+    };
+    const fsEl = el("span", { class: "tx-fs", "aria-live": "polite" }, "");
+    const bar = el("div", { class: "tx-bar" }, [
+      btn("tx-small", "글자 작게", "가−", () => bumpSize(-1)),
+      fsEl,
+      btn("tx-big", "글자 크게", "가+", () => bumpSize(1)),
+      el("span", { class: "tx-sep" }),
+      btn("tx-del", "글자 칸 지우기", TX_ICON.trash, () => removeText(selKey)),
+    ]);
+    const moveH = el("button", { type: "button", class: "tx-h tx-move", title: "끌어서 옮기기", "aria-label": "글자 칸 옮기기", html: TX_ICON.move });
+    const sizeH = el("button", { type: "button", class: "tx-h tx-resize", title: "끌어서 칸 크기 바꾸기", "aria-label": "글자 칸 크기", html: TX_ICON.size });
+    bindDrag(moveH, "move");
+    bindDrag(sizeH, "size");
+    const box = el("div", { class: "tx-sel", hidden: true }, [bar, moveH, sizeH]);
+    box.addEventListener("click", (e) => e.stopPropagation()); // 손잡이·막대를 눌러도 새 글자 칸이 생기지 않게
+    box.fsEl = fsEl;
+    return box;
+  }
+  function select(key) {
+    if (!selBox) return;
+    if (selKey !== key) {
+      const prev = selKey ? textEls.get(selKey) : null;
+      if (prev) { prev.classList.remove("is-sel"); try { selRO.unobserve(prev); } catch (_) {} }
+      selKey = key || null;
+      const node = selKey ? textEls.get(selKey) : null;
+      if (node) { node.classList.add("is-sel"); try { selRO.observe(node); } catch (_) {} }
+    }
+    placeSel();
+  }
+  // 선택 테두리를 글자 칸에 맞춤 — 글자 칸처럼 프레임 비율(%)로 둔다: 확대·맞춤으로 프레임 크기가 바뀌어도
+  // 글자 칸(위치 %·글자 cqw)과 함께 커지고 줄어 어긋나지 않는다. 내용이 바뀔 때(입력·크기)만 다시 잰다.
+  function placeSel() {
+    if (!selBox || destroyed) return;
+    const node = selKey ? textEls.get(selKey) : null;
+    const t = selKey ? findText(selKey) : null;
+    if (!textMode || !node || !t || !node.isConnected) { if (!selBox.hidden) selBox.hidden = true; return; }
+    selBox.hidden = false;
+    const lw = textLayer.clientWidth || 1, lh = textLayer.clientHeight || 1;
+    const pct = (v) => (v * 100).toFixed(4) + "%";
+    Object.assign(selBox.style, {
+      left: pct(t.x || 0), top: pct(t.y || 0),
+      width: pct(node.offsetWidth / lw), height: pct(node.offsetHeight / lh),
+    });
+    selBox.classList.toggle("bar-below", (t.y || 0) * lh < 56); // 위쪽 끝이면 막대를 아래로(프레임 밖으로 잘리지 않게)
+    const fs = String(Math.round((t.size || 18) * 10) / 10);
+    if (selBox.fsEl.textContent !== fs) selBox.fsEl.textContent = fs;
+  }
+  function bindDrag(h, kind) {
+    h.addEventListener("pointerdown", (e) => {
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      e.preventDefault(); e.stopPropagation(); // 글자 칸 포커스 유지 · 확대/이동·필기로 넘어가지 않게
+      const t = selKey ? findText(selKey) : null, node = selKey ? textEls.get(selKey) : null;
+      if (!t || !node || !writable || destroyed) return;
+      const lw = textLayer.clientWidth || 1, lh = textLayer.clientHeight || 1;
+      const r = textLayer.getBoundingClientRect(); // 화면 1px = 프레임 비율 얼마(확대 미리보기 transform까지 반영)
+      txDrag = {
+        kind, id: e.pointerId, key: selKey, sx: e.clientX, sy: e.clientY, kx: 1 / (r.width || lw), ky: 1 / (r.height || lh),
+        x: t.x, y: t.y, w: node.offsetWidth / lw, h: node.offsetHeight / lh, moved: false,
+      };
+      try { h.setPointerCapture(e.pointerId); } catch (_) {}
+    });
+    h.addEventListener("pointermove", (e) => {
+      const d = txDrag;
+      if (!d || d.id !== e.pointerId) return;
+      e.stopPropagation();
+      const t = findText(d.key), node = textEls.get(d.key);
+      if (!t || !node) return;
+      if (!d.moved && Math.hypot(e.clientX - d.sx, e.clientY - d.sy) < 2) return;
+      d.moved = true;
+      const dx = (e.clientX - d.sx) * d.kx, dy = (e.clientY - d.sy) * d.ky;
+      if (d.kind === "move") {
+        // 칸 전체가 프레임 안에 남게(오른쪽 끝에서 글자에 맞춘 칸이 좁아지며 줄이 바뀌지 않게)
+        t.x = r4(clampN(d.x + dx, 0, Math.max(0, 1 - d.w)));
+        t.y = r4(clampN(d.y + dy, 0, Math.max(0, 1 - d.h)));
+      } else {
+        t.w = r4(clampN(d.w + dx, TX_MIN_W, Math.max(TX_MIN_W, 1 - t.x)));
+        t.h = r4(clampN(d.h + dy, TX_MIN_H, Math.max(TX_MIN_H, 1 - t.y)));
+      }
+      placeText(node, t);
+      placeSel();
+    });
+    const end = (e) => {
+      const d = txDrag;
+      if (!d || d.id !== e.pointerId) return;
+      txDrag = null;
+      try { h.releasePointerCapture(e.pointerId); } catch (_) {}
+      const t = findText(d.key), node = textEls.get(d.key);
+      if (!t || !d.moved) return;
+      t.ts = Date.now();
+      clearTimeout(textTimer); textTimer = 0;
+      persist();
+      // 빈 칸을 먼저 키운 경우: 바로 쓸 수 있게 다시 입력 상태로
+      if (node && !String(t.value || "").trim() && document.activeElement !== node) setTimeout(() => { if (!destroyed && node.isConnected) node.focus(); }, 0);
+    };
+    h.addEventListener("pointerup", end);
+    h.addEventListener("pointercancel", end);
+    h.addEventListener("lostpointercapture", end);
+  }
+  // 선택한 칸 바꾸기(색·글자 크기) — 입력과 같은 300ms 묶음 저장
+  function setSelected(patch) {
+    const t = selKey ? findText(selKey) : null, node = selKey ? textEls.get(selKey) : null;
+    if (!t || !node) return;
+    Object.assign(t, patch, { ts: Date.now() });
+    placeText(node, t);
+    placeSel();
+    schedulePersist();
+  }
+  function bumpSize(dir) {
+    const t = selKey ? findText(selKey) : null;
+    if (!t) return;
+    const s = t.size || 18;
+    setSelected({ size: Math.round(clampN(dir > 0 ? s * 1.2 : s / 1.2, TX_MIN_FS, TX_MAX_FS) * 100) / 100 });
+  }
+  function removeText(key) {
+    if (!key || !writable || destroyed) return;
+    const rec = pathFor(true);
+    const i = rec.texts.findIndex(x => x.id === key);
+    if (i >= 0) rec.texts.splice(i, 1);
+    addRemoved(rec, [key]);
+    if (selKey === key) select(null);
+    const node = textEls.get(key);
+    textEls.delete(key);
+    if (node) node.remove();
+    clearTimeout(textTimer); textTimer = 0;
+    persist();
   }
   // 텍스트 도구일 때만 편집 가능(그 밖에는 iPad Scribble이 펜 필기를 가로채지 않게)
   function setEditable(node, on) {
@@ -218,20 +417,17 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
         cur.value = tb.innerText.replace(/\n$/, "");
         cur.ts = Date.now();
         schedulePersist();
+        if (selKey === key) placeSel();
       });
+      // 텍스트 도구에서 칸을 누르거나 입력 상태가 되면 선택(옮기기·칸 크기·글자 크기)
+      tb.addEventListener("pointerdown", () => { if (textMode && !destroyed) select(key); });
+      tb.addEventListener("focus", () => { if (textMode && !destroyed) select(key); });
+      tb.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.preventDefault(); tb.blur(); select(null); } });
       tb.addEventListener("blur", () => {
         if (destroyed) return;
-        const rec = pathFor(true);
-        const i = rec.texts.findIndex(x => x.id === key);
-        if (i >= 0 && !String(rec.texts[i].value || "").trim()) {
-          rec.texts.splice(i, 1);
-          addRemoved(rec, [key]);
-          textEls.delete(key);
-          tb.remove();
-          clearTimeout(textTimer); textTimer = 0;
-          persist();
-          return;
-        }
+        const cur = findText(key);
+        // 빈 칸은 지운다 — 단, 손잡이로 끌거나 막대를 누르는 중이면 그대로(먼저 칸을 키우고 나서 쓸 수 있게)
+        if (cur && !String(cur.value || "").trim() && !txDrag && !barDown) { removeText(key); return; }
         flushPersist();
       });
     }
@@ -275,8 +471,12 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
       }
     });
     for (const [key, node] of textEls) {
-      if (!seen.has(key)) { node.remove(); textEls.delete(key); }
+      if (!seen.has(key)) {
+        if (key === selKey) select(null);
+        node.remove(); textEls.delete(key);
+      }
     }
+    placeSel();
   }
 
   // 텍스트 도구: 빈 곳 탭 → 새 텍스트
@@ -291,7 +491,7 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
       y: Math.round(Math.min(0.95, Math.max(0, (e.clientY - r.top) / r.height)) * 10000) / 10000,
       value: "",
       // 확대 중이면 배율만큼 작게(화면에서 보이는 글자 크기 유지, 굿노트 식)
-      size: Math.max(2, Math.round(textSize / ink.zoomFactor() * 100) / 100),
+      size: clampN(Math.round(textSize / ink.zoomFactor() * 100) / 100, TX_MIN_FS, TX_MAX_FS),
       color: ink.color,
       ts: Date.now(),
     };
@@ -299,6 +499,7 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
     const node = makeTextEl(t.id, t);
     textEls.set(t.id, node);
     textLayer.appendChild(node);
+    select(t.id);
     setTimeout(() => node.focus(), 10);
   });
 
@@ -344,9 +545,18 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
       ink.setTool(textMode ? "pen" : t);
       ink.setReadOnly(!writable || textMode);
       canvas.style.pointerEvents = textMode ? "none" : "";
+      if (!textMode) select(null); else placeSel();
     },
-    setColor(c) { ink.setColor(c); },
-    setSize(s) { ink.setSize(s); textSize = textSizeFor(s); },
+    // 텍스트 도구에서 색·S/M/L을 바꾸면 선택한 글자 칸에도 바로 반영(값이 바뀔 때만 — 도구바는 누를 때마다 셋 다 다시 넘긴다)
+    setColor(c) {
+      if (textMode && c !== ink.color) setSelected({ color: c });
+      ink.setColor(c);
+    },
+    setSize(s) {
+      const ts = textSizeFor(s);
+      if (textMode && ts !== textSize) setSelected({ size: Math.max(TX_MIN_FS, Math.round(ts / ink.zoomFactor() * 100) / 100) });
+      ink.setSize(s); textSize = ts;
+    },
     refresh,
     isDrawing: () => ink.isDrawing(),
     undo() { return writable ? ink.undo() : false; },
@@ -365,6 +575,8 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
       if (destroyed) return;
       if (textTimer) flushPersist(); // 입력 중이던 텍스트 저장
       destroyed = true;
+      try { selRO?.disconnect(); fontRO?.disconnect(); } catch (_) {}
+      txDrag = null;
       zv?.destroy();
       ink.destroy();
       textEls.clear();

@@ -1252,6 +1252,28 @@ async function ensureReviewCode(s) {
   }
 }
 
+// 기록 목록용: 여러 세션의 이미 있는 복습 코드를 한 번에 읽어 둔다(없는 코드는 만들지 않음 — [복습 링크]를 누를 때 만든다).
+// → 목록에서 링크 복사가 누른 자리에서 바로(클립보드 사용자 동작 안에서) 된다. 세션마다 한 번만 묻는다.
+const reviewAsked = new Set();
+export async function cloudFetchReviewCodes(ids) {
+  await ready();
+  if (!isCloud) return;
+  const want = [...new Set(ids || [])].filter(id => id && !reviewAsked.has(id) && !findSession(id)?.reviewCode);
+  if (!want.length) return;
+  want.forEach(id => reviewAsked.add(id));
+  try {
+    for (let i = 0; i < want.length; i += 100) {
+      const { data, error } = await supa.from("sessions").select("id,review_code").in("id", want.slice(i, i + 100)).not("review_code", "is", null);
+      if (error) { if (error.code !== "42703") throw error; return; } // 42703: review_code 열이 아직 없는 DB
+      const rows = (data || []).filter(r => r && r.review_code);
+      if (rows.length) store.set(() => { for (const r of rows) { const s = findSession(r.id); if (s && !s.reviewCode) s.reviewCode = r.review_code; } });
+    }
+  } catch (e) {
+    warn("fetchReviewCodes", e);
+    want.forEach(id => reviewAsked.delete(id));
+  }
+}
+
 // 복습 코드 → { id, teacherId, status, title, teacher } | null
 export async function cloudFindSessionByReviewCode(code) {
   await ready();

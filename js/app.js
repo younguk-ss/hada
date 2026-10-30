@@ -7,6 +7,9 @@
 // 가정: QR 입장(/student/join?c=)에서 기억된 학생이면 로그인 화면을 그린 뒤 그 코드로 바로 입장을 시도한다(lastCode는 성공 시 저장).
 // 가정: 코드 칸 하나로 교사 코드와 수업별 복습 코드(학습지 QR, /r/CODE)를 함께 받는다 — 교사 코드를 먼저 찾고 없으면 복습 코드.
 //       복습 코드로 들어오면 lastCode(대기 화면용 교사 코드)는 이전 값을 두고, 없을 때만 그 수업 선생님의 코드로 채운다.
+// 가정: 복습 코드(학습지 QR·기록의 복습 링크)는 수업이 진행 중이어도 늘 학생 페이스 복습으로 보낸다(첫 슬라이드부터).
+//       진행 중인 수업이면 복습 화면 위쪽에 [수업 들어가기]가 뜬다. 수업 참여는 교사 코드로.
+import "./compat.js"; // 구형 브라우저 보완(가장 먼저)
 import "./slides/index.js"; // 슬라이드 타입 등록 (top-level await — 라우팅 전에 끝남)
 import { route, start, go } from "./router.js";
 import { mount, template, el } from "./ui.js";
@@ -233,9 +236,8 @@ function studentLoginView(params = {}, { autoCode = null } = {}) {
       });
       ssSet("hada:joinCode", null);
       if (review) {
-        // 진행 중이면 수업으로, 끝났으면 복습으로 (복습 화면도 live면 수업으로 보낸다)
-        if (review.status === "live") ssSet("hada:left", null);
-        go((review.status === "live" ? "/student/live/" : "/student/review/") + review.id);
+        // 복습은 늘 내 페이스로(진행 중인 수업이어도) — 수업에 들어가려면 복습 화면의 [수업 들어가기]
+        go("/student/review/" + review.id);
         return;
       }
       let live = null;

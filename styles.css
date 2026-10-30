@@ -47,8 +47,13 @@
   --topbar-h: 56px;
   --stu-topbar-h: 52px;
   --tabbar-h: 60px;
-  color-scheme: light;
+  color-scheme: only light;
 }
+/* 강제 다크 모드 끄기(v2.8): 안드로이드 크롬 '웹페이지 어둡게'·삼성 인터넷 다크 모드가 흰 학습지(글씨만 있는 이미지)를 반전시켜
+   검은 화면에 윤곽만 보이게 했다. 'only light' = 이 페이지는 밝은 화면 전용(브라우저가 색을 바꾸지 않음).
+   삼성 인터넷은 prefers-color-scheme 다크 규칙이 있는 사이트에는 자체 다크 모드를 씌우지 않는다 → 같은 값을 다크에서도 명시. */
+@media (prefers-color-scheme: dark) { :root { color-scheme: only light; } }
+.slide-frame, .slide-frame img, .zoom-view, .zoom-view canvas, .ink-mini, .ws-view { color-scheme: only light; forced-color-adjust: none; }
 @media (max-width: 600px) { :root { --bb-h: 30px; } }
 @media print { :root { --bb-h: 0px; } }
 

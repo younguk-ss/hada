@@ -214,8 +214,9 @@ function loadPdfJs() {
   return pdfjsPromise;
 }
 
+// 가져온 PDF·이미지 슬라이드의 기본 모드 = 발표(학습지 쪽은 teacher.js가 'individual'로 바꿔 넣는다)
 function inkSlide(id, img) {
-  return { id, type: "ink", title: null, config: {}, bg: img.url, bgPath: img.path, thumb: img.thumb, mode: "whole", strokes: [], texts: [] };
+  return { id, type: "ink", title: null, config: {}, bg: img.url, bgPath: img.path, thumb: img.thumb, mode: "none", strokes: [], texts: [] };
 }
 
 // 동시 업로드 제한(≤3)

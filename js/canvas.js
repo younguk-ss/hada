@@ -21,11 +21,29 @@
 //    그리는 중인 펜 획은 확정된 구간(뒤 점 2개가 정해진 구간)을 캐시에 바로 그려 두고 매 프레임 끝부분만 다시 그린다
 //    → 획이 길어져도 프레임 비용이 일정(저사양 크롬북·태블릿). 브라우저가 주는 예측 점(getPredictedEvents)으로 펜 끝을 조금 앞서 그려
 //    지연을 줄이고(저장하지 않음), 화면에서 0.6px보다 가까운 점은 버려 저장 크기를 줄인다. 위치 계산은 이벤트 묶음마다 한 번만.
+// 9) 구형·저사양 태블릿(v2.8, 갤럭시탭 S6 Lite 등): 저지연 캔버스(desynchronized)는 앞 버퍼에 바로 그리는 모드라
+//    일부 안드로이드 GPU(Mali 등)에서 투명한 필기 캔버스가 검게 덮이거나(오버레이가 투명도를 섞지 못함) 지우고 다시 그리는 순간이
+//    그대로 보여 빠르게 깜빡였다(학습지 화면이 검고 윤곽만 깜빡임) → 크롬북에서만 켠다(기기별 강제: localStorage 'hada:lowLatency' '1'|'0').
+//    비트맵은 한 변 4096px·총 1200만 화소 이하로 줄이고(메모리 부족으로 GPU가 그리기를 포기하지 않게),
+//    GPU 메모리 부족 등으로 캔버스 내용을 잃었다가 돌아오면(contextrestored) 다시 그린다.
 
 import { newId } from "./slides/registry.js";
 import { isPalmTouch } from "./pen-input.js";
 
 const REF_W = 960; // 선 굵기·글자 크기 기준 프레임 폭(px)
+const MAX_SIDE = 4096, MAX_PX = 12e6; // 캔버스 비트맵 한도(9)
+
+// 저지연 캔버스를 써도 되는 기기인가(9)
+const LOW_LATENCY = (() => {
+  try { const v = localStorage.getItem("hada:lowLatency"); if (v === "1") return true; if (v === "0") return false; } catch (_) {}
+  return typeof navigator !== "undefined" && /\bCrOS\b/.test(navigator.userAgent || "");
+})();
+// 화면 크기(CSS px) → 쓸 배율(기기 배율, 한도 안에서)
+function bitmapScale(cssW, cssH) {
+  const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+  const w = Math.max(1, cssW), h = Math.max(1, cssH);
+  return Math.max(0.25, Math.min(dpr, MAX_SIDE / w, MAX_SIDE / h, Math.sqrt(MAX_PX / (w * h))));
+}
 
 const r4 = (v) => Math.round(v * 10000) / 10000;
 const r2 = (v) => Math.round(v * 100) / 100;
@@ -36,7 +54,7 @@ export function strokeKey(s, i) { return (s && s.id) || ("#" + i); }
 export class InkCanvas {
   constructor(canvas, opts = {}) {
     this.canvas = canvas;
-    this.ctx = canvas.getContext("2d", { alpha: true, desynchronized: true });
+    this.ctx = canvas.getContext("2d", LOW_LATENCY ? { alpha: true, desynchronized: true } : { alpha: true });
     this.dpr = window.devicePixelRatio || 1;
     this.tool = "pen";
     this.color = "#1c1c22";
@@ -66,6 +84,10 @@ export class InkCanvas {
 
     this._ro = new ResizeObserver(() => this.resize());
     this._ro.observe(canvas);
+    // GPU가 캔버스를 잃었다가 돌려주면 다시 그림(9) — 화면 캔버스·캐시 둘 다
+    this._onRestore = () => { this.cacheValid = false; this._scheduleDraw(); };
+    canvas.addEventListener("contextrestored", this._onRestore);
+    this.cache.addEventListener("contextrestored", this._onRestore);
 
     this._bind();
     this.resize();
@@ -140,11 +162,11 @@ export class InkCanvas {
   resize() {
     if (this._destroyed) return;
     const { canvas } = this;
-    this.dpr = window.devicePixelRatio || 1; // 모니터 이동 시 갱신
     // 레이아웃 크기(변환 무시) — 확대 중 CSS transform이 걸려 있어도 비트맵 크기가 흔들리지 않게
     const r = canvas.getBoundingClientRect();
     this._cssW = canvas.clientWidth || r.width;
     this._cssH = canvas.clientHeight || r.height;
+    this.dpr = bitmapScale(this._cssW, this._cssH); // 모니터 이동 시 갱신, 큰 화면은 한도 안으로(9)
     const w = Math.max(1, Math.round(this._cssW * this.dpr));
     const h = Math.max(1, Math.round(this._cssH * this.dpr));
     this._updateK();
@@ -164,6 +186,8 @@ export class InkCanvas {
     const c = this.canvas;
     for (const [ev, fn, o] of this._handlers || []) c.removeEventListener(ev, fn, o);
     this._handlers = [];
+    c.removeEventListener("contextrestored", this._onRestore);
+    this.cache.removeEventListener("contextrestored", this._onRestore);
     this.current = null;
     this.cache.width = this.cache.height = 0;
   }
@@ -180,7 +204,9 @@ export class InkCanvas {
   // 확정 획의 점 개수 합(확대 중 실시간으로 다시 그릴지 판단용)
   pointCount() { let n = 0; for (const st of this.strokes) n += st.points ? st.points.length : 0; return n; }
   // 이 보기에서 화면 1px이 슬라이드 폭의 몇 배로 커 보이는지(1 = 확대 안 함)
-  zoomFactor() { const v = this._v(); return (v.cw || 1) / (v.baseW || v.cw || 1); }
+  // 확대 보기는 늘 1배 이상 — 아직 크기를 못 잰 캔버스(숨김 화면에서 막 그려짐 등)가 1/960 같은 값을 내어
+  // 그때 만든 글자·획이 수백 배로 커지지 않게 1 아래는 1로
+  zoomFactor() { const v = this._v(); const z = (v.cw || 1) / (v.baseW || v.cw || 1); return Number.isFinite(z) && z > 1 ? z : 1; }
 
   // 좌표 변환 기준(이벤트 묶음마다 한 번만 레이아웃을 읽는다)
   _frame() {
@@ -551,15 +577,43 @@ export function paintStrokes(canvas, strokes, { removed = [], texts = [], width,
   });
   for (const t of texts || []) {
     if (!t || !t.value || (rm && t.id && rm.has(t.id))) continue;
-    const fs = Math.max(4, (t.size || 16) * k);
-    ctx.save();
-    ctx.fillStyle = t.color || "#1c1c22";
-    ctx.font = `${fs}px Pretendard, -apple-system, system-ui, sans-serif`;
-    ctx.textBaseline = "top";
-    String(t.value).split("\n").forEach((line, li) => {
-      ctx.fillText(line, t.x * W + fs * 0.45, t.y * H + fs * 0.3 + li * fs * 1.3);
-    });
-    ctx.restore();
+    drawTextBox(ctx, t, W, H, Math.max(4, (t.size || 16) * k), "Pretendard, -apple-system, system-ui, sans-serif");
   }
   ctx.restore();
+}
+
+// 글자 칸 하나 그리기(미니·기록·인쇄 공용) — 화면의 .text-block과 같은 자리·여백·줄 간격·줄바꿈.
+// 칸 폭 = t.w(v2.8 칸 크기), 없으면 글자에 맞춰 늘어나는 칸처럼 min(70%, 오른쪽 끝까지). fs = 캔버스 px 글자 크기
+export function drawTextBox(ctx, t, W, H, fs, family) {
+  const padX = fs * 0.45, padY = fs * 0.3, lh = fs * 1.3;
+  const boxW = (t.w > 0 ? t.w : Math.min(0.7, Math.max(0.05, 1 - (t.x || 0)))) * W;
+  const maxW = Math.max(fs, boxW - padX * 2);
+  ctx.save();
+  ctx.fillStyle = t.color || "#1c1c22";
+  ctx.font = `${fs}px ${family}`;
+  ctx.textBaseline = "top";
+  let y = (t.y || 0) * H + padY;
+  const x = (t.x || 0) * W + padX;
+  for (const para of String(t.value).split("\n")) {
+    for (const line of wrapLine(ctx, para, maxW)) { ctx.fillText(line, x, y); y += lh; }
+  }
+  ctx.restore();
+}
+// 한 줄을 칸 폭에 맞춰 나눔: 띄어쓰기 단위, 한 낱말이 칸보다 길면 글자 단위(화면 word-break: break-word와 같게)
+function wrapLine(ctx, text, maxW) {
+  if (!text || ctx.measureText(text).width <= maxW) return [text || ""];
+  const out = [];
+  let line = "";
+  for (const tok of text.split(/(\s+)/)) {
+    if (!tok) continue;
+    if (ctx.measureText(line + tok).width <= maxW) { line += tok; continue; }
+    if (!tok.trim()) { if (line) { out.push(line); line = ""; } continue; } // 줄 끝 공백은 버림
+    if (line) { out.push(line); line = ""; }
+    for (const ch of tok) {
+      if (line && ctx.measureText(line + ch).width > maxW) { out.push(line); line = ""; }
+      line += ch;
+    }
+  }
+  if (line) out.push(line);
+  return out.length ? out : [""];
 }

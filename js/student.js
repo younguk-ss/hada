@@ -28,7 +28,7 @@ import { joinSessionChannel } from "./realtime.js";
 import { mountSlideHost } from "./slides/host.js";
 import { getSlideType, effectiveMode, injectCss } from "./slides/registry.js";
 import { renderSlide } from "./lesson-view.js";
-import { wsPages, wsForced, wsPageTitle, makeWsSessionView, wsTab } from "./worksheet.js";
+import { wsPages, wsForced, wsPageTitle, makeWsSessionView, wsTab, wsPrefetch } from "./worksheet.js";
 
 const CSS = `
 .stu-page { min-height:100vh; min-height:100dvh; max-width:760px; margin:0 auto; display:grid; gap:16px; align-content:start;
@@ -49,6 +49,13 @@ const CSS = `
 @media (max-width: 420px) { .stu-top .brand { display:none; } .stu-review .pill-review { display:none; } }
 .stu-review .stu-top > .btn-sm { flex:none; }
 @media (max-width: 360px) { .stu-review .ans-label { display:none; } .stu-review .stu-top > .btn-sm { padding:0 8px; } }
+@media (max-width: 520px) { .stu-review .stu-live-btn { font-size:13px; padding:0 10px; } }
+@media (max-width: 420px) {
+  .stu-review .stu-live-btn { font-size:12px; padding:0 8px; letter-spacing:-.02em; }
+  .stu-review .slide-nav .btn-icon { --btn-h:38px; }
+  .stu-review .slide-count { min-width:44px; font-size:14px; }
+  .stu-review .stu-top > .btn-ghost { padding:0 8px; }
+}
 `;
 
 const MODE_LABEL = { none: "발표", whole: "전체", individual: "개별", group: "모둠" };
@@ -315,6 +322,7 @@ export function studentLiveView({ id } = {}) {
     catch (e) { console.error("[student] 학습지 표시 실패", e); wsHost = null; }
     finally { mounting = false; }
     if (!wsHost) wsBody.replaceChildren(el("div", { class: "empty" }, "학습지를 불러오지 못했어요"));
+    else wsPrefetch(pages, wsIdx);
   }
 
   function showMsg(text) {
@@ -501,11 +509,14 @@ export function studentLiveView({ id } = {}) {
 // 가정: 필기는 모두 내 개별(individual) 칸에 쓴다 — 전체·모둠 칠판은 반 전체가 공유하므로 그 필기는 바닥 그림으로만 보여 준다.
 // 가정: 응답형은 다시 받는 상태(phase idle, 정답 숨김). 수업에서 정답을 공개했던 슬라이드만 [정답 보기]로 확인(이때는 잠김).
 // 가정: 게임(공룡·레이싱)은 다른 학생과 함께 하는 활동이라 결과만 보여 준다(phase ended).
-// 가정: 진행 중인 수업이면 수업 화면으로 보낸다. 마지막으로 본 슬라이드는 기기에 기억(localStorage).
-const REVIEW_POS = "hada:review:"; // + sessionId:studentId → 마지막으로 본 슬라이드
+// 가정(v2.8): 복습은 늘 학생 페이스·첫 슬라이드부터(결석생·다시 공부하는 학생이 처음부터 따라가게). 진행 중인 수업이어도 수업 화면으로
+//       보내지 않고 위쪽에 [수업 들어가기]만 띄운다. 같은 탭에서 새로고침했을 때만 보던 슬라이드를 이어서 연다(sessionStorage).
+//       수업 때 선생님·친구들이 쓴 기록(전체·모둠 칠판 필기, 담벼락·워드클라우드 등 응답)은 그대로 보이고, 문제는 복습하는 학생도 다시 푼다.
+const REVIEW_POS = "hada:review:"; // + sessionId:studentId → 이 탭에서 마지막으로 본 슬라이드(새로고침용)
 const ANSWER_TYPES = new Set(["mcq", "blank", "dragdrop", "short"]);
-function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
-function lsSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
+// 페이지를 새로고침해서 바로 이 복습 화면이 열렸는가(그때만 보던 곳 이어서) — 첫 화면에서 한 번만 쓴다
+const LOAD_HASH = typeof location !== "undefined" ? location.hash : "";
+let reviewReload = (() => { try { return performance.getEntriesByType("navigation")[0]?.type === "reload"; } catch { return false; } })();
 
 // 수업에서 정답을 공개했던 슬라이드인가
 function hadAnswer(slide, a) {
@@ -561,11 +572,17 @@ export function studentReviewView({ id } = {}) {
   const nextBtn = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "다음", onClick: () => step(1) }, icon("chevron-right"));
   const countEl = el("span", { class: "slide-count" }, "");
   const exitBtn = el("button", { class: "btn btn-ghost", type: "button", onClick: () => go("/student/records") }, "나가기");
+  // 지금 진행 중인 수업이면 선생님 수업으로 들어가는 버튼(복습은 그대로 내 페이스)
+  const liveBtn = el("button", { class: "btn btn-sm btn-primary stu-live-btn", type: "button", hidden: true,
+    onClick: () => { ssSet(LEFT_KEY, null); go("/student/live/" + id); } }, "수업 들어가기");
   const top = el("header", { class: "stu-top" }, [
     brand(), titleEl, el("span", { class: "pill pill-accent pill-review" }, "복습"), answerBtn,
     el("div", { class: "slide-nav" }, [prevBtn, countEl, nextBtn]),
-    exitBtn,
+    liveBtn, exitBtn,
   ]);
+  const posKey = `${REVIEW_POS}${id}:${me.id}`;
+  const resume = reviewReload && location.hash === LOAD_HASH;
+  reviewReload = false;
   const stage = el("div", { class: "stu-stage" }, [el("div", { class: "center" }, el("span", { class: "spinner", "aria-label": "불러오는 중" }))]);
   mount(el("div", { class: "stu stu-review" }, [top, stage]));
 
@@ -600,7 +617,7 @@ export function studentReviewView({ id } = {}) {
     const activity = {};
     for (const sl of list) if (sl) activity[sl.id] = reviewActivity(sl, real.activity?.[sl.id], answers.has(sl.id));
     const over = { activity, flow: "student", slidesSnapshot: list };
-    const view = new Proxy(real, { get: (t, k) => (Object.hasOwn(over, k) ? over[k] : Reflect.get(t, k)) });
+    const view = new Proxy(real, { get: (t, k) => (Object.prototype.hasOwnProperty.call(over, k) ? over[k] : Reflect.get(t, k)) });
     viewCache = { real, act: real.activity, snap: real.slidesSnapshot, ws: real.worksheet, ans: ansVer, view };
     return view;
   }
@@ -614,6 +631,7 @@ export function studentReviewView({ id } = {}) {
     const n = list.length;
     setText(titleEl, "title", s.title || "");
     titleEl.title = s.title || "";
+    liveBtn.hidden = s.status !== "live";
     if (!n) { destroyHost(); stage.replaceChildren(el("div", { class: "empty" }, "슬라이드가 없어요")); return; }
     idx = clamp(idx, 0, n - 1);
     const slide = list[idx];
@@ -644,7 +662,7 @@ export function studentReviewView({ id } = {}) {
     const next = clamp(idx + d, 0, slides.length - 1);
     if (next === idx) return;
     idx = next;
-    lsSet(`${REVIEW_POS}${id}:${me.id}`, String(idx));
+    ssSet(posKey, String(idx));
     render();
   }
   function toggleAnswer() {
@@ -683,11 +701,12 @@ export function studentReviewView({ id } = {}) {
       if (++loadTries < 5) loadTimer = setTimeout(load, 3000);
       return;
     }
-    if (s.status === "live") { ssSet(LEFT_KEY, null); go("/student/live/" + id, { replace: true }); return; }
+    if (s.status === "live") toast("지금 진행 중인 수업이에요 · 위의 [수업 들어가기]로 함께할 수 있어요");
     // 수업에 없던 학생도 복습하면 참여자로 남아 교사 기록에 보인다(이미 있으면 서버가 무시)
     cloudAddParticipant(id, me.id).then(r => { if (r && r.error) console.warn("[review] 참여 등록 실패", r.error); },
       e => console.warn("[review] 참여 등록 실패", e));
-    idx = parseInt(lsGet(`${REVIEW_POS}${id}:${me.id}`) || "0", 10) || 0;
+    idx = resume ? (parseInt(ssGet(posKey) || "0", 10) || 0) : 0; // 복습은 첫 슬라이드부터
+    ssSet(posKey, String(idx));
     offStore = store.subscribe(render);
     document.addEventListener("keydown", onKey);
     started = true;

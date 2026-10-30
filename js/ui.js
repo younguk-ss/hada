@@ -389,8 +389,8 @@ export function debounce(fn, ms = 200) {
   return d;
 }
 
-// copyText(text, okMsg='복사했어요') → Promise<boolean> (결과 toast)
-export async function copyText(text, okMsg = "복사했어요") {
+// copyText(text, okMsg='복사했어요', { quiet }) → Promise<boolean> (결과 toast, quiet면 실패 toast 생략)
+export async function copyText(text, okMsg = "복사했어요", { quiet = false } = {}) {
   const s = String(text ?? "");
   let ok = false;
   try {
@@ -408,6 +408,25 @@ export async function copyText(text, okMsg = "복사했어요") {
     try { ok = document.execCommand("copy"); } catch { ok = false; }
     ta.remove();
   }
-  toast(ok ? okMsg : "복사하지 못했어요", { type: ok ? "ok" : "error" });
+  if (ok || !quiet) toast(ok ? okMsg : "복사하지 못했어요", { type: ok ? "ok" : "error" });
   return ok;
+}
+
+// copyTextLater(Promise<string|null>, okMsg, { quiet }) → Promise<boolean>
+// 누른 뒤에 정해지는 글자(예: 서버에서 만드는 복습 코드) 복사. ClipboardItem에 Promise를 넘기면 누른 동작이 이어져
+// Safari·Chrome에서도 비동기 결과를 복사할 수 있다. 지원하지 않으면 값이 나온 뒤 copyText. 값이 없으면 false(toast 없음).
+export async function copyTextLater(promise, okMsg = "복사했어요", opts = {}) {
+  const p = Promise.resolve(promise).catch(() => null);
+  const cb = navigator.clipboard;
+  if (cb && window.isSecureContext && typeof window.ClipboardItem === "function" && typeof cb.write === "function") {
+    try {
+      const blob = p.then(t => { if (!t) throw new Error("empty"); return new Blob([String(t)], { type: "text/plain" }); });
+      await cb.write([new window.ClipboardItem({ "text/plain": blob })]);
+      toast(okMsg, { type: "ok" });
+      return true;
+    } catch {}
+  }
+  const t = await p;
+  if (!t) return false;
+  return copyText(t, okMsg, opts);
 }

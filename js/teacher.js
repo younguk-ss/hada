@@ -25,11 +25,11 @@
 //       학습지 화면에서 상단 ◀ ▶·슬라이드 번호를 누르면 슬라이드 화면으로 돌아간다.
 import { store, findLesson, findSession, findStudent, findTeacher, studentLabel, newId } from "./store.js";
 import { go } from "./router.js";
-import { el, mount, template, toast, confirmDialog, promptDialog, modal, sheet, icon, fmtDate, debounce, copyText } from "./ui.js";
+import { el, mount, template, toast, confirmDialog, promptDialog, modal, sheet, icon, fmtDate, debounce, copyText, copyTextLater } from "./ui.js";
 import {
   cloudReady, cloudCreateLesson, cloudSaveLesson, cloudDeleteLesson, cloudDuplicateLesson, cloudFetchLessonSlides,
   cloudStartSession, ensureSession, cloudFetchSession, patchSession, cloudEndSession, cloudResumeSession, cloudDeleteSession,
-  subscribeSession, cloudEnsureReviewCode, cloudInsertSessionSlide, cloudEnsureWorksheet,
+  subscribeSession, cloudEnsureReviewCode, cloudFetchReviewCodes, cloudInsertSessionSlide, cloudEnsureWorksheet,
 } from "./cloud.js";
 import { fileToSlides } from "./storage.js";
 import { joinSessionChannel } from "./realtime.js";
@@ -87,6 +87,9 @@ const TEACHER_CSS = `
 .t-review-row b { font-size:17px; letter-spacing:.08em; color:var(--ink); font-variant-numeric:tabular-nums; }
 .t-review-note { font-size:13px; }
 .t-meta .t-review-btn { height:28px; padding:0 10px; font-size:13px; letter-spacing:.04em; }
+.t-meta .t-review-copy { height:28px; padding:0 10px; font-size:13px; }
+.list-row .t-rv-copy { flex:none; white-space:nowrap; }
+@media (max-width: 560px) { .list-row .t-rv-copy .t-rv-label { display:none; } .list-row .t-rv-copy { width:var(--btn-h); padding:0; justify-content:center; } }
 .t-sum-head { display:flex; align-items:center; gap:10px; min-width:0; margin-bottom:14px; }
 .t-sum-head h3 { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:16px; }
 .t-sum-num { flex:none; min-width:26px; height:26px; padding:0 6px; border-radius:7px; background:var(--surface-2); display:grid; place-items:center; font-size:12px; font-weight:700; color:var(--ink-2); font-variant-numeric:tabular-nums; }
@@ -291,6 +294,7 @@ function openCodeModal(code, { sessionId = null, teacher = null } = {}) {
     review = el("div", { class: "t-review-row" }, [
       el("span", { class: "muted" }, "복습 코드"), rc,
       el("button", { class: "btn btn-sm", type: "button", onClick: () => openReviewModal(sessionId, teacher) }, [icon("qr", 16), "복습 QR"]),
+      reviewCopyBtn(sessionId, teacher, { label: "링크 복사" }),
       el("button", { class: "btn btn-sm", type: "button", onClick: () => { const s = findSession(sessionId); if (s) openBlankPrint({ session: s, teacher }); } }, [icon("print", 16), "빈 학습지"]),
     ]);
     cloudEnsureReviewCode(findSession(sessionId)).then(c => { rc.textContent = c || "——————"; });
@@ -342,6 +346,25 @@ function openReviewModal(sessionId, teacher) {
     urlEl.textContent = url;
     stop = drawQr(qr, url);
   });
+}
+
+// 복습 링크 복사 — 결석했거나 다시 공부할 학생에게 보낼 주소(/r/CODE, 학생 페이스로 첫 슬라이드부터).
+// 코드가 이미 있으면 누른 자리에서 바로 복사, 없으면 만들면서 복사(copyTextLater). 복사하지 못하면 복습 코드 창(코드·QR·주소)을 띄운다.
+async function copyReviewLink(sessionId, teacher) {
+  const s = findSession(sessionId);
+  if (!s) return;
+  const msg = "복습 링크를 복사했어요";
+  const ok = s.reviewCode
+    ? await copyText(reviewUrl(s.reviewCode), msg, { quiet: true })
+    : await copyTextLater(cloudEnsureReviewCode(s).then(c => (c ? reviewUrl(c) : null)), msg, { quiet: true });
+  if (!ok) openReviewModal(sessionId, teacher);
+}
+function reviewCopyBtn(sessionId, teacher, { cls = "btn btn-sm", label = "복습 링크" } = {}) {
+  return el("button", {
+    class: cls, type: "button", title: "복습 링크 복사 · 결석·복습 학생에게 보내기", "aria-label": "복습 링크 복사",
+    onClick: (e) => { e.stopPropagation(); copyReviewLink(sessionId, teacher); },
+    onKeydown: (e) => e.stopPropagation(),
+  }, [icon("link", 16), el("span", { class: "t-rv-label" }, label)]);
 }
 
 // ── 수업 시작 (카드·편집기 공용) ──
@@ -620,7 +643,7 @@ function lessonsTab(box, teacher) {
 }
 
 // ── 수업 기록 탭 ──
-function sessionRow(s, { onOpen } = {}) {
+function sessionRow(s, { onOpen, teacher = null } = {}) {
   const open = () => (onOpen ? onOpen(s.id) : go("/teacher/session/" + s.id));
   const row = el("div", {
     class: "list-row clickable", role: "button", tabindex: "0",
@@ -632,6 +655,7 @@ function sessionRow(s, { onOpen } = {}) {
       el("div", { class: "meta" }, `${fmtDate(s.startedAt)} · 참여 ${(s.participants || []).length}`),
     ]),
     statusPill(s.status),
+    reviewCopyBtn(s.id, teacher, { cls: "btn btn-sm t-rv-copy" }),
     s.status === "live"
       ? el("button", { class: "btn btn-sm btn-primary", type: "button", onClick: (e) => { e.stopPropagation(); go("/live/" + s.id); } }, "돌아가기")
       : null,
@@ -651,7 +675,9 @@ function recordsTab(box, teacher) {
     sig = nsig;
     list.hidden = !ss.length;
     empty.hidden = !!ss.length;
-    list.replaceChildren(...ss.map(s => sessionRow(s)));
+    list.replaceChildren(...ss.map(s => sessionRow(s, { teacher })));
+    // [복습 링크]가 누른 자리에서 바로 복사되게 이미 있는 복습 코드를 미리 읽어 둔다
+    cloudFetchReviewCodes(ss.map(s => s.id)).catch(() => {});
   }
   render();
   return { onStore: render };
@@ -701,7 +727,7 @@ function studentsTab(box, teacher) {
     const ss = mySessions(teacher.id).filter(s => (s.participants || []).includes(id));
     let sh = null;
     const body = ss.length
-      ? el("div", { class: "list" }, ss.map(s => sessionRow(s, { onOpen: (sid) => { if (sh) sh.close(); go("/teacher/session/" + sid); } })))
+      ? el("div", { class: "list" }, ss.map(s => sessionRow(s, { teacher, onOpen: (sid) => { if (sh) sh.close(); go("/teacher/session/" + sid); } })))
       : el("div", { class: "empty" }, "끝난 수업이 여기 모여요");
     sh = sheet({ title: studentLabel(st), body });
   }
@@ -1742,7 +1768,7 @@ function buildLive(sessionId, teacher) {
   async function addBlank() {
     if (blankBusy) return;
     blankBusy = true;
-    try { await insertNext(createSlide("ink", { title: "빈 슬라이드" })); }
+    try { await insertNext(createSlide("ink", { title: "빈 슬라이드", mode: "whole" })); } // 수업 중 빈 칠판은 바로 함께 쓰게 '전체'
     catch (e) { console.warn("[live] 빈 슬라이드", e); toast("슬라이드를 추가하지 못했어요", { type: "error" }); }
     finally { setTimeout(() => { blankBusy = false; }, 700); }
   }
@@ -2035,6 +2061,7 @@ export function sessionDetailView({ id } = {}) {
         wsPages(s).length ? el("span", {}, `학습지 ${wsPages(s).length}쪽`) : null,
         el("button", { class: "btn btn-sm t-review-btn no-print", type: "button", title: "복습 코드 · QR", onClick: () => openReviewModal(id, teacher) },
           [icon("qr", 16), "복습 ", reviewTxt]),
+        reviewCopyBtn(id, teacher, { cls: "btn btn-sm t-review-copy no-print", label: "복습 링크 복사" }),
       ]);
       const segBtn = (m, label) => el("button", {
         type: "button", class: mode === m ? "active" : null, "aria-pressed": String(mode === m),
