@@ -17,6 +17,12 @@
 // 가정: 갤러리 온라인 점은 realtime.currentChannel().onPresence로 갱신(없으면 onSession 때만).
 // 팝업 상호작용(v2.9, js/popup.js): 편집기에서 슬라이드 위에 핀(상호작용)을 넣고 끌어 옮긴다. 수업 중 교사가 핀(개별·모둠이면 머리 줄 버튼)을
 //       누르면 ctx.openPopup → 교사·학생 화면에 팝업. 학생 화면에는 자유 이동(flow 'student')·복습일 때만 핀이 보인다.
+// 이미지(v2.10): 편집기 도구바 '이미지' 도구 — 슬라이드 위 이미지(config.images, 그리기는 lesson-view)를 끌어서 옮기고 모서리로 크기, × 삭제.
+//       넣기: 이미지 도구를 누르면(이미지가 없을 때)·이미 고른 이미지 도구를 한 번 더 누르면·인스펙터 [이미지 넣기]·붙여넣기(⌘/Ctrl+V)·
+//       스테이지에 끌어다 놓기. 넣은 이미지는 선택된 채로 이미지 도구가 켜진다. 이미지 도구는 편집기 도구바에만 있다(학생·교사 진행은 펜으로).
+// 도형(v2.10): 도구바 '도형'(모든 화면) — 누르면 종류 창(직선·화살표·네모·동그라미·세모), 켜진 도형 도구를 다시 누르면 창을 다시 연다.
+//       도구 상태에 종류(shape)도 기억. 그리기·저장은 canvas.js 10.
+// 텍스트 부분 색(v2.10): 텍스트 도구에서 글자 일부를 고르고 색을 누르면 그 부분만(lesson-view paintText). 색 버튼은 pointerdown을 막아 선택 유지.
 // 펜 기기(v2.6.1, js/pen-input.js): 펜을 처음 쓰면 그 기기에서는 손가락 필기를 끈다(손바닥 오인 방지). 도구바 끝 ✋ 버튼(펜 기기에서만 보임)으로
 //       손가락 필기를 다시 켜고 끈다. 도구바는 두 번 탭 확대를 막고(touch-action: manipulation), 글자 선택이 생기지 않는다.
 import * as ui from "../ui.js";
@@ -26,7 +32,7 @@ import * as storage from "../storage.js";
 import * as realtime from "../realtime.js";
 import * as storeMod from "../store.js";
 import { registerSlideType, effectiveMode, groupStudents, newId, injectCss } from "./registry.js";
-import { renderSlide } from "../lesson-view.js";
+import { renderSlide, imageLayer } from "../lesson-view.js";
 import { paintStrokes } from "../canvas.js";
 import { pageRectFor } from "../zoom-view.js";
 import { hotspotLayer, hotspotInspector, hotspotChips, openHotspotEditor, hotspotsOf } from "../popup.js";
@@ -39,8 +45,14 @@ const TOOLS = [
   { id: "pen", label: "펜" },
   { id: "highlight", label: "형광펜" },
   { id: "eraser", label: "지우개" },
-  { id: "text", label: "텍스트" },
+  { id: "text", label: "텍스트 — 글자를 골라 색을 누르면 그 부분만 바뀌어요" },
+  { id: "shape", label: "도형" },
 ];
+const SHAPE_KINDS = [
+  { id: "line", label: "직선" }, { id: "arrow", label: "화살표" }, { id: "rect", label: "네모" },
+  { id: "ellipse", label: "동그라미" }, { id: "tri", label: "세모" },
+];
+const IMAGE_TOOL = { id: "image", label: "이미지 — 옮기기·크기" }; // 편집기 전용
 const MODES = [["none", "발표"], ["whole", "전체"], ["individual", "개별"], ["group", "모둠"]];
 
 // 24px stroke SVG (ui.icon 없을 때 대체)
@@ -49,15 +61,21 @@ const SVG = {
   highlight: '<path d="M9 15l-4 4h6l1-1"/><path d="M9 15l7-11 4 3-7 11z"/><path d="M8 14l5 3"/>',
   eraser: '<path d="M7 20h12"/><path d="M5 15l9-9 5 5-8 8H8z"/><path d="M10 10l5 5"/>',
   text: '<path d="M5 6V4h14v2"/><path d="M12 4v16"/><path d="M9 20h6"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/>',
   undo: '<path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 010 12h-3"/>',
   zoomIn: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.4-4.4"/><path d="M8.2 11h5.6M11 8.2v5.6"/>',
   zoomOut: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.4-4.4"/><path d="M8.2 11h5.6"/>',
   users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0113 0"/><path d="M16 4.5a3.5 3.5 0 010 7"/><path d="M18 14a6 6 0 013.5 6"/>',
+  "sh-line": '<path d="M5 19 19 5"/>',
+  "sh-arrow": '<path d="M5 19 19 5"/><path d="M10 5h9v9"/>',
+  "sh-rect": '<rect x="4" y="6" width="16" height="12" rx="1.5"/>',
+  "sh-ellipse": '<ellipse cx="12" cy="12" rx="8.5" ry="6.5"/>',
+  "sh-tri": '<path d="M12 5 20.5 19h-17z"/>',
   hand: '<path d="M18 11V6a2 2 0 00-4 0v5"/><path d="M14 10V4a2 2 0 00-4 0v6"/><path d="M10 10.5V6a2 2 0 00-4 0v8"/><path d="M18 8a2 2 0 114 0v6a8 8 0 01-8 8h-2c-2.8 0-4.5-.86-6-2.34l-3.6-3.6a2 2 0 012.83-2.82L7 15"/>',
 };
 const PEN_ICON = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${SVG.pen}</svg>`;
 
-const LOCAL_ICONS = new Set(["zoomIn", "zoomOut", "hand"]); // 앱 공용 아이콘에 없는 것
+const LOCAL_ICONS = new Set(["zoomIn", "zoomOut", "hand", "sh-line", "sh-arrow", "sh-rect", "sh-ellipse", "sh-tri"]); // 앱 공용 아이콘에 없는 것
 function icon(name) {
   if (typeof ui.icon === "function" && !LOCAL_ICONS.has(name)) {
     try { const n = ui.icon(name); if (n) return n; } catch (_) {}
@@ -85,6 +103,9 @@ const CSS = `
 .ink-tool.active, .ink-size.active { background:var(--ink); color:#fff; }
 .ink-tool svg { width:20px; height:20px; }
 .ink-ic { display:inline-grid; place-items:center; }
+.ink-shape-pop { position:fixed; z-index:300; display:flex; gap:2px; padding:5px; background:var(--surface); border:1px solid var(--line);
+  border-radius:var(--radius); box-shadow:var(--shadow-2); touch-action:manipulation; -webkit-user-select:none; user-select:none; }
+.ink-shape-pop .ink-tool { width:44px; height:44px; }
 .ink-swatch { width:36px; height:36px; border:0; background:transparent; display:grid; place-items:center; cursor:pointer; padding:0; flex:none; }
 .ink-swatch i { width:20px; height:20px; border-radius:50%; background:var(--c); box-shadow:inset 0 0 0 1px rgba(0,0,0,.12); }
 .ink-swatch.active i { box-shadow:0 0 0 2px var(--surface), 0 0 0 4px var(--c); }
@@ -132,6 +153,13 @@ const CSS = `
   .ink-wrap:not(.bar-side) .ink-float .ink-tool, .ink-wrap:not(.bar-side) .ink-float .ink-size { width:37px; }
   .ink-wrap:not(.bar-side) .ink-float .ink-swatch { width:32px; min-width:32px; }
 }
+/* 세로 아이패드(744~834px)에서 도형 도구·✋까지 한 줄에(높이 44px 유지). 휴대폰은 그대로(가로 스크롤) */
+@media (min-width:521px) and (max-width:860px) {
+  .ink-wrap:not(.bar-side) .ink-float { gap:1px; padding:4px; }
+  .ink-wrap:not(.bar-side) .ink-float .ink-swatch { width:30px; min-width:30px; }
+  .ink-wrap:not(.bar-side) .ink-float .ink-size { width:34px; min-width:34px; }
+  .ink-wrap:not(.bar-side) .ink-float .ink-sep { margin:0 1px; }
+}
 .ink-wait { flex:1; display:grid; place-items:center; }
 .ink-gallery { flex:1; min-height:0; overflow:auto; padding:2px; display:flex; flex-direction:column; gap:12px; }
 .ink-tiles { display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:12px; }
@@ -162,6 +190,11 @@ const CSS = `
   display:grid; place-items:center; color:var(--muted); font-size:13px; }
 .ink-insp-bg img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
 .ink-insp-row { display:flex; gap:6px; margin-top:8px; }
+.ink-inspector { display:grid; gap:18px; }
+.ink-insp-img .ink-insp-row { margin-top:0; align-items:center; }
+.ink-insp-img .ink-insp-n { color:var(--muted); font-size:13px; font-variant-numeric:tabular-nums; }
+.ink-insp-hint { margin:6px 0 0; font-size:12px; line-height:1.5; color:var(--muted); font-weight:400; }
+.ink-editor .ink-stage.drop-on { outline:3px dashed var(--accent); outline-offset:-6px; border-radius:var(--radius); }
 .ink-thumb { position:relative; width:100%; height:100%; aspect-ratio:16/10; background:#fff; overflow:hidden; }
 .ink-thumb.is-paper { background:#fff linear-gradient(transparent 23px, var(--line) 24px) 0 6px / 100% 24px; }
 .ink-thumb img, .ink-thumb canvas { position:absolute; inset:0; width:100%; height:100%; }
@@ -186,7 +219,7 @@ const CSS = `
 `;
 
 // 모듈 단위 도구 상태
-const toolState = { tool: "pen", color: COLORS[0], size: "M" };
+const toolState = { tool: "pen", color: COLORS[0], size: "M", shape: "rect" };
 // 교사 갤러리 보기: "focus"(필기 부분, 기본) | "page"(전체) — 이 기기에 기억
 const GAL_KEY = "hada:inkGallery";
 let galleryView = (() => { try { return localStorage.getItem(GAL_KEY) === "page" ? "page" : "focus"; } catch { return "focus"; } })();
@@ -267,20 +300,66 @@ function zoomPill(getViewer) {
   return pill;
 }
 
-function makeToolbar(getViewer, { float = false, extras = [], zoom = false } = {}) {
+function makeToolbar(getViewer, { float = false, extras = [], zoom = false, tools = TOOLS, onTool = null } = {}) {
   const st = toolState;
+  // 도구 상태는 모듈 공용 — 이 도구바에 없는 도구(편집기의 '이미지')면 펜으로
+  const known = () => { if (!tools.some(t => t.id === st.tool)) st.tool = "pen"; };
   const apply = () => {
     const v = getViewer();
     if (!v) return;
-    v.setTool(st.tool); v.setColor(st.color); v.setSize(sizeVal(st.size));
+    known();
+    v.setTool(st.tool); v.setShape?.(st.shape); v.setColor(st.color); v.setSize(sizeVal(st.size));
   };
-  const toolBtns = TOOLS.map(t => el("button", {
-    type: "button", class: "ink-tool", title: t.label, "aria-label": t.label, "data-id": t.id,
-    onClick: () => { st.tool = t.id; sync(); apply(); },
-  }, [icon(t.id)]));
+  const toolBtns = tools.map(t => {
+    const b = el("button", {
+      type: "button", class: "ink-tool", title: t.label, "aria-label": t.label.split(" — ")[0], "data-id": t.id,
+      onClick: () => {
+        const again = st.tool === t.id;
+        st.tool = t.id; sync(); apply();
+        if (t.id === "shape") again && shapePop ? closeShapePop() : openShapePop(b);
+        else closeShapePop();
+        onTool && onTool(t.id, again);
+      },
+    }, [icon(t.id === "shape" ? "sh-" + st.shape : t.id)]);
+    return b;
+  });
+  // 도형 종류 창(화면에 고정 — 도구바는 가로 스크롤이라 그 안에 두면 잘림)
+  let shapePop = null, popWatch = 0;
+  function closeShapePop() {
+    if (!shapePop) return;
+    shapePop.remove(); shapePop = null;
+    clearInterval(popWatch);
+    document.removeEventListener("pointerdown", onOutside, true);
+    document.removeEventListener("keydown", onPopKey, true);
+  }
+  function onOutside(e) { if (shapePop && !shapePop.contains(e.target) && !e.target.closest?.('.ink-tool[data-id="shape"]')) closeShapePop(); }
+  function onPopKey(e) { if (e.key === "Escape") { e.stopPropagation(); closeShapePop(); } }
+  function openShapePop(anchor) {
+    closeShapePop();
+    shapePop = el("div", { class: "ink-shape-pop", role: "menu", "aria-label": "도형 종류" }, SHAPE_KINDS.map(k => el("button", {
+      type: "button", class: "ink-tool" + (k.id === st.shape ? " active" : ""), title: k.label, "aria-label": k.label, role: "menuitemradio",
+      onClick: () => { st.shape = k.id; st.tool = "shape"; sync(); apply(); closeShapePop(); },
+    }, [icon("sh-" + k.id)])));
+    document.body.appendChild(shapePop);
+    const r = anchor.getBoundingClientRect(), pw = shapePop.offsetWidth, ph = shapePop.offsetHeight;
+    const side = bar.closest(".bar-side") && bar.classList.contains("ink-float");
+    let x = side ? r.right + 8 : r.left + r.width / 2 - pw / 2;
+    let y = side ? r.top + r.height / 2 - ph / 2 : (r.top - ph - 8 >= 8 && bar.classList.contains("ink-float") ? r.top - ph - 8 : r.bottom + 8);
+    x = Math.max(8, Math.min(innerWidth - pw - 8, x));
+    y = Math.max(8, Math.min(innerHeight - ph - 8, y));
+    Object.assign(shapePop.style, { left: x + "px", top: y + "px" });
+    document.addEventListener("pointerdown", onOutside, true);
+    document.addEventListener("keydown", onPopKey, true);
+    popWatch = setInterval(() => { if (!anchor.isConnected) closeShapePop(); }, 400); // 슬라이드가 바뀌어 도구바가 사라지면 함께
+  }
   const colorBtns = COLORS.map(c => el("button", {
     type: "button", class: "ink-swatch", "aria-label": "색", "data-id": c, style: { "--c": c },
-    onClick: () => { st.color = c; if (st.tool === "eraser") st.tool = "pen"; sync(); apply(); },
+    // 누르는 순간 글 상자의 고른 글자가 풀리지 않게
+    onPointerdown: (e) => e.preventDefault(),
+    onClick: () => {
+      getViewer()?.paintText?.(c); // 텍스트 도구에서 글자를 골라 두었으면 그 부분만
+      st.color = c; if (st.tool === "eraser" || st.tool === "image") st.tool = "pen"; sync(); apply();
+    },
   }, [el("i", {})]));
   const sizeBtns = SIZES.map((s, i) => el("button", {
     type: "button", class: "ink-size", title: s.id, "aria-label": "굵기 " + s.id, "data-id": s.id,
@@ -315,7 +394,11 @@ function makeToolbar(getViewer, { float = false, extras = [], zoom = false } = {
     ...extras,
   ]);
   function sync() {
-    toolBtns.forEach(b => b.classList.toggle("active", b.dataset.id === st.tool));
+    known();
+    toolBtns.forEach(b => {
+      b.classList.toggle("active", b.dataset.id === st.tool);
+      if (b.dataset.id === "shape" && b.dataset.k !== st.shape) { b.dataset.k = st.shape; b.replaceChildren(icon("sh-" + st.shape)); }
+    });
     colorBtns.forEach(b => b.classList.toggle("active", b.dataset.id === st.color));
     sizeBtns.forEach(b => b.classList.toggle("active", b.dataset.id === st.size));
   }
@@ -323,6 +406,7 @@ function makeToolbar(getViewer, { float = false, extras = [], zoom = false } = {
   bar.sync = sync;
   bar.apply = apply;
   bar.bindZoom = (viewer) => zg?.bindZoom(viewer);
+  bar.closePops = closeShapePop;
   return bar;
 }
 
@@ -389,6 +473,8 @@ function miniFrame(slide, { big = false, crop = false } = {}) {
   const inner = crop ? el("div", { class: "ink-mini-in" }) : box;
   if (crop) box.appendChild(inner);
   if (slide.bg) inner.appendChild(el("img", { src: slide.bg, alt: "", loading: "lazy", decoding: "async" }));
+  const il = imageLayer(slide, { lazy: true });
+  if (il) inner.appendChild(il);
   const cv = el("canvas", { width: big ? 960 : 480, height: big ? 600 : 300 });
   box.appendChild(cv);
   let page = null, lastRec = null, sig = null, cssW = 0;
@@ -504,7 +590,7 @@ function Editor({ slide, lesson, update, ctx }) {
   const viewer = renderSlide({
     root: stage, slide, session: null, scope: "edit", readOnly: false, zoom: true,
     authorId: ctx?.me?.id || lesson?.teacherId || null,
-    onChange: () => update({ strokes: slide.strokes, texts: slide.texts }),
+    onChange: () => { update({ strokes: slide.strokes, texts: slide.texts, config: slide.config }); syncImgInsp(); },
   });
   const clearBtn = el("button", {
     type: "button", class: "btn btn-sm btn-ghost",
@@ -540,7 +626,11 @@ function Editor({ slide, lesson, update, ctx }) {
   const popBtn = el("button", { type: "button", class: "btn btn-sm btn-ghost", title: "슬라이드 위에 팝업 상호작용(핀) 넣기", onClick: addHotspot },
     [ui.icon ? ui.icon("plus", 16) : null, "팝업"]);
 
-  const bar = makeToolbar(() => viewer, { extras: [popBtn, clearBtn] });
+  const bar = makeToolbar(() => viewer, {
+    extras: [popBtn, clearBtn], tools: TOOLS.concat(IMAGE_TOOL),
+    // 이미지 도구: 이미지가 없거나 이미 고른 도구를 한 번 더 누르면 파일 고르기
+    onTool: (id, again) => { if (id === "image" && (again || !viewer.imageCount())) pickImage(); },
+  });
   const zp = zoomPill(() => viewer);
   wrap.append(bar, stage, zp);
   bar.apply();
@@ -552,11 +642,103 @@ function Editor({ slide, lesson, update, ctx }) {
   const btnReplace = el("button", { type: "button", class: "btn btn-sm", onClick: () => fileIn.click() }, "교체");
   const btnRemove = el("button", { type: "button", class: "btn btn-sm btn-ghost", onClick: removeBg }, "제거");
   const modeSeg = seg(MODES, slide.mode || "none", (m) => { update({ mode: m }); segSet(modeSeg, m); });
+  // 슬라이드 위 이미지(여러 장, 옮기기·크기)
+  const imgIn = el("input", { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", multiple: true, style: { display: "none" } });
+  const btnImg = el("button", { type: "button", class: "btn btn-sm", onClick: () => pickImage() }, [icon("image"), el("span", { class: "ink-insp-lbl" }, "이미지 넣기")]);
+  const imgN = el("span", { class: "ink-insp-n" });
   const inspector = el("div", { class: "ink-inspector" }, [
+    el("div", { class: "field ink-insp-img" }, [
+      el("label", {}, "이미지"),
+      el("div", { class: "ink-insp-row" }, [btnImg, imgN]),
+      el("p", { class: "ink-insp-hint" }, "도구바 이미지 도구로 끌어서 옮기고, 모서리를 끌어 크기를 바꿔요. 복사한 이미지를 붙여넣거나(⌘/Ctrl+V) 끌어다 놓아도 돼요."),
+      imgIn,
+    ]),
     el("div", { class: "field" }, [el("label", {}, "배경 이미지"), bgBox, el("div", { class: "ink-insp-row" }, [btnReplace, btnRemove]), fileIn]),
     el("div", { class: "field" }, [el("label", {}, "기본 모드"), modeSeg]),
     hsInsp,
   ]);
+
+  // ── 이미지 넣기 ──
+  let imgBusy = 0, dead = false;
+  function syncImgInsp() {
+    const n = viewer.imageCount();
+    imgN.textContent = n ? `${n}개` : "";
+    btnImg.disabled = imgBusy > 0;
+    btnImg.lastChild.textContent = imgBusy ? "올리는 중…" : "이미지 넣기";
+  }
+  function pickImage() { if (!imgBusy) imgIn.click(); }
+  const isImageFile = (f) => !!f && (/^image\//.test(f.type || "") || /\.(png|jpe?g|webp|gif)$/i.test(f.name || ""));
+  // at: 놓을 곳 가운데(프레임 정규화). 여러 장이면 조금씩 비껴 놓는다
+  async function insertImages(files, at = null) {
+    const list = [...(files || [])].filter(isImageFile);
+    if (!list.length) { if ((files || []).length) ctx.toast("이미지 파일만 넣을 수 있어요"); return; }
+    imgBusy++; syncImgInsp();
+    try {
+      for (let i = 0; i < list.length; i++) {
+        let res;
+        try { res = await storage.uploadPlacedImage(lesson?.id, slide.id, list[i]); }
+        catch (e) { console.warn("[ink] 이미지 올리기 실패", e); ctx.toast("이미지를 올리지 못했어요"); continue; }
+        const ar = res.ar > 0 ? res.ar : 1;
+        const w = Math.min(0.5, 0.6 * ar / 1.6); // 폭 50% · 높이 60% 안
+        const h = w * 1.6 / ar;
+        const cx = (at ? at.x : 0.5) + i * 0.03, cy = (at ? at.y : 0.5) + i * 0.03;
+        const round = (v) => Math.round(v * 10000) / 10000;
+        const im = {
+          id: newId("im"), url: res.url, path: res.path || null, ar,
+          w: round(w), x: round(Math.max(0, Math.min(1 - w, cx - w / 2))), y: round(Math.max(0, Math.min(1 - h, cy - h / 2))),
+        };
+        if (dead) {
+          // 다른 슬라이드로 옮겨 갔어도 올린 이미지는 이 슬라이드에 저장
+          slide.config ||= {};
+          (slide.config.images ||= []).push(im);
+          update({ config: slide.config });
+          continue;
+        }
+        toolState.tool = "image"; bar.sync(); bar.apply();
+        viewer.addImage(im);
+      }
+    } finally {
+      imgBusy--;
+      if (!dead) syncImgInsp();
+    }
+  }
+  imgIn.addEventListener("change", () => {
+    const files = [...(imgIn.files || [])];
+    imgIn.value = "";
+    insertImages(files);
+  });
+  // 붙여넣기: 입력칸·글자 편집 중이 아니고 다른 창이 없을 때
+  function onPaste(e) {
+    if (dead) return;
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    if (document.documentElement.classList.contains("has-layer")) return;
+    const files = [...(e.clipboardData?.files || [])].filter(isImageFile);
+    if (!files.length) return;
+    e.preventDefault();
+    insertImages(files);
+  }
+  document.addEventListener("paste", onPaste);
+  // 끌어다 놓기: 놓은 곳에
+  const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
+  stage.addEventListener("dragover", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    stage.classList.add("drop-on");
+  });
+  stage.addEventListener("dragleave", (e) => { if (!stage.contains(e.relatedTarget)) stage.classList.remove("drop-on"); });
+  stage.addEventListener("drop", (e) => {
+    stage.classList.remove("drop-on");
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    const r = viewer.frame.getBoundingClientRect();
+    const at = r.width && r.height ? {
+      x: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)),
+      y: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)),
+    } : null;
+    insertImages(e.dataTransfer.files, at);
+  });
   let busy = false;
   function syncInspector() {
     bgBox.replaceChildren();
@@ -610,11 +792,17 @@ function Editor({ slide, lesson, update, ctx }) {
     syncInspector();
   }
   syncInspector();
+  syncImgInsp();
 
   return {
     el: wrap,
     inspector,
-    destroy() { hs.destroy(); viewer.destroy(); },
+    destroy() {
+      dead = true;
+      document.removeEventListener("paste", onPaste);
+      hs.destroy();
+      viewer.destroy();
+    },
   };
 }
 
@@ -1068,6 +1256,8 @@ function thumb(slide) {
   const src = slide.thumb || slide.bg;
   const d = el("div", { class: "ink-thumb" + (src ? "" : " is-paper") });
   if (src) d.appendChild(el("img", { src, alt: "", loading: "lazy", decoding: "async" }));
+  const il = imageLayer(slide, { lazy: true });
+  if (il) d.appendChild(il);
   if (hasInk(slide)) {
     const c = el("canvas", {});
     paintStrokes(c, slide.strokes || [], { texts: slide.texts || [], width: 320, height: 200 });

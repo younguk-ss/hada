@@ -26,6 +26,12 @@
 //    그대로 보여 빠르게 깜빡였다(학습지 화면이 검고 윤곽만 깜빡임) → 크롬북에서만 켠다(기기별 강제: localStorage 'hada:lowLatency' '1'|'0').
 //    비트맵은 한 변 4096px·총 1200만 화소 이하로 줄이고(메모리 부족으로 GPU가 그리기를 포기하지 않게),
 //    GPU 메모리 부족 등으로 캔버스 내용을 잃었다가 돌아오면(contextrestored) 다시 그린다.
+// 10) 도형(v2.10, 도구 'shape'): 끌어서 그리는 직선·화살표·네모·동그라미·세모. 저장은 보통 획과 같은 Stroke에
+//    shape(종류)·box([시작 x, y, 끝 x, y], 정규화)를 더한 것 — 그리기는 box로 정확한 도형, points는 윤곽을 기준 화면 8px 간격으로
+//    채운 점(지우개 판정·필기 범위·이전 버전 화면에서도 비슷하게 보이게). Shift를 누르면 정사각형·정원·45° 직선.
+//    거의 끌지 않은(4px 미만) 도형은 버린다. 굵기는 펜과 같은 규칙(7), 압력 없이 고르게.
+// 11) 텍스트 부분 색(v2.10): Text.runs = [{ t, c }](t를 이으면 value, c = null이면 글 상자 색). 정적 그림은 drawTextBox가
+//    글자별 색을 칸 폭 줄바꿈 뒤에도 그대로 칠한다.
 
 import { newId } from "./slides/registry.js";
 import { isPalmTouch } from "./pen-input.js";
@@ -47,6 +53,8 @@ function bitmapScale(cssW, cssH) {
 
 const r4 = (v) => Math.round(v * 10000) / 10000;
 const r2 = (v) => Math.round(v * 100) / 100;
+const REF_H = REF_W / 1.6;
+const SHAPE_STEP = 8; // 도형 윤곽 점 간격(기준 화면 px)
 
 // 획 키: id 우선, 없으면 인덱스
 export function strokeKey(s, i) { return (s && s.id) || ("#" + i); }
@@ -57,6 +65,7 @@ export class InkCanvas {
     this.ctx = canvas.getContext("2d", LOW_LATENCY ? { alpha: true, desynchronized: true } : { alpha: true });
     this.dpr = window.devicePixelRatio || 1;
     this.tool = "pen";
+    this.shape = "rect";        // 도형 도구의 종류(10)
     this.color = "#1c1c22";
     this.size = 2;
     this.strokes = [];           // 확정 획 (removed 제외)
@@ -134,6 +143,7 @@ export class InkCanvas {
     try { if (pid != null) this.canvas.releasePointerCapture(pid); } catch (_) {}
   }
   setTool(t) { this.tool = t; }
+  setShape(k) { if (SHAPES.includes(k)) this.shape = k; }
   setColor(c) { this.color = c; }
   setSize(s) { this.size = s; }
   setReadOnly(v) {
@@ -256,9 +266,11 @@ export class InkCanvas {
       try { c.setPointerCapture(pid); } catch (_) {}
       // 펜 지우개 끝(button 5 / buttons 32)·옆 버튼(S펜 등, button 2 / buttons 2)을 누른 채 쓰면 지우개
       const penErase = e.pointerType === "pen" && (e.button === 5 || e.button === 2 || (e.buttons & 34) !== 0);
-      const tool = penErase ? "eraser" : this.tool;
+      const shape = !penErase && this.tool === "shape" ? this.shape : null;
+      const tool = penErase ? "eraser" : shape ? "pen" : this.tool;
       this.current = {
         tool,
+        ...(shape ? { shape, box: [pt.x, pt.y, pt.x, pt.y] } : {}),
         color: this.color,
         // 형광펜은 굵게. 슬라이드 위 실제 굵기 = 펜 값 ÷ 쓰는 배율(7)
         size: Math.max(0.05, r2((tool === "highlight" ? this.size * 4 : this.size) / this.zoomFactor())),
@@ -272,6 +284,17 @@ export class InkCanvas {
 
     on("pointermove", (e) => {
       if (!this.current || e.pointerId !== pid) return;
+      // 도형(10): 시작점 ~ 지금 점으로 다시 만든다
+      if (this.current.shape) {
+        const cur = this.current, f = this._frame();
+        const b = this._toNorm(e, f);
+        const [ax, ay] = cur.box;
+        const end = e.shiftKey ? constrainShape(cur.shape, ax, ay, b.x, b.y) : b;
+        cur.box = [ax, ay, end.x, end.y];
+        cur.points = shapePoints(cur.shape, cur.box, cur.size);
+        this._scheduleDraw();
+        return;
+      }
       // coalesced 이벤트로 중간 점 보충 → 부드러운 선. 위치 기준은 한 번만 읽는다(8)
       const events = (typeof e.getCoalescedEvents === "function") ? e.getCoalescedEvents() : [e];
       const f = this._frame();
@@ -308,7 +331,14 @@ export class InkCanvas {
       this._pred = null;
       try { c.releasePointerCapture(pid); } catch (_) {}
       pid = null; this._pid = null;
-      if (s.tool === "eraser") {
+      if (s.shape) {
+        const [ax, ay, bx, by] = s.box;
+        if (Math.max(Math.abs(bx - ax) * REF_W, Math.abs(by - ay) * REF_H) * this.zoomFactor() < 4) s.points = []; // 거의 안 끌면 버림
+        else s.box = s.box.map(r4);
+      }
+      if (s.shape && !s.points.length) {
+        // 버린 도형: 아무것도 저장하지 않음
+      } else if (s.tool === "eraser") {
         const ids = [];
         const keepS = [], keepK = [];
         const zf = this.zoomFactor(); // 확대해서 지우면 화면에서 보이는 만큼만 지움
@@ -381,7 +411,7 @@ export class InkCanvas {
     if (!this.cacheValid) this._rebuildCache();
     const cur = this.current;
     // 펜 획: 뒤 점 2개가 정해진 구간(i ≤ 점 수 - 3)은 모양이 바뀌지 않으므로 캐시에 바로 그려 둔다(8)
-    const inc = !!cur && cur.tool === "pen" && cur.points.length >= 4;
+    const inc = !!cur && cur.tool === "pen" && !cur.shape && cur.points.length >= 4;
     if (inc) {
       const upto = cur.points.length - 2;
       if (upto > this._liveN) {
@@ -507,6 +537,16 @@ export function drawStroke(ctx, s, W, H, k = 1) {
   ctx.save();
   strokeStyle(ctx, s);
 
+  // 도형(10): box로 정확하게, 고른 굵기
+  if (s.shape && Array.isArray(s.box) && SHAPES.includes(s.shape)) {
+    ctx.lineWidth = baseW;
+    ctx.beginPath();
+    shapePath(ctx, s.shape, s.box, s.size, W, H);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
   const pts = s.points;
 
   // 점 하나: 동그라미
@@ -584,36 +624,133 @@ export function paintStrokes(canvas, strokes, { removed = [], texts = [], width,
 
 // 글자 칸 하나 그리기(미니·기록·인쇄 공용) — 화면의 .text-block과 같은 자리·여백·줄 간격·줄바꿈.
 // 칸 폭 = t.w(v2.8 칸 크기), 없으면 글자에 맞춰 늘어나는 칸처럼 min(70%, 오른쪽 끝까지). fs = 캔버스 px 글자 크기
+// 부분 색(11): 글자별 색으로 줄마다 같은 색끼리 이어 칠함
 export function drawTextBox(ctx, t, W, H, fs, family) {
   const padX = fs * 0.45, padY = fs * 0.3, lh = fs * 1.3;
   const boxW = (t.w > 0 ? t.w : Math.min(0.7, Math.max(0.05, 1 - (t.x || 0)))) * W;
   const maxW = Math.max(fs, boxW - padX * 2);
+  const base = t.color || "#1c1c22";
+  const runs = textRuns(t);
+  let cols = null;
+  if (runs) { cols = []; for (const r of runs) for (let i = 0; i < r.t.length; i++) cols.push(r.c || base); }
   ctx.save();
-  ctx.fillStyle = t.color || "#1c1c22";
+  ctx.fillStyle = base;
   ctx.font = `${fs}px ${family}`;
   ctx.textBaseline = "top";
-  let y = (t.y || 0) * H + padY;
+  let y = (t.y || 0) * H + padY, off = 0;
   const x = (t.x || 0) * W + padX;
   for (const para of String(t.value).split("\n")) {
-    for (const line of wrapLine(ctx, para, maxW)) { ctx.fillText(line, x, y); y += lh; }
+    for (const [a, b] of wrapLine(ctx, para, maxW)) {
+      if (!cols) ctx.fillText(para.slice(a, b), x, y);
+      else {
+        let cx = x;
+        for (let i = a; i < b;) {
+          let j = i + 1;
+          while (j < b && cols[off + j] === cols[off + i]) j++;
+          const seg = para.slice(i, j);
+          ctx.fillStyle = cols[off + i] || base;
+          ctx.fillText(seg, cx, y);
+          cx += ctx.measureText(seg).width;
+          i = j;
+        }
+      }
+      y += lh;
+    }
+    off += para.length + 1;
   }
   ctx.restore();
 }
-// 한 줄을 칸 폭에 맞춰 나눔: 띄어쓰기 단위, 한 낱말이 칸보다 길면 글자 단위(화면 word-break: break-word와 같게)
+// 한 줄을 칸 폭에 맞춰 나눔 → 줄마다 [시작, 끝) 글자 위치: 띄어쓰기 단위, 한 낱말이 칸보다 길면 글자 단위(화면 word-break: break-word와 같게)
 function wrapLine(ctx, text, maxW) {
-  if (!text || ctx.measureText(text).width <= maxW) return [text || ""];
+  const n = text ? text.length : 0;
+  if (!n || ctx.measureText(text).width <= maxW) return [[0, n]];
   const out = [];
-  let line = "";
-  for (const tok of text.split(/(\s+)/)) {
-    if (!tok) continue;
-    if (ctx.measureText(line + tok).width <= maxW) { line += tok; continue; }
-    if (!tok.trim()) { if (line) { out.push(line); line = ""; } continue; } // 줄 끝 공백은 버림
-    if (line) { out.push(line); line = ""; }
-    for (const ch of tok) {
-      if (line && ctx.measureText(line + ch).width > maxW) { out.push(line); line = ""; }
-      line += ch;
+  let s = 0, e = 0; // 지금 줄 = text[s, e)
+  const fits = (b) => ctx.measureText(text.slice(s, b)).width <= maxW;
+  const flush = () => { if (e > s) out.push([s, e]); };
+  for (const m of text.matchAll(/\s+|\S+/g)) {
+    const a = m.index, b = a + m[0].length;
+    if (e === s) s = e = a;
+    if (fits(b)) { e = b; continue; }
+    if (!m[0].trim()) { flush(); s = e = b; continue; } // 줄 끝 공백은 버림
+    flush(); s = e = a;
+    for (const ch of m[0]) {
+      if (e > s && !fits(e + ch.length)) { out.push([s, e]); s = e; }
+      e += ch.length;
     }
   }
-  if (line) out.push(line);
-  return out.length ? out : [""];
+  flush();
+  return out.length ? out : [[0, 0]];
+}
+
+// ── 텍스트 부분 색(11) ──
+// runs가 value와 맞으면 그 조각들, 아니면 null(한 색)
+export function textRuns(t) {
+  const r = t && t.runs;
+  if (!Array.isArray(r) || !r.length) return null;
+  return r.map(x => String((x && x.t) || "")).join("") === String(t.value || "") ? r : null;
+}
+
+// ── 도형(10) ──
+export const SHAPES = ["line", "arrow", "rect", "ellipse", "tri"];
+// 기준 화면 px 꼭짓점 목록(닫힌 도형은 첫 점 반복). 화살표는 [꼬리, 끝, 날개1, 끝, 날개2]
+function shapeVerts(kind, box, size) {
+  const [ax, ay, bx, by] = box;
+  const x0 = Math.min(ax, bx) * REF_W, x1 = Math.max(ax, bx) * REF_W, y0 = Math.min(ay, by) * REF_H, y1 = Math.max(ay, by) * REF_H;
+  const A = { x: ax * REF_W, y: ay * REF_H }, B = { x: bx * REF_W, y: by * REF_H };
+  if (kind === "line") return [A, B];
+  if (kind === "rect") return [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }, { x: x0, y: y0 }];
+  if (kind === "tri") { const top = { x: (x0 + x1) / 2, y: y0 }; return [top, { x: x1, y: y1 }, { x: x0, y: y1 }, top]; }
+  if (kind === "arrow") {
+    const len = Math.hypot(B.x - A.x, B.y - A.y) || 1;
+    const head = Math.min(len * 0.45, Math.max(12, 6 + (size || 2) * 3.2));
+    const ang = Math.atan2(B.y - A.y, B.x - A.x), spread = 0.5;
+    const w1 = { x: B.x - head * Math.cos(ang - spread), y: B.y - head * Math.sin(ang - spread) };
+    const w2 = { x: B.x - head * Math.cos(ang + spread), y: B.y - head * Math.sin(ang + spread) };
+    return [A, B, w1, B, w2];
+  }
+  return null;
+}
+// 캔버스 경로(W×H 그림 위)
+function shapePath(ctx, kind, box, size, W, H) {
+  const kx = W / REF_W, ky = H / REF_H;
+  if (kind === "ellipse") {
+    const [ax, ay, bx, by] = box;
+    ctx.ellipse((ax + bx) / 2 * W, (ay + by) / 2 * H, Math.max(0.5, Math.abs(bx - ax) / 2 * W), Math.max(0.5, Math.abs(by - ay) / 2 * H), 0, 0, Math.PI * 2);
+    return;
+  }
+  const v = shapeVerts(kind, box, size);
+  if (!v) return;
+  ctx.moveTo(v[0].x * kx, v[0].y * ky);
+  for (let i = 1; i < v.length; i++) ctx.lineTo(v[i].x * kx, v[i].y * ky);
+  if (kind === "rect" || kind === "tri") ctx.closePath();
+}
+// 윤곽을 SHAPE_STEP 간격 점으로(정규화, 압력 0.5)
+export function shapePoints(kind, box, size) {
+  const out = [];
+  const add = (x, y) => out.push({ x: r4(x / REF_W), y: r4(y / REF_H), p: 0.5 });
+  if (kind === "ellipse") {
+    const [ax, ay, bx, by] = box;
+    const cx = (ax + bx) / 2 * REF_W, cy = (ay + by) / 2 * REF_H, rx = Math.abs(bx - ax) / 2 * REF_W, ry = Math.abs(by - ay) / 2 * REF_H;
+    const n = Math.max(12, Math.ceil(Math.PI * (rx + ry) / SHAPE_STEP));
+    for (let i = 0; i <= n; i++) { const a = (i / n) * Math.PI * 2; add(cx + rx * Math.cos(a), cy + ry * Math.sin(a)); }
+    return out;
+  }
+  const v = shapeVerts(kind, box, size) || [];
+  v.forEach((p, i) => {
+    if (!i) { add(p.x, p.y); return; }
+    const q = v[i - 1], n = Math.max(1, Math.ceil(Math.hypot(p.x - q.x, p.y - q.y) / SHAPE_STEP));
+    for (let j = 1; j <= n; j++) add(q.x + (p.x - q.x) * j / n, q.y + (p.y - q.y) * j / n);
+  });
+  return out;
+}
+// Shift: 네모·동그라미·세모는 정사각형, 직선·화살표는 45° 단위
+function constrainShape(kind, ax, ay, bx, by) {
+  const dx = (bx - ax) * REF_W, dy = (by - ay) * REF_H;
+  if (kind === "line" || kind === "arrow") {
+    const len = Math.hypot(dx, dy), a = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) * (Math.PI / 4);
+    return { x: ax + len * Math.cos(a) / REF_W, y: ay + len * Math.sin(a) / REF_H };
+  }
+  const m = Math.max(Math.abs(dx), Math.abs(dy));
+  return { x: ax + Math.sign(dx || 1) * m / REF_W, y: ay + Math.sign(dy || 1) * m / REF_H };
 }

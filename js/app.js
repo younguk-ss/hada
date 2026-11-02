@@ -4,7 +4,9 @@
 // 가정: 교사 로그인 상태에서 /teacher-login에 오면 /teacher로 보낸다(로그아웃은 대시보드).
 // 가정: /student-login?form=1 은 기억된 학생이 있어도 폼을 연다(대기 화면 '코드 바꾸기'). 이때 학생 정보는 채우고 코드는 비운다.
 // 가정: 참여 등록(cloudAddParticipant)은 여기서 하지 않는다 — 수업 화면 진입 시 student.js가 1회 처리.
-// 가정: QR 입장(/student/join?c=)에서 기억된 학생이면 로그인 화면을 그린 뒤 그 코드로 바로 입장을 시도한다(lastCode는 성공 시 저장).
+// 가정: QR 입장(/student/join?c=, /r/CODE)은 기억된 학생이 있어도 바로 들어가지 않고 '누가 참여하나요?'를 먼저 보인다
+//       ([홍길동으로 입장] / [다른 학생이에요]) — 학년·반이 돌려쓰는 공용 태블릿에서 앞 학생 이름으로 들어가지 않게. lastCode는 입장 성공 시 저장.
+//       [다른 학생이에요]는 QR 코드를 채운 빈 폼(학년부터 입력). 새 학생으로 입장하면 기억된 학생이 그 학생으로 바뀐다.
 // 가정: 코드 칸 하나로 교사 코드와 수업별 복습 코드(학습지 QR, /r/CODE)를 함께 받는다 — 교사 코드를 먼저 찾고 없으면 복습 코드.
 //       복습 코드로 들어오면 lastCode(대기 화면용 교사 코드)는 이전 값을 두고, 없을 때만 그 수업 선생님의 코드로 채운다.
 // 가정: 복습 코드(학습지 QR·기록의 복습 링크)는 수업이 진행 중이어도 늘 학생 페이스 복습으로 보낸다(첫 슬라이드부터).
@@ -31,6 +33,13 @@ function redirect(path) { setTimeout(() => go(path, { replace: true }), 0); }
 function ssGet(k) { try { return sessionStorage.getItem(k); } catch { return null; } }
 function ssSet(k, v) { try { v == null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v); } catch {} }
 const isEnter = (e) => e.key === "Enter" && !e.isComposing && e.keyCode !== 229;
+// 이름 뒤 '로/으로' (받침 없음·ㄹ받침 → 로)
+function josaRo(name) {
+  const c = String(name || "").trim().slice(-1).charCodeAt(0) - 0xac00;
+  if (!(c >= 0 && c < 11172)) return "(으)로";
+  const j = c % 28;
+  return j === 0 || j === 8 ? "로" : "으로";
+}
 function failView() {
   mount(el("main", { class: "center-page" }, el("div", { class: "empty" }, "화면을 불러오지 못했어요")));
 }
@@ -139,7 +148,7 @@ route("/teacher-login", () => {
 });
 
 // ── 학생 입장 ──
-// opts.autoCode: QR 입장 — 기억된 학생으로 이 코드에 바로 입장
+// opts.autoCode: QR 입장 — 기억된 학생이면 이 코드로 '누가 참여하나요?'(바로 들어가지 않음)
 function studentLoginView(params = {}, { autoCode = null } = {}) {
   const v = template("tpl-student-login");
   mount(v);
@@ -197,9 +206,10 @@ function studentLoginView(params = {}, { autoCode = null } = {}) {
   function setBusy(btn, on) {
     if (btn === againBtn) {
       againBtn.disabled = on;
+      otherBtn.disabled = on;
       againBtn.setAttribute("aria-busy", on ? "true" : "false");
-      if (on) { againBtn._label = againBtn.textContent; againBtn.replaceChildren(el("span", { class: "spinner", style: { borderColor: "rgba(255,255,255,.35)", borderTopColor: "#fff" } })); }
-      else if (againBtn._label != null) { againBtn.textContent = againBtn._label; }
+      if (on) { againBtn._kids = [...againBtn.childNodes]; againBtn.replaceChildren(el("span", { class: "spinner", style: { borderColor: "rgba(255,255,255,.35)", borderTopColor: "#fff" } })); }
+      else if (againBtn._kids) { againBtn.replaceChildren(...againBtn._kids); }
     } else {
       btn.classList.toggle("loading", on);
     }
@@ -275,13 +285,15 @@ function studentLoginView(params = {}, { autoCode = null } = {}) {
   if (canRemember) {
     remembered.hidden = false;
     form.hidden = true;
-    againBtn.textContent = `${profile.name} (${profile.grade}-${profile.classNum}-${profile.num}) · ${rememberedCode} 입장`;
-    const runRemembered = () => join({
+    againBtn.replaceChildren(
+      el("span", { class: "remembered-name" }, `${profile.name}${josaRo(profile.name)} 입장`),
+      el("small", {}, `${profile.grade}학년 ${profile.classNum}반 ${profile.num}번 · 코드 ${rememberedCode}`),
+    );
+    againBtn.onclick = () => join({
       code: rememberedCode, grade: profile.grade, classNum: profile.classNum, num: profile.num, name: profile.name,
     }, againBtn);
-    againBtn.onclick = runRemembered;
-    otherBtn.onclick = () => showForm({ code: preset || rememberedCode || "" });
-    if (autoCode) runRemembered();
+    // QR이면 그 코드, 아니면 기억된 코드를 채운 빈 폼 — 학년·반·번호·이름만 새로
+    otherBtn.onclick = () => showForm({ code: autoCode ? rememberedCode : (preset || rememberedCode || "") });
   } else if (profile && (params.form || !rememberedCode)) {
     // 코드 바꾸기 · 코드 없이 기억된 학생: 학생 정보는 채우고 코드만 입력
     showForm({ keepStudent: true, code: preset || "" });
@@ -299,7 +311,7 @@ function qrJoin(rawCode) {
   const code = normCode(rawCode || "");
   const me = currentStudent();
   if (me && me.id && code) {
-    // 기록상 주소를 로그인 화면으로 바꿔 둔다 → 수업에서 '뒤로'를 눌러도 자동 입장이 반복되지 않음(재디스패치 없음)
+    // 기록상 주소를 로그인 화면으로 바꿔 둔다 → 새로고침·'뒤로'에도 QR 주소가 다시 처리되지 않음(재디스패치 없음)
     try { history.replaceState(null, "", "#/student-login"); } catch {}
     return studentLoginView({}, { autoCode: code });
   }

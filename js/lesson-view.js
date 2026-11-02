@@ -16,6 +16,10 @@
 //       기본 획은 지우개로 지우면 그 scope의 removed에만 기록(원본 불변). 전체 지우기는 Rec만 비운다.
 // 가정: id 없는 레거시 기본 획은 '#<i>'(i < 기본 획 수, 순서 불변)로 removed에 기록 가능. Rec 쪽 '#' 키는 불안정해 기록 안 함.
 // 가정: individual/group인데 scopeId가 없으면(구버전 호출) 빈 읽기 전용으로 그린다.
+// 텍스트 부분 색(v2.10): 글자 일부를 고르고 도구바 색을 누르면 그 부분만 그 색(Text.runs, canvas.js 11). 글 상자 안은 색 조각마다
+//       <span data-c>이고, 입력할 때마다 DOM을 읽어 runs·value를 다시 만든다(줄바꿈은 글자 \n·<br>·<div> 모두 받음).
+//       색 버튼은 pointerdown을 막아 선택이 풀리지 않게 하고, 혹시 풀려도 4초 안의 마지막 선택을 쓴다. 전부 한 색이면 runs 없이 color만.
+// 도형(v2.10): 도구 'shape' + setShape(종류) → InkCanvas가 그림(canvas.js 10).
 // 가정(v2.6.1): 텍스트 블록은 텍스트 도구일 때만 편집 가능(contenteditable). 펜 도구일 때 편집 가능한 칸이 화면에 있으면
 //       iPad의 Scribble(펜 손글씨 → 글자 입력)이 근처 필기를 가로채 글자 칸이 선택되는 일이 있어서 끈다.
 // zoom: true → root(스테이지)가 확대·이동 뷰포트가 된다(js/zoom-view.js). 캔버스는 프레임 밖에서 뷰포트 전체를 덮고
@@ -25,9 +29,12 @@
 //       선택한 칸은 도구바의 색·S/M/L도 바로 따른다. 옮기기·크기는 손을 뗄 때 저장(ts 갱신 → 병합에서 최신이 이김).
 //       w가 없으면 예전처럼 글자에 맞춰 늘어남(최대 70%). 미니·인쇄(canvas.js drawTextBox)도 같은 칸 폭으로 줄바꿈.
 // 가정: 컨테이너 단위(cqw)를 모르는 구형 브라우저는 글자 크기를 프레임 폭 기준 px로 계산해 넣고 프레임 크기가 바뀌면 다시 맞춘다.
+// 놓인 이미지(v2.10, slide.config.images): 배경 위·필기 아래 레이어. Img = { id, url, path, x, y, w, ar } — x·y는 왼쪽 위(프레임 정규화),
+//       w는 프레임 폭 비율, ar은 가로/세로(높이 = w × 1.6 / ar). 모든 scope에서 그리고, 편집기(edit)의 '이미지' 도구일 때만
+//       끌어서 옮기기·모서리로 크기(비율 유지)·× 삭제·Delete 키. 이미지 파일은 지우지 않는다(지난 수업 스냅샷이 같은 URL을 참조).
 
 import { el } from "./ui.js";
-import { InkCanvas, strokeKey } from "./canvas.js";
+import { InkCanvas, strokeKey, textRuns } from "./canvas.js";
 import { store } from "./store.js";
 import { cloudWriteRecord } from "./cloud.js";
 import { newId, injectCss } from "./slides/registry.js";
@@ -36,6 +43,20 @@ import { createZoomView } from "./zoom-view.js";
 const BASE_CSS = `
 :where(.slide-frame) { position:relative; aspect-ratio:16/10; background:#fff; overflow:hidden; }
 .slide-frame > img.bg { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; pointer-events:none; user-select:none; -webkit-user-drag:none; }
+.img-layer { position:absolute; inset:0; pointer-events:none; }
+.img-layer > img.slide-img { position:absolute; display:block; max-width:none; object-fit:fill; pointer-events:none; user-select:none; -webkit-user-drag:none; }
+.slide-frame.tool-image { cursor:default; }
+.slide-frame.tool-image .img-layer > img.slide-img { pointer-events:auto; cursor:move; touch-action:none; }
+@media (hover: hover) { .slide-frame.tool-image .img-layer > img.slide-img:hover { outline:2px dashed var(--accent); outline-offset:-1px; } }
+.img-sel { position:absolute; z-index:3; pointer-events:none; box-shadow:0 0 0 2px var(--accent); }
+.img-sel[hidden] { display:none; }
+.img-sel > .img-h { position:absolute; width:22px; height:22px; margin:-11px 0 0 -11px; padding:0; border-radius:50%; background:#fff;
+  border:2.5px solid var(--accent); box-shadow:0 1px 3px rgba(0,0,0,.25); pointer-events:auto; touch-action:none; }
+.img-sel > .img-h::before { content:""; position:absolute; inset:-10px; } /* 손가락 닿는 곳 넓게 */
+.img-sel > .img-h.nw { left:0; top:0; cursor:nwse-resize; } .img-sel > .img-h.ne { left:100%; top:0; cursor:nesw-resize; }
+.img-sel > .img-h.sw { left:0; top:100%; cursor:nesw-resize; } .img-sel > .img-h.se { left:100%; top:100%; cursor:nwse-resize; }
+.img-sel > .img-del { position:absolute; right:8px; top:8px; width:34px; height:34px; padding:0; border:0; border-radius:50%;
+  display:grid; place-items:center; background:var(--danger); color:#fff; box-shadow:0 1px 4px rgba(0,0,0,.3); pointer-events:auto; cursor:pointer; }
 .slide-frame > canvas { position:absolute; inset:0; width:100%; height:100%; touch-action:none; }
 .slide-frame > .text-layer { position:absolute; inset:0; pointer-events:none; container-type:size; }
 .slide-frame .text-block { position:absolute; pointer-events:none; min-width:4em; max-width:70%; padding:.3em .45em; line-height:1.3;
@@ -71,6 +92,85 @@ const BASE_CSS = `
 .zoom-view > canvas.ink-view { position:absolute; left:0; top:0; width:100%; height:100%; transform-origin:0 0; z-index:1; }
 `;
 
+// ── 글 상자 안 색 조각(v2.10) ──
+const textSig = (t) => String(t.value || "") + "\u0001" + (textRuns(t) ? JSON.stringify(t.runs) : "");
+// 글 상자 DOM을 그 텍스트로(색 조각은 <span data-c>)
+function fillTextEl(node, t) {
+  node._sig = textSig(t);
+  const runs = textRuns(t);
+  if (!runs) { node.textContent = t.value || ""; return; }
+  node.replaceChildren(...runs.map(r => (r.c ? el("span", { "data-c": r.c, style: { color: r.c } }, r.t) : document.createTextNode(r.t))));
+}
+function cssHex(v) {
+  const m = /^rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(v || "");
+  return m ? "#" + m.slice(1, 4).map(n => (+n).toString(16).padStart(2, "0")).join("") : (v || null);
+}
+// DOM → { runs:[{t, c}], at:[points의 글자 위치] }. 마지막 줄바꿈 하나는 뺀다(contenteditable이 붙이는 것)
+function scanText(root, points = []) {
+  const runs = [], at = points.map(() => null);
+  let len = 0;
+  const push = (t, c) => {
+    if (!t) return;
+    const last = runs[runs.length - 1];
+    if (last && last.c === c) last.t += t; else runs.push({ t, c });
+    len += t.length;
+  };
+  const endsNL = () => { const last = runs[runs.length - 1]; return !last || last.t.endsWith("\n"); };
+  const mark = (node, i) => points.forEach((p, k) => { if (at[k] == null && p.node === node && p.offset === i) at[k] = len; });
+  const walk = (node, c) => {
+    const kids = node.childNodes;
+    for (let i = 0; i < kids.length; i++) {
+      mark(node, i);
+      const ch = kids[i];
+      if (ch.nodeType === 3) {
+        points.forEach((p, k) => { if (at[k] == null && p.node === ch) at[k] = len + Math.min(p.offset, ch.data.length); });
+        push(ch.data, c);
+      } else if (ch.nodeName === "BR") push("\n", c);
+      else if (ch.nodeType === 1) {
+        if (/^(DIV|P|LI)$/.test(ch.nodeName) && !endsNL()) push("\n", c);
+        const own = ch.getAttribute("data-c") || (ch.style && ch.style.color ? cssHex(ch.style.color) : null);
+        walk(ch, own || c);
+      }
+    }
+    mark(node, kids.length);
+  };
+  walk(root, null);
+  const last = runs[runs.length - 1];
+  if (last && last.t.endsWith("\n")) { last.t = last.t.slice(0, -1); if (!last.t) runs.pop(); }
+  return { runs, at };
+}
+// 조각 → t.value·t.runs(정리: 같은 색 합치기, 글 상자 색과 같으면 null, 전부 한 색이면 color로)
+function setTextRuns(t, runs) {
+  const base = (t.color || "#1c1c22").toLowerCase();
+  const out = [];
+  for (const r of runs) {
+    if (!r.t) continue;
+    const c = r.c && r.c.toLowerCase() !== base ? r.c : null;
+    const last = out[out.length - 1];
+    if (last && last.c === c) last.t += r.t; else out.push({ t: r.t, c });
+  }
+  t.value = out.map(r => r.t).join("");
+  if (out.length === 1 && out[0].c) { t.color = out[0].c; delete t.runs; }
+  else if (out.some(r => r.c)) t.runs = out;
+  else delete t.runs;
+}
+// 글자 위치 s..e를 선택(fillTextEl로 그린 DOM)
+function selectTextRange(root, s, e) {
+  const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let pos = 0, a = null, b = null, n;
+  while ((n = tw.nextNode())) {
+    const L = n.data.length;
+    if (!a && s <= pos + L) a = [n, s - pos];
+    if (!b && e <= pos + L) { b = [n, e - pos]; break; }
+    pos += L;
+  }
+  if (!a || !b) return;
+  const sel = document.getSelection();
+  const r = document.createRange();
+  r.setStart(a[0], a[1]); r.setEnd(b[0], b[1]);
+  sel.removeAllRanges(); sel.addRange(r);
+}
+
 // 펜 굵기 → 글자 크기(기준 폭 960px)
 function textSizeFor(size) { return size <= 2.5 ? 18 : size <= 4 ? 24 : 32; }
 
@@ -89,6 +189,31 @@ const TX_ICON = {
 
 const EMPTY = () => ({ strokes: [], texts: [], removed: [] });
 
+const FRAME_A = 1.6; // 슬라이드 16:10
+
+// 놓인 이미지 목록(그릴 수 있는 것만)
+export function slideImages(slide) {
+  const a = slide && slide.config && slide.config.images;
+  return Array.isArray(a) ? a.filter(im => im && im.url && im.w > 0 && im.ar > 0) : [];
+}
+function placeImg(node, im) {
+  node.style.left = (im.x * 100) + "%";
+  node.style.top = (im.y * 100) + "%";
+  node.style.width = (im.w * 100) + "%";
+  node.style.height = (im.w * FRAME_A / im.ar * 100) + "%";
+}
+// 썸네일·미니 프레임용 이미지 레이어(16:10 상자 안에 넣음). 이미지가 없으면 null
+export function imageLayer(slide, { lazy = false } = {}) {
+  const list = slideImages(slide);
+  if (!list.length) return null;
+  injectCss("lesson-view", BASE_CSS);
+  return el("div", { class: "img-layer" }, list.map(im => {
+    const node = el("img", { class: "slide-img", src: im.url, alt: "", decoding: "async", draggable: "false", ...(lazy ? { loading: "lazy" } : {}) });
+    placeImg(node, im);
+    return node;
+  }));
+}
+
 export function renderSlide({ root, slide, session, scope, scopeId, readOnly, authorId, onChange, zoom = false }) {
   injectCss("lesson-view", BASE_CSS);
   const noScopeId = (scope === "individual" || scope === "group") && !scopeId;
@@ -96,7 +221,9 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
   const frame = el("div", { class: "slide-frame" + (writable ? "" : " readonly") });
   let img = null;
   const canvas = el("canvas", zoom ? { class: "ink-view" } : {});
+  const imgLayer = el("div", { class: "img-layer" });
   const textLayer = el("div", { class: "text-layer" });
+  frame.appendChild(imgLayer);
   syncBg();
   if (!zoom) frame.appendChild(canvas);
   frame.appendChild(textLayer);
@@ -104,12 +231,20 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
   if (zoom) { root.classList.add("zoom-view"); root.appendChild(canvas); }
 
   let textMode = false;
+  let curTool = "pen";
+  let savedSel = null; // 글 상자에서 마지막으로 고른 부분 { key, s, e, at }
+  let imgMode = false; // 편집기 '이미지' 도구
   let textSize = 18;
   let textTimer = 0;
   let pendingRefresh = false;
   let destroyed = false;
   let lastSig = null; // 마지막으로 그린 Rec 서명 (doRefresh 가 초기 렌더에서 쓰므로 먼저 선언)
   const textEls = new Map(); // key → node
+  // 놓인 이미지 상태(초기 doRefresh가 쓰므로 먼저 선언)
+  const editImgs = scope === "edit" && writable;
+  const imgEls = new Map(); // id → <img>
+  let selImg = null;        // 선택한 이미지 id(이미지 도구일 때만)
+  let imgSelBox = null, imgDrag = null;
   // 바닥 레이어(편집기 기본 필기)
   const base = scope === "edit" ? { strokes: [], texts: [] }
     : { strokes: Array.isArray(slide.strokes) ? slide.strokes : [], texts: Array.isArray(slide.texts) ? slide.texts : [] };
@@ -242,6 +377,140 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
       frame.insertBefore(img, frame.firstChild);
     }
     if (img.getAttribute("src") !== url) img.src = url;
+  }
+
+  // ── 놓인 이미지 ──
+  function imgList() {
+    if (!editImgs) return slideImages(slide);
+    slide.config ||= {};
+    if (!Array.isArray(slide.config.images)) slide.config.images = [];
+    return slide.config.images;
+  }
+  function findImg(id) { return imgList().find(im => im && im.id === id) || null; }
+  function renderImages() {
+    const list = slideImages(slide);
+    const seen = new Set();
+    list.forEach((im, i) => {
+      if (!im.id && editImgs) im.id = newId("im");
+      const key = im.id || "#i" + i;
+      seen.add(key);
+      let node = imgEls.get(key);
+      if (!node) {
+        node = el("img", { class: "slide-img", alt: "", decoding: "async", draggable: "false" });
+        if (editImgs) bindImg(node, key);
+        imgEls.set(key, node);
+      }
+      if (node.getAttribute("src") !== im.url) node.src = im.url;
+      placeImg(node, im);
+      if (imgLayer.children[i] !== node) imgLayer.insertBefore(node, imgLayer.children[i] || null);
+    });
+    for (const [key, node] of imgEls) if (!seen.has(key)) { node.remove(); imgEls.delete(key); }
+    if (selImg && !seen.has(selImg)) selImg = null;
+    syncSel();
+  }
+  function syncSel() {
+    if (!editImgs) return;
+    const im = imgMode && selImg ? findImg(selImg) : null;
+    if (!im) { if (imgSelBox) imgSelBox.hidden = true; return; }
+    if (!imgSelBox) {
+      const handle = (k) => {
+        const h = el("span", { class: "img-h zv-own " + k, "aria-hidden": "true" });
+        h.addEventListener("pointerdown", (e) => { const cur = findImg(selImg); if (cur) startImgDrag(e, cur, k); });
+        return h;
+      };
+      const del = el("button", { type: "button", class: "img-del zv-own", title: "이미지 삭제", "aria-label": "이미지 삭제", onClick: (e) => { e.stopPropagation(); removeImg(selImg); } },
+        el("span", { html: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>' }));
+      imgSelBox = el("div", { class: "img-sel" }, [handle("nw"), handle("ne"), handle("sw"), handle("se"), del]);
+      frame.appendChild(imgSelBox);
+    }
+    imgSelBox.hidden = false;
+    placeImg(imgSelBox, im);
+  }
+  function selectImg(id) { selImg = id || null; syncSel(); }
+  function bindImg(node, id) {
+    node.classList.add("zv-own"); // 확대 보기가 끌기를 이동으로 가로채지 않게
+    node.addEventListener("pointerdown", (e) => {
+      if (!imgMode || destroyed) return;
+      const im = findImg(id);
+      if (!im) return;
+      selectImg(id);
+      startImgDrag(e, im, "move");
+    });
+  }
+  // 끌기: move = 옮기기, nw·ne·sw·se = 그 모서리로 크기(맞은편 모서리 고정, 비율 유지)
+  function startImgDrag(e, im, kind) {
+    if (destroyed || !imgMode || (e.pointerType === "mouse" && e.button !== 0)) return;
+    e.preventDefault(); e.stopPropagation();
+    if (imgDrag) imgDrag.end(false);
+    const r = frame.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    const pid = e.pointerId, sx = e.clientX, sy = e.clientY;
+    const o = { x: im.x, y: im.y, w: im.w, h: im.w * FRAME_A / im.ar };
+    let moved = false;
+    const move = (ev) => {
+      if (ev.pointerId !== pid) return;
+      if (!moved && Math.hypot(ev.clientX - sx, ev.clientY - sy) < 3) return;
+      moved = true;
+      if (ev.cancelable) ev.preventDefault();
+      const dx = (ev.clientX - sx) / r.width, dy = (ev.clientY - sy) / r.height;
+      if (kind === "move") {
+        // 가장자리에 조금은 남게(완전히 밖으로 나가 잃어버리지 않게)
+        im.x = r4(clampN(o.x + dx, 0.04 - o.w, 0.96));
+        im.y = r4(clampN(o.y + dy, 0.04 - o.h, 0.96));
+      } else {
+        // 끈 만큼을 대각선(고정 모서리 → 잡은 모서리) 방향으로 투영 → 배율
+        const ex = kind.includes("e") ? 1 : -1, ey = kind.includes("s") ? 1 : -1;
+        const wp = o.w * r.width, hp = o.h * r.height;
+        const k = 1 + (ex * (ev.clientX - sx) * wp + ey * (ev.clientY - sy) * hp) / (wp * wp + hp * hp);
+        const w = clampN(o.w * k, 0.04, 2);
+        const h = w * FRAME_A / im.ar;
+        im.w = r4(w);
+        im.x = r4(ex > 0 ? o.x : o.x + o.w - w);
+        im.y = r4(ey > 0 ? o.y : o.y + o.h - h);
+      }
+      const node = imgEls.get(im.id);
+      if (node) placeImg(node, im);
+      syncSel();
+    };
+    const end = (save) => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+      imgDrag = null;
+      if (save && moved && !destroyed) persist();
+    };
+    const up = (ev) => { if (ev.pointerId === pid) end(true); };
+    const cancel = (ev) => { if (ev.pointerId === pid) end(true); };
+    imgDrag = { end };
+    window.addEventListener("pointermove", move, { passive: false });
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
+  }
+  function removeImg(id) {
+    const list = imgList();
+    const i = list.findIndex(im => im && im.id === id);
+    if (i < 0) return;
+    list.splice(i, 1);
+    selImg = null;
+    renderImages();
+    persist();
+  }
+  function onImgKey(e) {
+    if (!imgMode || !selImg || destroyed || e.defaultPrevented) return;
+    if (e.key !== "Delete" && e.key !== "Backspace") return;
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    if (document.documentElement.classList.contains("has-layer")) return;
+    e.preventDefault();
+    removeImg(selImg);
+  }
+  if (editImgs) {
+    document.addEventListener("keydown", onImgKey);
+    // 빈 곳을 누르면 선택 해제
+    frame.addEventListener("click", (e) => {
+      if (!imgMode || e.target.closest(".slide-img, .img-sel")) return;
+      selectImg(null);
+    });
   }
 
   // ── 텍스트 ──
@@ -407,15 +676,16 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
     }
   }
   function makeTextEl(key, t) {
-    const tb = el("div", { class: "text-block" });
+    const tb = el("div", { class: "text-block", "data-key": key });
     if (writable) {
       setEditable(tb, textMode);
       tb.addEventListener("input", () => {
         if (destroyed) return;
         const cur = findText(key);
         if (!cur) return;
-        cur.value = tb.innerText.replace(/\n$/, "");
+        setTextRuns(cur, scanText(tb).runs);
         cur.ts = Date.now();
+        tb._sig = textSig(cur);
         schedulePersist();
         if (selKey === key) placeSel();
       });
@@ -431,10 +701,59 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
         flushPersist();
       });
     }
-    tb.textContent = t.value || "";
+    fillTextEl(tb, t);
     placeText(tb, t);
     return tb;
   }
+  // 글 상자 안에서 지금 고른 부분 → { key, s, e } | null
+  function liveTextSel() {
+    const sel = document.getSelection();
+    if (!sel || !sel.rangeCount || sel.isCollapsed) return null;
+    const rng = sel.getRangeAt(0);
+    const n = rng.commonAncestorContainer;
+    const tb = (n.nodeType === 1 ? n : n.parentElement)?.closest?.(".text-block");
+    if (!tb || tb.classList.contains("is-base") || !textLayer.contains(tb)) return null;
+    const { at } = scanText(tb, [{ node: rng.startContainer, offset: rng.startOffset }, { node: rng.endContainer, offset: rng.endOffset }]);
+    if (at[0] == null || at[1] == null || at[0] === at[1]) return null;
+    return { key: tb.dataset.key, s: Math.min(at[0], at[1]), e: Math.max(at[0], at[1]) };
+  }
+  function onSelChange() {
+    if (!textMode || destroyed) return;
+    const t = liveTextSel();
+    if (t) savedSel = { ...t, at: Date.now() };
+  }
+  // 고른 부분만 색 c로. 칠했으면 true
+  function paintText(c) {
+    if (!writable || !textMode || destroyed || !c) return false;
+    let tgt = liveTextSel();
+    if (!tgt && savedSel && Date.now() - savedSel.at < 4000) tgt = savedSel;
+    const tb = tgt && textEls.get(tgt.key);
+    const cur = tgt && findText(tgt.key);
+    if (!tb || !cur || !tb.isConnected) return false;
+    const { runs } = scanText(tb);
+    const cols = [];
+    for (const r of runs) for (let i = 0; i < r.t.length; i++) cols.push(r.c);
+    const value = runs.map(r => r.t).join("");
+    const s0 = Math.max(0, Math.min(tgt.s, value.length)), e0 = Math.max(0, Math.min(tgt.e, value.length));
+    if (e0 <= s0) return false;
+    for (let i = s0; i < e0; i++) cols[i] = c;
+    const next = [];
+    for (let i = 0; i < value.length; i++) {
+      const last = next[next.length - 1];
+      if (last && last.c === cols[i]) last.t += value[i]; else next.push({ t: value[i], c: cols[i] });
+    }
+    setTextRuns(cur, next);
+    cur.ts = Date.now();
+    fillTextEl(tb, cur);
+    placeText(tb, cur);
+    selectTextRange(tb, s0, e0);
+    savedSel = { key: tgt.key, s: s0, e: e0, at: Date.now() };
+    ink.setColor(c); // 이어서 오는 setColor(c)가 칸 전체를 이 색으로 바꾸지 않게(고른 글자만)
+    clearTimeout(textTimer); textTimer = 0;
+    persist();
+    return true;
+  }
+  if (writable) document.addEventListener("selectionchange", onSelChange);
   function renderTexts() {
     const rec = pathFor(false);
     const rm = rec.removed && rec.removed.length ? new Set(rec.removed) : null;
@@ -448,10 +767,10 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
       let node = textEls.get(key);
       if (!node) {
         node = el("div", { class: "text-block is-base" });
-        node.textContent = t.value;
         textEls.set(key, node);
         textLayer.insertBefore(node, textLayer.firstChild);
       }
+      if (node._sig !== textSig(t)) fillTextEl(node, t);
       placeText(node, t);
     });
     (rec.texts || []).forEach((t, i) => {
@@ -466,7 +785,7 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
         textEls.set(key, node);
         textLayer.appendChild(node);
       } else {
-        if (document.activeElement !== node && node.textContent !== (t.value || "")) node.textContent = t.value || "";
+        if (document.activeElement !== node && node._sig !== textSig(t)) fillTextEl(node, t);
         placeText(node, t);
       }
     });
@@ -524,6 +843,7 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
     const rec = pathFor(false);
     ink.setStrokes(baseN ? base.strokes.concat(rec.strokes) : rec.strokes, rec.removed || []);
     renderTexts();
+    renderImages();
     lastSig = recSig(rec);
   }
   // 외부(스토어 변경) 새로고침: 내 Rec이 그대로면 O(획 수) 작업 생략. 지우기/되돌리기/로컬 커밋은 doRefresh 직접.
@@ -539,19 +859,39 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
     frame,
     zoom: zv,
     setTool(t) {
+      const was = curTool;
+      curTool = t;
       textMode = t === "text";
-      for (const node of [...textEls.values()]) setEditable(node, textMode);
+      imgMode = t === "image" && editImgs;
+      // 같은 도구로 다시 부르면(색·굵기 바꿀 때) 글 상자를 건드리지 않음 — 고른 글자가 풀리지 않게
+      if ((was === "text") !== textMode) for (const node of [...textEls.values()]) setEditable(node, textMode);
       frame.classList.toggle("tool-text", textMode && writable);
-      ink.setTool(textMode ? "pen" : t);
-      ink.setReadOnly(!writable || textMode);
-      canvas.style.pointerEvents = textMode ? "none" : "";
+      frame.classList.toggle("tool-image", imgMode);
+      ink.setTool(textMode || t === "image" ? "pen" : t);
+      ink.setReadOnly(!writable || textMode || t === "image");
+      canvas.style.pointerEvents = textMode || imgMode ? "none" : "";
       if (!textMode) select(null); else placeSel();
+      if (!imgMode) { imgDrag?.end(true); selImg = null; }
+      syncSel();
     },
+    // 편집기: 이미지 넣기(선택된 채로) · 개수
+    addImage(im) {
+      if (!editImgs || destroyed || !im || !im.url) return;
+      if (!im.id) im.id = newId("im");
+      imgList().push(im);
+      selImg = im.id;
+      renderImages();
+      persist();
+    },
+    imageCount: () => slideImages(slide).length,
     // 텍스트 도구에서 색·S/M/L을 바꾸면 선택한 글자 칸에도 바로 반영(값이 바뀔 때만 — 도구바는 누를 때마다 셋 다 다시 넘긴다)
     setColor(c) {
       if (textMode && c !== ink.color) setSelected({ color: c });
       ink.setColor(c);
     },
+    setShape(k) { ink.setShape(k); },
+    // 글 상자에서 고른 글자만 색 바꾸기(텍스트 도구일 때, 도구바가 setColor보다 먼저 부름). 칠했으면 true
+    paintText: (c) => paintText(c),
     setSize(s) {
       const ts = textSizeFor(s);
       if (textMode && ts !== textSize) setSelected({ size: Math.max(TX_MIN_FS, Math.round(ts / ink.zoomFactor() * 100) / 100) });
@@ -577,9 +917,13 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
       destroyed = true;
       try { selRO?.disconnect(); fontRO?.disconnect(); } catch (_) {}
       txDrag = null;
+      imgDrag?.end(false);
+      if (editImgs) document.removeEventListener("keydown", onImgKey);
+      if (writable) document.removeEventListener("selectionchange", onSelChange);
       zv?.destroy();
       ink.destroy();
       textEls.clear();
+      imgEls.clear();
       frame.remove();
       if (zoom) { canvas.remove(); root.classList.remove("zoom-view"); }
     },

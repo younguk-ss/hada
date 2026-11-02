@@ -227,7 +227,7 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
       if (g) e.stopPropagation(); // 마우스로 끄는 중이면 쓰지 않음
       return;
     }
-    if (e.target.closest?.(".text-block:focus, button, input, textarea")) return;
+    if (e.target.closest?.(".text-block:focus, button, input, textarea, .zv-own")) return; // .zv-own: 스스로 끄는 요소(편집기 놓인 이미지·손잡이)
     const p = local(e);
     if (e.pointerType === "mouse") {
       if (e.button === 1 || (e.button === 0 && !drawable())) {

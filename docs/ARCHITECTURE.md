@@ -58,6 +58,8 @@ Slide    = { id, type /*'ink'|'mcq'|…*/, title /*string|null*/, config /*objec
              // ink 전용(다른 타입은 생략 가능):
              bg /*URL|null*/, bgPath /*storage path|null*/, thumb /*URL|null*/, mode /*'none'|'whole'|'individual'|'group'*/,
              strokes /*Stroke[] 편집기 기본 필기*/, texts /*Text[]*/ }
+             // ink config.images(v2.10): 슬라이드 위에 놓인 이미지(배경 위·필기 아래). slides.config(jsonb)에 들어가므로 DB 변경 없음
+             //   Img = { id, url, path /*storage path|null(로컬)*/, x, y /*왼쪽 위, 프레임 정규화*/, w /*프레임 폭 비율*/, ar /*가로/세로*/ }  높이 = w × 1.6 / ar
 session  = { id, lessonId, teacherId, title, status /*'live'|'stopped'|'completed'*/, flow /*'teacher'|'student'*/,
              currentSlide /*int*/, rev /*number, 단조 증가*/, groups: [{ id, name, memberIds: [] }],
              reviewCode /*6자리 복습 코드|undefined — 학습지 QR, §9.4*/,
@@ -67,8 +69,11 @@ session  = { id, lessonId, teacherId, title, status /*'live'|'stopped'|'complete
              records: { __whole: { [slideId]: Rec }, __groups: { [groupId]: { [slideId]: Rec } }, [studentId]: { [slideId]: Rec } },
              responses: { [slideId]: Response[] } }
 Rec      = { strokes: Stroke[], texts: Text[], removed: string[] /* 지운 stroke id (whole/group 병합용 tombstone) */ }
-Stroke   = { id /*'st_…'*/, by /*작성자 id*/, tool /*'pen'|'highlight'|'eraser'*/, color, size, ts, points: [{x,y,p}] /* 0..1, 소수 4자리로 반올림 */ }
-Text     = { id /*'tx_…'*/, by, x, y, value, size, color, ts }
+Stroke   = { id /*'st_…'*/, by /*작성자 id*/, tool /*'pen'|'highlight'|'eraser'*/, color, size, ts, points: [{x,y,p}] /* 0..1, 소수 4자리로 반올림 */,
+             shape? /*'line'|'arrow'|'rect'|'ellipse'|'tri' (v2.10 도형)*/, box? /*[시작x, 시작y, 끝x, 끝y] 정규화*/ }
+             // 도형: 그리기는 box로 정확하게, points는 윤곽을 기준 화면 8px 간격으로 채운 점(지우개·필기 범위·이전 버전 화면용)
+Text     = { id /*'tx_…'*/, by, x, y, value, size, color, ts,
+             runs? /*[{ t, c }] 부분 색(v2.10) — t를 이으면 value, c=null이면 color. 맞지 않으면 무시하고 한 색*/ }
 Response = { id /*DB bigserial number; 로컬 임시는 음수*/, sessionId, slideId, studentId, itemKey /*'' 기본*/,
              payload /*object*/, score /*number|null*/, correct /*boolean|null*/, timeMs /*int|null*/, updatedAt /*ms*/ }
 ActivityState = { phase: 'idle'|'running'|'ended', startedAt?, endsAt?, reveal?: boolean, mode?: InkMode, ...타입별 필드 }
@@ -110,6 +115,7 @@ storage bucket 'slides' public, 5 MB, image/jpeg|png|webp, anon select/insert/up
 
 `<lessonId>/<slideId>_<Date.now().toString(36)>.jpg` (본 이미지), 같은 이름 + `_t.jpg` (썸네일 폭 320px).
 업로드 옵션 `{ contentType: 'image/jpeg', cacheControl: '31536000', upsert: false }`. 교체 시 이전 path는 best-effort `remove`.
+놓인 이미지(v2.10): `<lessonId>/<slideId>_img_<시각>.png|jpg` — 썸네일 없음, 긴 변 1600px, 투명 픽셀이 있으면 PNG(흰 배경 없음)·아니면 JPEG. 지우거나 바꿔도 파일은 지우지 않는다(스냅샷이 URL 참조). 자료 복제 시 새 폴더로 복사.
 
 ---
 
@@ -248,6 +254,8 @@ export function watchTeacherLive(teacherId, onLive /*(sessionMeta)*/) → stop  
 export async function uploadSlideImage(lessonId, slideId, blobOrDataUrl) → { url, path, thumb }   // 본+썸네일 업로드. 로컬 모드: dataURL 그대로 반환
 export async function removeSlideImage(path)
 export async function fileToSlides(file, lessonId, onProgress) → Slide[]   // PDF(pdf.js 4.0.379, scale 1.6, jpeg 0.85)·이미지 → ink 슬라이드(업로드 완료된 URL)
+export async function uploadPlacedImage(lessonId, slideId, blob) → { url, path, ar }   // 슬라이드 위 이미지(v2.10). 로컬 모드: dataURL
+export async function copySlideImage(path, lessonId, slideId, { tag, thumb }) → { url, path, thumb } | null   // 자료 복제용, 확장자 유지
 export function isDataUrl(s)
 ```
 
@@ -401,6 +409,9 @@ ctx = {
 - TeacherLive: 스테이지 = 캔버스(none/whole → whole scope에 교사 필기, 도구바 동일 + `전체 지우기`). individual/group → 스테이지는 배경만 + **갤러리**(학생/모둠 타일 그리드, 이름·온라인 점·미니 캔버스, 레코드 변경 시만 다시 그림) — 타일 탭 → 모달로 크게(교사 첨삭 가능, 해당 scope에 기록). panel 없음(v2.7 — 모드 seg는 수업 진행 상단 바에만). `actions.groups()` = 모둠 편성 창(상단 바 [모둠] 버튼이 부름).
 - **모둠 편성 모달**: 조 크기 seg `2·3·4·5`(기본 4) + `[랜덤 편성]`(groupStudents(online∪participants, size)) + 칩 **탭→탭** 이동(드래그 금지). 저장 = `patchSession(session, { groups })`.
 - Editor: 스테이지에 캔버스 + 도구바(교사 기본 필기), 인스펙터(코어)에 배경 교체·기본 모드 seg를 ink가 `inspector` 필드로 제공(`Editor()` 반환에 `inspector?: HTMLElement` 허용).
+  - 도형(v2.10, 모든 화면): 도구바 **도형** — 누르면 종류 창(직선·화살표·네모·동그라미·세모), 켜진 도구를 다시 누르면 다시 연다. 끌어서 그리고 Shift = 정사각형·정원·45°. 거의 안 끈 것(4px 미만)은 버림. 지우개·되돌리기·병합은 보통 획과 같다.
+  - 텍스트 부분 색(v2.10, 모든 화면): 텍스트 도구에서 글자 일부를 고르고 색을 누르면 그 부분만(`Text.runs`). 색 버튼은 pointerdown을 막아 선택을 지키고, 풀려도 4초 안의 마지막 선택을 쓴다. 글자를 고르지 않고 색을 누르면 예전처럼 선택한 칸 전체(이미 칠한 부분 색은 남음). 기록·썸네일·인쇄는 `drawTextBox`가 칸 폭 줄바꿈 뒤에도 글자별 색으로.
+  - 이미지(v2.10): 도구바 끝 **이미지 도구**(편집기에만) — 슬라이드 위 이미지를 끌어서 옮기기 · 네 모서리로 크기(비율 유지, 맞은편 모서리 고정) · `×`·Delete 키로 삭제. 넣기 = 이미지 도구를 처음 누를 때(이미지가 없으면)·켜진 도구를 한 번 더 · 인스펙터 `이미지 [이미지 넣기]`(여러 장) · 붙여넣기(⌘/Ctrl+V) · 스테이지에 끌어다 놓기(놓은 곳에). 넣으면 선택된 채로 이미지 도구가 켜진다. 그리기는 lesson-view(`.img-layer`, 모든 scope·썸네일·갤러리 칸·인쇄).
 - summary: whole 레코드 미니 캔버스 / individual 학생 수 표기 + 갤러리(읽기 전용).
 - 저장: `cloudWriteRecord`(250ms 디바운스). 병합은 cloud.js `applyRecord`가 담당, ink는 `viewer.refresh()`.
 
@@ -500,11 +511,11 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 |---|---|---|
 | `/` | (기존) | 랜딩(인트로 유지). 버튼 `교사로 시작` `학생으로 참여` |
 | `/teacher-login` | C | 카드: 이름·비밀번호·`입장` + 작은 `처음이면 자동으로 만들어져요` |
-| `/student-login` | C | 기억된 학생 있으면 큰 버튼 `홍길동 (6-2-14) · ABC123 입장` + 작은 `다른 사람이에요`. 없으면 폼: 코드(1칸, 자동 대문자, 6자) · 학년/반/번호(`repeat(3,minmax(0,1fr))`, `type=text inputmode=numeric`) · 이름 · `입장` |
-| `/student/join?c=CODE` | C | QR. 기억된 학생이면 즉시 입장 시도, 아니면 코드 채운 로그인 폼 |
+| `/student-login` | C | 기억된 학생 있으면 `누가 참여하나요?` — 큰 버튼 `홍길동으로 입장`(작게 `6학년 2반 14번 · 코드 ABC123`) + 같은 크기 `다른 학생이에요 · 새로 입력`(코드 채운 빈 폼). 없으면 폼: 코드(1칸, 자동 대문자, 6자) · 학년/반/번호(`repeat(3,minmax(0,1fr))`, `type=text inputmode=numeric`) · 이름 · `입장` |
+| `/student/join?c=CODE` | C | QR. 기억된 학생이 있어도 **바로 들어가지 않고** `누가 참여하나요?`(v2.10, 학년·반이 돌려쓰는 공용 태블릿). 없으면 코드 채운 로그인 폼 |
 | `/r/:code` | C | 학습지 복습 QR(짧은 주소). `/student/join`과 같은 처리 — 코드 칸은 교사 코드·복습 코드를 모두 받는다 |
 | `/student/review/:id` | C | 학생 페이스 복습(§9.4), 늘 첫 슬라이드부터. 진행 중인 수업이어도 머물고 위쪽 `[수업 들어가기]` |
-| `/student` | C | 대기 카드: 교사 이름 · `선생님이 수업을 시작하면 자동으로 들어가요` · `코드 바꾸기` · 하단 작은 `내 기록` |
+| `/student` | C | 대기 카드: 맨 위 `👤 6-2-14 홍길동 | 로그아웃` · 교사 이름 · `선생님이 수업을 시작하면 자동으로 들어가요` · `코드 바꾸기` · 하단 작은 `내 기록` |
 | `/student/live/:id` | C | 학생 수업 화면 |
 | `/student/records` | C | 내 기록 목록 → 세션 상세(읽기 전용) |
 | `/teacher` | B | 대시보드(탭: `lessons`(기본) · `records` · `students` · `code`). 쿼리 `?tab=` 지원. LIVE 세션 있으면 상단 배너 `진행 중 · 제목 [돌아가기]` |
@@ -542,10 +553,11 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 
 ### 9.2 학생
 - **입장**: 코드 정규화 → `cloudFindTeacherByCode`(없으면 '코드를 확인해 주세요') → `cloudJoinStudent`(서버 id 채택, studentProfile 저장 + lastCode) → `cloudFetchLiveSession(teacherId)` → 있으면 `cloudAddParticipant` → `/student/live/:id`; 없으면 `/student`(대기, `watchTeacherLive`로 자동 입장).
-- **수업 화면 `/student/live/:id`**: store에 없으면 `cloudFetchSession(id, {forStudentId})`. `subscribeSession` + `joinSessionChannel`(presence) + `send('session:hello')`. 상단 바: 로고(작게) · 제목 · 모드 pill(ink일 때만, `전체`/`개별`/`모둠 · 2모둠`) · `3 / 12`(자유 이동이면 `◀ ▶`) · `나가기`. 스테이지 = `mountSlideHost({role:'student'})`.
+- **수업 화면 `/student/live/:id`**: store에 없으면 `cloudFetchSession(id, {forStudentId})`. `subscribeSession` + `joinSessionChannel`(presence) + `send('session:hello')`. 상단 바: 로고(작게) · 제목 · 모드 pill(ink일 때만, `전체`/`개별`/`모둠 · 2모둠`) · `3 / 12`(자유 이동이면 `◀ ▶`) · `나가기` · `👤 홍길동 | 로그아웃`(≤720px 이름만·≤420px 아이콘만). 스테이지 = `mountSlideHost({role:'student'})`.
   - flow teacher: currentSlide를 따른다. flow student: 로컬 인덱스(처음엔 currentSlide).
-  - 세션 status가 live가 아니게 되면 `수업이 끝났어요` 2초 → `/student`(대기: 같은 교사의 다음 수업 자동 입장).
+  - 세션 status가 live가 아니게 되면 `수업이 끝났어요` 2초 → `/student-login`(`누가 참여하나요?`, v2.10). 대기 화면은 다음 수업에 자동 입장하므로, 다음 시간 다른 반이 같은 태블릿을 쓰면 앞 학생 이름으로 들어가 버리기 때문. 같은 학생은 이름 버튼 한 번.
   - `나가기` → 채널 leave → `/student`.
+- **로그아웃**(v2.10): 대기·수업·복습·내 기록 화면의 `이름 | 로그아웃` 버튼(수업 중에만 한 번 확인). studentProfile·whoStudent를 지우고 `/student-login` 폼으로 — 코드는 이 탭(sessionStorage `hada:joinCode`)에 남겨 다음 학생은 학년·반·번호·이름만 입력.
 - **내 기록**: `cloudListSessionsForStudent` → 세션 → 읽기 전용 학생별 뷰(교사 기록의 학생별 컴포넌트와 같은 구조를 student.js가 간단히 구현: 슬라이드마다 ink 읽기 전용 / `def.summary`에 내 응답만 넘김). 상세 위 `[복습하기]`(진행 중이면 `[수업 들어가기]`).
 
 ### 9.4 복습 코드 (학습지 QR, v2.5)

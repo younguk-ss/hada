@@ -14,6 +14,7 @@ import { getSlideType, effectiveMode, injectCss } from "./slides/index.js";
 import { cloudEnsureReviewCode } from "./cloud.js";
 import { pageRectFor } from "./zoom-view.js";
 import { wsPages } from "./worksheet.js";
+import { slideImages } from "./lesson-view.js";
 
 const MARK = "assets/print-mark.png";
 const FRAME = 16 / 10;        // 슬라이드 프레임 비율
@@ -155,7 +156,10 @@ async function renderInk(session, slide, studentId) {
   const strokes = [...(slide.strokes || []), ...((rec && rec.strokes) || [])];
   const texts = [...(slide.texts || []), ...((rec && rec.texts) || [])];
   const removed = new Set((rec && rec.removed) || []);
-  const img = await loadImg(slide.bg);
+  const [img, placed] = await Promise.all([
+    loadImg(slide.bg),
+    Promise.all(slideImages(slide).map(async im => ({ im, pic: await loadImg(im.url) }))), // 슬라이드 위 이미지
+  ]);
   // 이미지가 프레임에서 차지하는 영역
   let r = { x: 0, y: 0, w: 1, h: 1 };
   if (img && img.naturalWidth && img.naturalHeight) {
@@ -170,7 +174,12 @@ async function renderInk(session, slide, studentId) {
     let focus = null;
     try { focus = (await pageRectFor(slide.thumb || slide.bg)).focus; } catch (_) { focus = null; }
     if (focus && focus.x1 > focus.x0 && focus.y1 > focus.y0) {
-      const ink = inkBounds(strokes, texts, removed);
+      let ink = inkBounds(strokes, texts, removed);
+      for (const { im, pic } of placed) {
+        if (!pic) continue;
+        const b = { x0: im.x, y0: im.y, x1: im.x + im.w, y1: im.y + im.w * FRAME / im.ar };
+        ink = ink ? { x0: Math.min(ink.x0, b.x0), y0: Math.min(ink.y0, b.y0), x1: Math.max(ink.x1, b.x1), y1: Math.max(ink.y1, b.y1) } : b;
+      }
       const u = ink ? { x0: Math.min(focus.x0, ink.x0), y0: Math.min(focus.y0, ink.y0), x1: Math.max(focus.x1, ink.x1), y1: Math.max(focus.y1, ink.y1) } : focus;
       f = { x0: Math.max(f.x0, u.x0), y0: Math.max(f.y0, u.y0), x1: Math.min(f.x1, u.x1), y1: Math.min(f.y1, u.y1) };
       if (!(f.x1 > f.x0 && f.y1 > f.y0)) f = { x0: r.x, y0: r.y, x1: r.x + r.w, y1: r.y + r.h };
@@ -192,6 +201,7 @@ async function renderInk(session, slide, studentId) {
   ctx.save();
   ctx.translate(-cx0 * FW, -cy0 * FH);
   if (img) ctx.drawImage(img, r.x * FW, r.y * FH, r.w * FW, r.h * FH);
+  for (const { im, pic } of placed) if (pic) ctx.drawImage(pic, im.x * FW, im.y * FH, im.w * FW, im.w * FW / im.ar);
   const k = FW / REF_W;
   strokes.forEach((s, i) => { if (!removed.has(strokeKey(s, i))) drawStroke(ctx, s, FW, FH, k); });
   for (const t of texts) {

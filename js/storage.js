@@ -2,6 +2,8 @@
 // 경로: <lessonId>/<slideId>_<Date.now().toString(36)>.jpg, 썸네일은 같은 이름 + '_t.jpg' (폭 320px)
 // 로컬 모드: 업로드 없이 data URL을 그대로 돌려준다(썸네일은 작은 data URL).
 // 가정: 본 이미지는 긴 변 2400px 이하로 맞추고, 5MB를 넘으면 화질/크기를 낮춰 다시 인코딩한다.
+// 놓인 이미지(편집기 [이미지], slide.config.images): <lessonId>/<slideId>_img_<시각>.png|jpg, 썸네일 없음. 긴 변 1600px,
+//       투명한 픽셀이 있으면 PNG(흰 배경을 깔지 않음), 없으면 JPEG.
 import { cloudEnabled, supaClient, clientReady } from "./cloud.js";
 import { newId, store } from "./store.js";
 
@@ -14,6 +16,7 @@ const MAX_SIDE = 2400;
 const MAX_SIDE_PORTRAIT = 3000;
 const maxSideFor = (w, h) => (h > w ? MAX_SIDE_PORTRAIT : MAX_SIDE);
 const MAX_BYTES = 5 * 1024 * 1024 - 16 * 1024;
+const PLACED_MAX_SIDE = 1600;
 const UPLOAD_OPTS = { contentType: "image/jpeg", cacheControl: "31536000", upsert: false };
 
 export function isDataUrl(s) {
@@ -42,8 +45,8 @@ function publicUrl(path) {
 }
 
 // ── 인코딩 헬퍼 ──
-function canvasToBlob(cv, quality = 0.85) {
-  return new Promise((res, rej) => cv.toBlob(b => b ? res(b) : rej(new Error("이미지 변환 실패")), "image/jpeg", quality));
+function canvasToBlob(cv, quality = 0.85, type = "image/jpeg") {
+  return new Promise((res, rej) => cv.toBlob(b => b ? res(b) : rej(new Error("이미지 변환 실패")), type, quality));
 }
 
 function blobToDataUrl(blob) {
@@ -162,6 +165,55 @@ export async function uploadSlideImage(lessonId, slideId, blobOrDataUrl) {
   return await putEncoded(lessonId, slideId, enc);
 }
 
+// 투명한 픽셀이 있나(듬성듬성 확인)
+function hasAlpha(g, w, h) {
+  const d = g.getImageData(0, 0, w, h).data;
+  const step = 4 * Math.max(1, Math.floor((w * h) / 250000));
+  for (let i = 3; i < d.length; i += step) if (d[i] < 250) return true;
+  return false;
+}
+
+// 슬라이드 위에 놓는 이미지 → { url, path, ar(가로/세로) }. 로컬 모드: data URL
+export async function uploadPlacedImage(lessonId, slideId, blob) {
+  if (!blob) throw new Error("이미지가 없어요");
+  await waitClient();
+  const bmp = await loadBitmap(blob);
+  const w0 = bmp.width || bmp.naturalWidth, h0 = bmp.height || bmp.naturalHeight;
+  if (!w0 || !h0) { bmp.close?.(); throw new Error("이미지를 읽지 못했어요"); }
+  let k = Math.min(1, PLACED_MAX_SIDE / Math.max(w0, h0));
+  const draw = (scale, white) => {
+    const cv = document.createElement("canvas");
+    cv.width = Math.max(1, Math.round(w0 * scale));
+    cv.height = Math.max(1, Math.round(h0 * scale));
+    const g = cv.getContext("2d");
+    if (white) { g.fillStyle = "#ffffff"; g.fillRect(0, 0, cv.width, cv.height); }
+    g.drawImage(bmp, 0, 0, cv.width, cv.height);
+    return { cv, g };
+  };
+  let main, png = false;
+  try {
+    const first = draw(k, false);
+    png = !/jpe?g/i.test(blob.type || "") && hasAlpha(first.g, first.cv.width, first.cv.height);
+    if (png) {
+      main = await canvasToBlob(first.cv, undefined, "image/png");
+      while (main.size > MAX_BYTES && k > 0.1) { k *= 0.75; main = await canvasToBlob(draw(k, false).cv, undefined, "image/png"); }
+    } else {
+      let q = 0.88;
+      main = await canvasToBlob(draw(k, true).cv, q);
+      while (main.size > MAX_BYTES && (q > 0.5 || k > 0.1)) {
+        if (q > 0.5) q -= 0.1; else k *= 0.8;
+        main = await canvasToBlob(draw(k, true).cv, q);
+      }
+    }
+  } finally { bmp.close?.(); }
+  const ar = Math.round((w0 / h0) * 10000) / 10000;
+  if (!cloudEnabled() || !bucket()) return { url: await blobToDataUrl(main), path: null, ar };
+  const path = `${lessonId}/${slideId}_img_${Date.now().toString(36)}.${png ? "png" : "jpg"}`;
+  const { error } = await bucket().upload(path, main, { ...UPLOAD_OPTS, contentType: png ? "image/png" : "image/jpeg" });
+  if (error) throw new Error("이미지 업로드 실패: " + (error.message || error));
+  return { url: publicUrl(path), path, ar };
+}
+
 // 본+썸네일 삭제 (best-effort)
 export async function removeSlideImage(path) {
   if (!path || !cloudEnabled() || !bucket()) return;
@@ -187,13 +239,15 @@ export async function removeLessonImages(lessonId) {
   } catch (e) { console.warn("[storage] 폴더 삭제 실패:", e); }
 }
 
-// 다른 수업 자료로 이미지 복사 (복제용). 실패하면 null
-export async function copySlideImage(path, lessonId, slideId) {
+// 다른 수업 자료로 이미지 복사 (복제용). 실패하면 null. tag: 파일 이름 꼬리(놓인 이미지 '_img'), 확장자는 원본 그대로
+export async function copySlideImage(path, lessonId, slideId, { tag = "", thumb = true } = {}) {
   if (!path || !cloudEnabled() || !bucket()) return null;
   try {
-    const np = `${lessonId}/${slideId}_${Date.now().toString(36)}.jpg`;
+    const ext = (/\.(png|jpe?g|webp)$/i.exec(path) || [, "jpg"])[1].toLowerCase();
+    const np = `${lessonId}/${slideId}${tag}_${Date.now().toString(36)}.${ext}`;
     const { error } = await bucket().copy(path, np);
     if (error) throw error;
+    if (!thumb) return { url: publicUrl(np), path: np, thumb: null };
     const { error: e2 } = await bucket().copy(thumbPathOf(path), thumbPathOf(np));
     return { url: publicUrl(np), path: np, thumb: publicUrl(e2 ? np : thumbPathOf(np)) };
   } catch (e) {

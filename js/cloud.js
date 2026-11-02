@@ -725,6 +725,12 @@ export async function cloudDuplicateLesson(lessonId) {
     })));
     // 문제 그림(config 속 image — 문제별·팝업 상호작용 속까지, v2.9)도 새 자료 폴더로
     await Promise.all(copy.map(s => upLimit(() => copyConfigImages(s.config, nid, s.id))));
+    // 슬라이드 위에 놓인 이미지(config.images)도 새 자료 폴더로
+    const placed = copy.flatMap(s => (Array.isArray(s.config?.images) ? s.config.images : []).filter(im => im && im.path).map(im => ({ s, im })));
+    await Promise.all(placed.map(({ s, im }) => upLimit(async () => {
+      const img = await copySlideImage(im.path, nid, s.id, { tag: "_img", thumb: false });
+      if (img) { im.url = img.url; im.path = img.path; } else im.path = null;
+    })));
   }
   const lesson = { id: nid, teacherId: src.teacherId, title: `${src.title} (복사본)`, createdAt: Date.now(), updatedAt: Date.now(), slides: copy, worksheet: wsCopy };
   const r = await cloudCreateLesson(lesson);

@@ -19,7 +19,11 @@
 //       띄우기를 풀어도 열린 채 두고, 탭을 다시 눌러 닫는다. 마지막 쪽은 sessionStorage 'hada:ws:<세션>'.
 // 가정(v2.9): 팝업 상호작용(js/popup.js) — 선생님이 핀을 누르면(activity.__pop) 화면 위에 팝업이 뜨고 선생님이 닫을 때까지 유지.
 //       자유 이동·복습에서는 슬라이드의 핀을 눌러 스스로 열고 닫는다(내 화면에서만).
-import { el, mount, icon, fmtDate, toast } from "./ui.js";
+// 가정(공용 태블릿): 대기·수업·복습·내 기록 화면에 늘 '이름 | 로그아웃' 버튼(meChip)을 둔다. 로그아웃 = 기억된 학생을 지우고
+//       입장 화면으로(코드는 이 탭에 남겨 다음 학생은 학년·반·번호·이름만). 수업 중에는 한 번 확인한다(필기·답은 이미 저장됨).
+// 가정: 수업이 끝나면 대기 화면이 아니라 입장 화면('누가 참여하나요?')으로 간다 — 대기 화면은 다음 수업에 자동으로 들어가므로,
+//       다음 시간에 다른 반이 같은 태블릿을 쓰면 앞 학생 이름으로 들어가 버린다. 같은 학생은 이름 버튼 한 번이면 된다.
+import { el, mount, icon, fmtDate, toast, confirmDialog } from "./ui.js";
 import { store, findSession, findStudent, studentLabel, normCode } from "./store.js";
 import { go } from "./router.js";
 import {
@@ -51,6 +55,19 @@ const CSS = `
 .stu-top .slide-count { min-width:56px; }
 @media (max-width: 420px) { .stu-top .brand { display:none; } .stu-review .pill-review { display:none; } }
 .stu-review .stu-top > .btn-sm { flex:none; }
+.stu-me { flex:none; display:inline-flex; align-items:stretch; height:44px; max-width:100%; padding:0; border:1px solid var(--line-strong);
+  border-radius:999px; background:var(--surface); color:var(--ink); font:inherit; cursor:pointer; overflow:hidden; }
+.stu-me-who { display:inline-flex; align-items:center; gap:6px; min-width:0; padding:0 10px 0 12px; font-size:14px; font-weight:650; }
+.stu-me-who .icon { color:var(--muted); }
+.stu-me-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:10em; }
+.stu-me-out { display:inline-flex; align-items:center; gap:5px; flex:none; padding:0 14px 0 10px; border-left:1px solid var(--line);
+  color:var(--danger); font-size:14px; font-weight:650; }
+@media (hover: hover) { .stu-me:hover .stu-me-out { background:var(--danger-soft); } }
+.stu-me:active .stu-me-out { background:var(--danger-soft); }
+.stu-wait .stu-me { width:100%; justify-content:space-between; }
+.stu-page-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+@media (max-width: 720px) { .stu-top .stu-me-lbl, .stu-top .stu-me-who .icon { display:none; } .stu-top .stu-me-out { padding:0 12px; } }
+@media (max-width: 420px) { .stu-top .stu-me-who { display:none; } .stu-top .stu-me-out { border-left:0; } }
 @media (max-width: 360px) { .stu-review .ans-label { display:none; } .stu-review .stu-top > .btn-sm { padding:0 8px; } }
 @media (max-width: 520px) { .stu-review .stu-live-btn { font-size:13px; padding:0 10px; } }
 @media (max-width: 420px) {
@@ -113,6 +130,37 @@ export function currentStudent() {
   return p;
 }
 
+// 로그아웃: 기억된 학생을 지우고 입장 화면으로. 코드는 이 탭에 남겨(hada:joinCode) 다음 학생은 학년·반·번호·이름만 입력
+export function logoutStudent() {
+  const code = normCode(currentStudent()?.lastCode || "");
+  store.set(s => { s.studentProfile = null; s.whoStudent = null; });
+  store.flush();
+  ssSet(LEFT_KEY, null);
+  try { Object.keys(sessionStorage).filter(k => k.startsWith(WS_POS)).forEach(k => sessionStorage.removeItem(k)); } catch {}
+  ssSet("hada:joinCode", code || null);
+  go("/student-login", { replace: true });
+}
+
+// 이름표 + 로그아웃 한 버튼 — 다른 학생 이름이 보이면 바로 눌러 바꾼다. confirm: 수업 중이면 한 번 확인
+function meChip(me, { full = false, confirm = false } = {}) {
+  const btn = el("button", { class: "stu-me", type: "button", title: "로그아웃", "aria-label": `${studentLabel(me)} 로그아웃` }, [
+    el("span", { class: "stu-me-who" }, [icon("user", 18), el("span", { class: "stu-me-name" }, full ? studentLabel(me) : me.name)]),
+    el("span", { class: "stu-me-out" }, [icon("logout", 18), el("span", { class: "stu-me-lbl" }, "로그아웃")]),
+  ]);
+  btn.onclick = async () => {
+    if (confirm) {
+      const ok = await confirmDialog({
+        title: `${me.name} 학생, 로그아웃할까요?`,
+        body: "지금까지 쓴 필기와 답은 저장돼 있어요. 로그아웃하면 다른 학생이 이 기기로 들어올 수 있어요.",
+        ok: "로그아웃",
+      });
+      if (!ok || !btn.isConnected) return;
+    }
+    logoutStudent();
+  };
+  return btn;
+}
+
 function myGroupOf(session, studentId) {
   return (session?.groups || []).find(g => (g.memberIds || []).includes(studentId)) || null;
 }
@@ -133,7 +181,7 @@ export function studentWaitView() {
   const line = el("div", { class: "stu-wait-line" }, [pulse, lineText]);
   const rejoinBtn = el("button", { class: "btn btn-primary btn-lg", type: "button", hidden: true }, "수업 들어가기");
   const card = el("div", { class: "card wait-card stack stu-wait" }, [
-    el("div", { class: "muted" }, studentLabel(me)),
+    meChip(me, { full: true }),
     teacherEl,
     el("span", { class: "pill pill-code" }, code),
     line,
@@ -238,7 +286,7 @@ export function studentLiveView({ id } = {}) {
   const top = el("header", { class: "stu-top" }, [
     brand(), titleEl, modePill,
     el("div", { class: "slide-nav" }, [prevBtn, countEl, nextBtn]),
-    exitBtn,
+    exitBtn, meChip(me, { confirm: true }),
   ]);
   const stage = el("div", { class: "stu-stage" }, [el("div", { class: "center" }, el("span", { class: "spinner", "aria-label": "불러오는 중" }))]);
   // 학습지: 오른쪽 📝 탭으로 열고 닫음(선생님이 띄운 동안은 닫기 불가), 쪽은 자유롭게
@@ -373,7 +421,8 @@ export function studentLiveView({ id } = {}) {
     popView.close();
     rememberEnded(id, findSession(id)?.rev);
     root.appendChild(el("div", { class: "stage-overlay" }, "수업이 끝났어요"));
-    endTimer = setTimeout(() => { if (!dead) go("/student", { replace: true }); }, 2000);
+    // 대기 화면(다음 수업 자동 입장)이 아니라 '누가 참여하나요?' — 다음 시간 다른 반이 이 태블릿을 쓸 수 있음
+    endTimer = setTimeout(() => { if (!dead) go("/student-login", { replace: true }); }, 2000);
   }
 
   function render() {
@@ -597,7 +646,7 @@ export function studentReviewView({ id } = {}) {
   const top = el("header", { class: "stu-top" }, [
     brand(), titleEl, el("span", { class: "pill pill-accent pill-review" }, "복습"), answerBtn,
     el("div", { class: "slide-nav" }, [prevBtn, countEl, nextBtn]),
-    liveBtn, exitBtn,
+    liveBtn, exitBtn, meChip(me),
   ]);
   const posKey = `${REVIEW_POS}${id}:${me.id}`;
   const resume = reviewReload && location.hash === LOAD_HASH;
@@ -762,7 +811,7 @@ export function studentRecordsView() {
 
   const backBtn = el("button", { class: "btn btn-ghost", type: "button" }, [icon("chevron-left"), "돌아가기"]);
   const body = el("div", { class: "stack" });
-  mount(el("main", { class: "stu-page" }, [backBtn, body]));
+  mount(el("main", { class: "stu-page" }, [el("div", { class: "stu-page-top" }, [backBtn, meChip(me)]), body]));
 
   const spinner = () => el("div", { class: "center", style: { padding: "48px 0" } }, el("span", { class: "spinner", "aria-label": "불러오는 중" }));
 
