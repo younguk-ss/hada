@@ -24,7 +24,7 @@
 import { el, icon } from "../ui.js";
 import { findStudent } from "../store.js";
 import { registerSlideType, newId, injectCss, groupStudents } from "./registry.js";
-import { questionEditor, optionLetter } from "./common.js";
+import { questionEditor, optionLetter, questionImage } from "./common.js";
 
 // ── 규칙 상수 ──
 const BASE = 1 / 12000;          // 랩/ms (1랩 12초)
@@ -61,6 +61,7 @@ function cfgOf(slide) {
     return {
       id: q.id || newId("q"), question: String(q.question ?? ""), options,
       answerId: options.some(o => o.id === ans) ? ans : null,
+      image: q.image && q.image.url ? q.image : null,
     };
   });
   return { laps, questions };
@@ -814,14 +815,14 @@ function seg(options, value, onPick) {
   return root;
 }
 
-function Editor({ slide, update, ctx }) {
+function Editor({ slide, lesson, update, ctx }) {
   ensureCss(ctx);
   let cfg = cfgOf(slide);
   const emit = () => update({
     config: {
       ...(slide.config || {}),
       laps: cfg.laps,
-      questions: cfg.questions.map(q => ({ id: q.id, question: q.question, options: q.options.map(o => ({ ...o })), answerId: q.answerId })),
+      questions: cfg.questions.map(q => ({ id: q.id, question: q.question, options: q.options.map(o => ({ ...o })), answerId: q.answerId, image: q.image || null })),
     },
   });
 
@@ -848,10 +849,12 @@ function Editor({ slide, update, ctx }) {
       const qe = questionEditor({
         question: q.question, options: q.options, answerIds: q.answerId ? [q.answerId] : [],
         multiple: false, maxOptions: 4, minOptions: 4, placeholder: "문제를 입력하세요",
-        onChange: ({ question, options, answerIds }) => {
+        image: q.image, imageAt: { lessonId: lesson?.id, slideId: slide.id },
+        onChange: ({ question, options, answerIds, image }) => {
           q.question = question;
           q.options = options.slice(0, 4);
           q.answerId = answerIds[0] || null;
+          q.image = image || null;
           emit();
         },
       });
@@ -1029,6 +1032,7 @@ function Student({ slide, me, ctx }) {
       el("div", { class: "race-quiz-top" }, [el("span", { class: "pill pill-muted" }, `문제 ${k}/${Q}`), left]),
       barWrap,
       el("h2", { class: "race-q" }, q.question || ""),
+      questionImage(q.image),
       el("div", { class: "race-choices" }, q.options.map((o, i) => el("button", {
         class: "choice", type: "button",
         onClick: () => { if (race && race.quizK === k) answer(k, o.id, null); },

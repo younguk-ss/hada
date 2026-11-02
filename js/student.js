@@ -17,6 +17,8 @@
 // 가정: 학습지(js/worksheet.js) — 수업에 학습지가 있으면 오른쪽 가장자리 📝 탭. 누르면 슬라이드 스테이지를 숨기고(호스트는 유지) 학습지 스테이지를
 //       보인다(내 개별 칸에 필기, 쪽은 ◀ ▶·←/→). 선생님이 띄우면(activity.__ws.force) 자동으로 열리고 닫을 수 없다(쪽 이동은 자유).
 //       띄우기를 풀어도 열린 채 두고, 탭을 다시 눌러 닫는다. 마지막 쪽은 sessionStorage 'hada:ws:<세션>'.
+// 가정(v2.9): 팝업 상호작용(js/popup.js) — 선생님이 핀을 누르면(activity.__pop) 화면 위에 팝업이 뜨고 선생님이 닫을 때까지 유지.
+//       자유 이동·복습에서는 슬라이드의 핀을 눌러 스스로 열고 닫는다(내 화면에서만).
 import { el, mount, icon, fmtDate, toast } from "./ui.js";
 import { store, findSession, findStudent, studentLabel, normCode } from "./store.js";
 import { go } from "./router.js";
@@ -29,6 +31,7 @@ import { mountSlideHost } from "./slides/host.js";
 import { getSlideType, effectiveMode, injectCss } from "./slides/registry.js";
 import { renderSlide } from "./lesson-view.js";
 import { wsPages, wsForced, wsPageTitle, makeWsSessionView, wsTab, wsPrefetch } from "./worksheet.js";
+import { createPopupView, popOf, findPopSlide, hotspotsOf, popSlideFor } from "./popup.js";
 
 const CSS = `
 .stu-page { min-height:100vh; min-height:100dvh; max-width:760px; margin:0 auto; display:grid; gap:16px; align-content:start;
@@ -256,6 +259,18 @@ export function studentLiveView({ id } = {}) {
   const wsTabEl = wsTab({ onClick: toggleWs });
   const root = el("div", { class: "stu" }, [top, stage, wsStage, wsTabEl]);
   mount(root);
+  // 팝업 상호작용: 선생님이 띄운 것(닫기 없음) > 내가 연 것(자유 이동일 때만)
+  let localPop = null;
+  const popView = createPopupView({ container: root, role: "student", me, onClose: () => { localPop = null; render(); } });
+  const openLocalPop = (pid) => { localPop = pid; render(); };
+  function syncPopup(s) {
+    const p = popOf(s);
+    const tps = p ? findPopSlide(s, p.id) : null;
+    if (tps) { localPop = null; popView.show(s, tps, { closable: false, note: "선생님이 띄웠어요" }); return; }
+    const lps = localPop && s.flow === "student" ? findPopSlide(s, localPop) : null;
+    if (lps) popView.show(s, lps, { closable: true });
+    else { localPop = null; popView.close(); }
+  }
 
   function setText(node, key, text) {
     if (shown[key] === text) return;
@@ -355,6 +370,7 @@ export function studentLiveView({ id } = {}) {
   function showEnded() {
     if (ended) return;
     ended = true;
+    popView.close();
     rememberEnded(id, findSession(id)?.rev);
     root.appendChild(el("div", { class: "stage-overlay" }, "수업이 끝났어요"));
     endTimer = setTimeout(() => { if (!dead) go("/student", { replace: true }); }, 2000);
@@ -367,6 +383,7 @@ export function studentLiveView({ id } = {}) {
     const s = findSession(id);
     if (!s) return;
     if (s.status !== "live") { showEnded(); return; }
+    syncPopup(s);
     const slides = Array.isArray(s.slidesSnapshot) ? s.slidesSnapshot : [];
     const n = slides.length;
     if (!n) {
@@ -403,7 +420,7 @@ export function studentLiveView({ id } = {}) {
     shown.msg = null;
     stage.replaceChildren();
     mounting = true; dirty = false;
-    try { host = mountSlideHost({ role: "student", root: stage, slide, session: s, me }); }
+    try { host = mountSlideHost({ role: "student", root: stage, slide, session: s, me, onPopup: openLocalPop }); }
     catch (e) { console.error("[student] 슬라이드 표시 실패", e); host = null; }
     finally { mounting = false; }
     if (dead) { destroyHost(); return; }
@@ -429,6 +446,7 @@ export function studentLiveView({ id } = {}) {
     const n = (s.slidesSnapshot || []).length;
     if (!n) return;
     localIdx = clamp((localIdx ?? s.currentSlide ?? 0) + d, 0, n - 1);
+    localPop = null; // 내가 연 팝업은 슬라이드를 넘기면 닫힘
     render();
   }
 
@@ -499,6 +517,7 @@ export function studentLiveView({ id } = {}) {
     try { offStore && offStore(); } catch (e) { console.warn(e); }
     try { unsub && unsub(); } catch (e) { console.warn(e); }
     if (ch) { try { ch.leave(); } catch (e) { console.warn(e); } ch = null; }
+    popView.close();
     destroyWsHost();
     destroyHost();
   };
@@ -584,7 +603,11 @@ export function studentReviewView({ id } = {}) {
   const resume = reviewReload && location.hash === LOAD_HASH;
   reviewReload = false;
   const stage = el("div", { class: "stu-stage" }, [el("div", { class: "center" }, el("span", { class: "spinner", "aria-label": "불러오는 중" }))]);
-  mount(el("div", { class: "stu stu-review" }, [top, stage]));
+  const rroot = el("div", { class: "stu stu-review" }, [top, stage]);
+  mount(rroot);
+  // 팝업 상호작용: 슬라이드의 핀을 눌러 스스로 열고 닫는다(복습용 세션 보기로)
+  let localPop = null;
+  const popView = createPopupView({ container: rroot, role: "student", me, sessionView, onClose: () => { localPop = null; render(); } });
 
   function setText(node, key, text) {
     if (shown[key] === text) return;
@@ -646,10 +669,12 @@ export function studentReviewView({ id } = {}) {
       answerBtn.title = label;
       answerBtn.setAttribute("aria-label", label);
     }
+    const lps = localPop ? findPopSlide(s, localPop) : null;
+    if (lps) popView.show(s, lps, { closable: true }); else { localPop = null; popView.close(); }
     if (host) { host.update({ slide, session: s }); return; }
     stage.replaceChildren();
     mounting = true; dirty = false;
-    try { host = mountSlideHost({ role: "student", root: stage, slide, session: s, me, sessionView }); }
+    try { host = mountSlideHost({ role: "student", root: stage, slide, session: s, me, sessionView, onPopup: (pid) => { localPop = pid; render(); } }); }
     catch (e) { console.error("[review] 슬라이드 표시 실패", e); host = null; }
     finally { mounting = false; }
     if (dead) { destroyHost(); return; }
@@ -662,6 +687,7 @@ export function studentReviewView({ id } = {}) {
     const next = clamp(idx + d, 0, slides.length - 1);
     if (next === idx) return;
     idx = next;
+    localPop = null;
     ssSet(posKey, String(idx));
     render();
   }
@@ -719,6 +745,7 @@ export function studentReviewView({ id } = {}) {
     clearTimeout(loadTimer);
     document.removeEventListener("keydown", onKey);
     try { offStore && offStore(); } catch (e) { console.warn(e); }
+    popView.close();
     destroyHost();
   };
 }
@@ -862,7 +889,8 @@ export function studentRecordsView() {
             ? el("button", { class: "btn btn-primary", type: "button", onClick: () => go("/student/live/" + s.id) }, "수업 들어가기")
             : el("button", { class: "btn btn-primary", type: "button", onClick: () => go("/student/review/" + s.id) }, [icon("pen", 18), "복습하기"]),
         ]),
-        ...(slides.length ? slides.map((sl, i) => slideBlock(sl, i, s)) : [el("div", { class: "empty" }, "슬라이드가 없어요")]),
+        ...(slides.length ? slides.flatMap((sl, i) => [slideBlock(sl, i, s), ...hotspotsOf(sl).map(h => slideBlock(popSlideFor(h, sl), i, s))])
+          : [el("div", { class: "empty" }, "슬라이드가 없어요")]),
         // 학습지 쪽(내 개별 필기)
         ...wsPages(s).map((p, i) => slideBlock({ ...p, title: wsPageTitle(p, i), mode: "individual" }, slides.length + i, s)),
       );

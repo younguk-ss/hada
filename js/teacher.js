@@ -23,6 +23,10 @@
 //       그런 슬라이드로 오면 저절로 펼친다(직접 닫으면 다시 열 때까지 자동으로 펼치지 않음). 필기 슬라이드는 패널이 없어 화면이 넓다.
 //       '추가' = 지금 슬라이드 다음에 끼워 넣을 상호작용을 고르는 작은 창. 접속 수는 레일 '참여' 배지.
 //       학습지 화면에서 상단 ◀ ▶·슬라이드 번호를 누르면 슬라이드 화면으로 돌아간다.
+// 가정(v2.9): 상단 바는 세 구역 — 왼쪽(← 제목 · 코드) | 가운데(◀ n/N ▶) | 오른쪽(모드 · 진행 방식 · 종료). 넓은 화면은 가운데가
+//       정확히 가운데라 모드 버튼이 생기고 없어져도 ◀ ▶ 자리가 그대로이고, 좁은 화면은 모드·모둠 자리를 비워 둔 채(보이지 않게) 둬 같은 효과.
+// 가정(v2.9): 팝업 상호작용(js/popup.js) — 필기 슬라이드의 핀을 누르면 activity.__pop → 스테이지 위 팝업(오른쪽에 그 활동의 마감·공개 도구).
+//       다시 누르거나 ×·Esc·다른 슬라이드로 이동하면 닫힌다(학생 화면도 함께). 기록에는 그 슬라이드 뒤에 '팝업'으로 이어 붙인다.
 import { store, findLesson, findSession, findStudent, findTeacher, studentLabel, newId } from "./store.js";
 import { go } from "./router.js";
 import { el, mount, template, toast, confirmDialog, promptDialog, modal, sheet, icon, fmtDate, debounce, copyText, copyTextLater } from "./ui.js";
@@ -37,6 +41,7 @@ import { getSlideType, listSlideTypes, createSlide, CATEGORIES, effectiveMode, i
 import { renderSlide } from "./lesson-view.js";
 import { openStudentPrint, openBlankPrint, printStudents, printRecordView, reviewUrl } from "./print.js";
 import { wsPages, wsForced, setWsForce, wsPageTitle, wsStats, makeWsSessionView, wsCss } from "./worksheet.js";
+import { createPopupView, popOf, findPopSlide, setPop, freshHotspotIds, hotspotsOf, popSlideFor } from "./popup.js";
 
 const TABS = ["lessons", "records", "students", "code"];
 // 수업 중 바로 추가할 수 있는 타입 (정답 없는 상호작용 · 미디어)
@@ -65,6 +70,17 @@ const TEACHER_CSS = `
 .live-top .topbar-title { flex:1 1 80px; }
 .live-top .seg { flex:none; }
 .live-top .slide-count { min-width:72px; }
+/* 상단 바 세 구역(v2.9): ◀ n/N ▶ 는 늘 같은 자리 */
+.live-top { display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); gap:12px; }
+.live-top .lt-side { display:flex; align-items:center; gap:8px; min-width:0; }
+.live-top .lt-right { justify-content:flex-end; justify-content:safe flex-end; }
+.live-top .lt-nav { justify-self:center; }
+.live-top .is-off { display:none !important; }
+@media (max-width: 1280px) { .live-top .lt-right .t-flow-label { display:none; } }
+@media (max-width: 1100px) {
+  .live-top { grid-template-columns:minmax(0,1fr) auto auto; }
+  .live-top .is-off { display:inline-flex !important; visibility:hidden; pointer-events:none; }
+}
 .drawer-head { border-bottom:1px solid var(--line); }
 .drawer-head .tabs { flex:1; min-width:0; border-bottom:0; padding:0; }
 .t-pane { display:grid; gap:12px; align-content:start; min-width:0; }
@@ -1098,6 +1114,7 @@ function buildEditor(lessonId, teacher) {
     try { copy = JSON.parse(JSON.stringify(list[i])); } catch (e) { toast("복제하지 못했어요", { type: "error" }); return; }
     copy.id = newId("slide");
     if (copy.bgPath) copy.bgPath = null; // 가정: 이미지 파일 소유권은 원본에만
+    freshHotspotIds(copy); // 팝업 상호작용 id 새로(같은 수업에서 응답이 섞이지 않게)
     list.splice(i + 1, 0, copy);
     afterStructure(copy.id);
   }
@@ -1396,10 +1413,12 @@ function buildLive(sessionId, teacher) {
   const endBtn = el("button", { class: "btn btn-sm btn-danger", type: "button", onClick: endClass }, "종료");
   const savingPill = el("span", { class: "pill pill-warn", role: "status", hidden: true }, "저장 중…");
   const top = el("header", { class: "topbar live-top" }, [
-    el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "대시보드", title: "대시보드 (수업은 계속돼요)", onClick: () => go("/teacher") }, icon("arrow-left")),
-    titleEl, codeBtn,
-    el("div", { class: "slide-nav" }, [prevBtn, countBtn, nextBtn]),
-    modeSeg, groupBtn, flowBtn, savingPill, endBtn,
+    el("div", { class: "lt-side lt-left" }, [
+      el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "대시보드", title: "대시보드 (수업은 계속돼요)", onClick: () => go("/teacher") }, icon("arrow-left")),
+      titleEl, savingPill, codeBtn,
+    ]),
+    el("div", { class: "slide-nav lt-nav" }, [prevBtn, countBtn, nextBtn]),
+    el("div", { class: "lt-side lt-right" }, [modeSeg, groupBtn, flowBtn, endBtn]),
   ]);
 
   // ── 본문: 스테이지 | (패널) | 레일 ──
@@ -1443,8 +1462,26 @@ function buildLive(sessionId, teacher) {
     ]),
     el("div", { class: "drawer-body" }, [pluginBox, peopleBox]),
   ]);
-  const root = el("div", { class: "live" }, [top, el("div", { class: "live-body" }, [stage, wsStage, drawer, rail])]);
+  const liveBody = el("div", { class: "live-body" }, [stage, wsStage, drawer, rail]);
+  const root = el("div", { class: "live" }, [top, liveBody]);
   mount(root);
+
+  // ── 팝업 상호작용(v2.9): 핀 → activity.__pop → 교사·학생 화면에 함께 ──
+  const popView = createPopupView({ container: liveBody, role: "teacher", me: teacher, onClose: () => setPop(S(), null) });
+  function togglePopup(id) {
+    const s = S();
+    if (!s || !id) return;
+    const p = popOf(s);
+    setPop(s, p && p.id === id ? null : id);
+  }
+  function syncPopup() {
+    const s = S();
+    const p = popOf(s);
+    const ps = p ? findPopSlide(s, p.id) : null;
+    // 다른 슬라이드로 넘어갔거나 핀이 사라졌으면 닫는다(학생 화면도 함께 닫힘)
+    if (p && (!ps || (ps._parent && ps._parent !== (curSlide(s) || {}).id))) { popView.close(); setPop(s, null); return; }
+    if (ps) popView.show(s, ps, { closable: true }); else popView.close();
+  }
 
   // ── 동기화 ──
   function syncHost() {
@@ -1463,7 +1500,7 @@ function buildLive(sessionId, teacher) {
     if (host) { try { host.destroy(); } catch (e) { console.warn("[live] host destroy", e); } host = null; }
     stage.replaceChildren();
     hostSlideId = slide.id;
-    host = mountSlideHost({ role: "teacher", root: stage, slide, session: s, me: teacher });
+    host = mountSlideHost({ role: "teacher", root: stage, slide, session: s, me: teacher, onPopup: togglePopup });
     syncPanel(true);
   }
   // 플러그인 panel → '도구'. changed = 슬라이드가 바뀜(넓은 화면이면 도구를 저절로 펼침)
@@ -1524,7 +1561,7 @@ function buildLive(sessionId, teacher) {
     nextBtn.disabled = i >= n - 1;
     const isInk = !!slide && slide.type === "ink";
     const m = isInk ? effectiveMode(slide, s) : null;
-    modeSeg.hidden = !isInk || wsOpen; // 학습지 화면에서는 숨김(가려진 슬라이드의 모드라 헷갈림)
+    modeSeg.classList.toggle("is-off", !isInk || wsOpen); // 학습지 화면에서는 숨김(가려진 슬라이드의 모드라 헷갈림). 자리는 상단 바 CSS가 정함
     if (isInk) {
       modeSeg.querySelectorAll("button").forEach(b => {
         const on = b.dataset.mode === m;
@@ -1532,7 +1569,8 @@ function buildLive(sessionId, teacher) {
         b.setAttribute("aria-pressed", String(on));
       });
     }
-    groupBtn.hidden = m !== "group" || wsOpen;
+    groupBtn.hidden = false;
+    groupBtn.classList.toggle("is-off", m !== "group" || wsOpen);
     if (m === "group") {
       const gs = s.groups || [];
       const assigned = new Set(gs.flatMap(g => g.memberIds || []));
@@ -1549,7 +1587,7 @@ function buildLive(sessionId, teacher) {
     if (flow !== lastFlow) {
       lastFlow = flow;
       const free = flow === "student";
-      flowBtn.replaceChildren(icon(free ? "unlock" : "lock", 18), el("span", { class: "hide-sm" }, free ? "자유 이동" : "교사 진행"));
+      flowBtn.replaceChildren(icon(free ? "unlock" : "lock", 18), el("span", { class: "hide-sm t-flow-label" }, free ? "자유 이동" : "교사 진행"));
       flowBtn.title = free ? "자유 이동 (학생이 직접 넘김)" : "교사 진행";
       flowBtn.setAttribute("aria-pressed", String(free));
     }
@@ -1784,6 +1822,7 @@ function buildLive(sessionId, teacher) {
       actions: [
         { label: "취소" },
         { label: "추가하고 이동", primary: true, icon: "plus", onClick: async (close) => {
+          if (box.querySelector(".qi-busy")) { toast("그림을 올리는 중이에요. 잠시 뒤 다시 눌러 주세요"); return; }
           const msg = typeof def.validate === "function" ? def.validate(draft) : null;
           if (msg) { toast(msg); return; }
           if (await insertNext(draft)) close();
@@ -1791,7 +1830,8 @@ function buildLive(sessionId, teacher) {
       ],
       onClose: () => { try { ed && ed.destroy(); } catch (_) {} },
     });
-    try { ed = mountSlideHost({ role: "editor", root: box, slide: draft, onEditorUpdate: () => {} }); }
+    const lesson = findLesson(S()?.lessonId) || (S()?.lessonId ? { id: S().lessonId } : null); // 그림 올릴 폴더
+    try { ed = mountSlideHost({ role: "editor", root: box, slide: draft, lesson, onEditorUpdate: () => {} }); }
     catch (e) { console.warn("[live] 편집기 표시 실패", e); box.replaceChildren(el("div", { class: "empty" }, "편집기를 불러오지 못했어요")); }
   }
 
@@ -1843,6 +1883,7 @@ function buildLive(sessionId, teacher) {
     else if (e.key === "Escape") {
       if (openPop) closePop();
       else if (document.documentElement.classList.contains("has-layer")) return;
+      else if (popView.id) setPop(S(), null);
       else if (wsOpen) setWsOpen(false);
       else if (panel) setPanel(null, { user: true });
     }
@@ -1863,6 +1904,7 @@ function buildLive(sessionId, teacher) {
     syncTop();
     syncPeople();
     syncWs();
+    syncPopup();
   });
 
   syncTop();
@@ -1870,6 +1912,7 @@ function buildLive(sessionId, teacher) {
   syncOnline();
   syncPeople();
   syncWs();
+  syncPopup();
   // '작성 중'(최근 20초)은 시간이 지나면 저절로 풀리므로 주기적으로 배지만 다시 셈
   wsTimer = setInterval(() => { if (!disposed && wsPages(S()).length) syncWs(); }, 5000);
 
@@ -1880,6 +1923,7 @@ function buildLive(sessionId, teacher) {
     offStore();
     try { offPres(); } catch (_) {}
     closePop();
+    popView.close();
     destroyWsHost();
     if (host) { try { host.destroy(); } catch (e) { console.warn(e); } host = null; }
     try { unsub(); } catch (_) {}
@@ -2089,9 +2133,14 @@ export function sessionDetailView({ id } = {}) {
       if (!slides.length) { content.replaceChildren(el("div", { class: "empty empty-box" }, "슬라이드가 없어요")); return; }
       // 학습지 쪽은 슬라이드 뒤에 이어서(개별 필기 갤러리 / 그 학생 필기)
       const ws = wsPages(s).map((p, i) => ({ ...p, title: wsPageTitle(p, i), mode: "individual" }));
+      // 팝업 상호작용(v2.9)은 그 슬라이드 바로 뒤에 '팝업' 표지로
+      const popsOf = (sl) => hotspotsOf(sl).map(h => popSlideFor(h, sl));
       if (mode === "slides") {
         content.replaceChildren(
-          ...slides.map((sl, i) => slideSection(sl, i, summaryEl(s, sl, (s.responses || {})[sl.id] || [], recordCtx(s, teacher, sl, timers)))),
+          ...slides.flatMap((sl, i) => [
+            slideSection(sl, i, summaryEl(s, sl, (s.responses || {})[sl.id] || [], recordCtx(s, teacher, sl, timers))),
+            ...popsOf(sl).map(ps => slideSection(ps, i, summaryEl(s, ps, (s.responses || {})[ps.id] || [], recordCtx(s, teacher, ps, timers)), "팝업")),
+          ]),
           ...ws.map((p, i) => slideSection(p, slides.length + i, summaryEl(s, p, [], recordCtx(s, teacher, p, timers)), "학습지")),
         );
         return;
@@ -2105,21 +2154,20 @@ export function sessionDetailView({ id } = {}) {
         onClick: () => { if (picked !== p.id) { picked = p.id; renderContent(); } },
       }, p.st ? studentLabel(p.st) : "학생")));
       const st = findStudent(picked);
-      const sections = slides.map((sl, i) => {
-        let body;
-        if (sl.type === "ink") body = inkFor(s, sl, picked);
-        else {
-          const rs = ((s.responses || {})[sl.id] || []).filter(r => r.studentId === picked);
-          // 가정: 학생별 보기는 학생 '내 기록'과 같은 계약(isTeacher:false, me=그 학생, 그 학생 응답만) → race 등은 개인 결과만 표시
-          body = summaryEl(s, sl, rs, recordCtx(s, teacher, sl, timers, {
-            isTeacher: false, me: st || { id: picked }, studentId: picked,
-            responses: () => rs,
-            myResponse: (itemKey = "") => rs.find(r => (r.itemKey || "") === (itemKey || "")) || null,
-            myGroup: () => (s.groups || []).find(g => (g.memberIds || []).includes(picked)) || null,
-          }));
-        }
-        return slideSection(sl, i, body);
-      });
+      // 가정: 학생별 보기는 학생 '내 기록'과 같은 계약(isTeacher:false, me=그 학생, 그 학생 응답만) → race 등은 개인 결과만 표시
+      const mineOf = (sl) => {
+        const rs = ((s.responses || {})[sl.id] || []).filter(r => r.studentId === picked);
+        return summaryEl(s, sl, rs, recordCtx(s, teacher, sl, timers, {
+          isTeacher: false, me: st || { id: picked }, studentId: picked,
+          responses: () => rs,
+          myResponse: (itemKey = "") => rs.find(r => (r.itemKey || "") === (itemKey || "")) || null,
+          myGroup: () => (s.groups || []).find(g => (g.memberIds || []).includes(picked)) || null,
+        }));
+      };
+      const sections = slides.flatMap((sl, i) => [
+        slideSection(sl, i, sl.type === "ink" ? inkFor(s, sl, picked) : mineOf(sl)),
+        ...popsOf(sl).map(ps => slideSection(ps, i, mineOf(ps), "팝업")),
+      ]);
       const wsSections = ws.map((p, i) => slideSection(p, slides.length + i, inkFor(s, p, picked), "학습지"));
       content.replaceChildren(chips, el("h2", { class: "t-print-only" }, st ? studentLabel(st) : "학생"), ...sections, ...wsSections);
     }

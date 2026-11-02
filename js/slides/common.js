@@ -1,10 +1,17 @@
 // 플러그인 공용 UI·헬퍼 (docs/ARCHITECTURE.md §6.3)
 // activityBar · choiceBars · columnChart · whoSheet · OPTION_COLORS/optionColor · countdownPill · phasePill
 // questionEditor · loadYouTubeApi · normalizeAnswer · optionLetter
+// resultsOpen · resultsVeil(v2.9 결과 가리기) · imageField · questionImage(v2.9 문제 그림)
 // 가정: 스타일은 styles.css(.btn/.pill/.bars/.bar-row/.bar-fill/.field)가 기본. 여기서는 구조용 보조 CSS만
 //       :where() 로 주입해 styles.css 규칙이 항상 이기도록 한다.
-import { el } from "../ui.js";
+// 가정(v2.9): 정답이 있는 활동(객관식·빈칸·분류·주관식·동영상 퀴즈)의 교사 화면은 칠판에 띄워지므로, 학생이 답하는 동안에는
+//       응답 수만 보이고 결과(막대·답·학생별 표)는 교사가 [마감]하거나 [정답 공개]·타이머가 끝난 뒤에 보인다(미리 보기 방지).
+//       '전원 응답 → 자동 공개'는 쓰지 않는다(결과는 늘 교사가 연다).
+// 가정(v2.9): 문제 그림 = config.image(문제가 여럿이면 문제마다 q.image) = { url, path, thumb }. 수업 자료 폴더에 올리고
+//       자료 복제 때 함께 복사(cloud.js), 자료 삭제 때 폴더째 지워진다.
+import { el, toast } from "../ui.js";
 import { injectCss, newId } from "./registry.js";
+import * as storage from "../storage.js";
 
 injectCss("slides-common", `
 :where(.activity-bar){display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -56,6 +63,32 @@ injectCss("slides-common", `
 .who-name{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;background:var(--surface-2);font-size:14px}
 .who-name .who-extra{color:var(--muted)}
 .who-empty{color:var(--muted);font-size:14px}
+/* 결과 가리기(v2.9): 마감 전 교사 화면 — 응답 수와 진행 막대만 */
+.cc.is-veiled .cc-count,.cc.is-veiled .cc-bar{display:none}
+.cc.is-veiled{align-items:stretch}
+.rv-veil{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:26px 16px;min-height:150px;
+  border:1px dashed var(--line-strong);border-radius:16px;background:var(--surface);text-align:center}
+.rv-veil .rv-n{font-size:clamp(30px,4.4vw,52px);font-weight:800;line-height:1;color:var(--ink);font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.rv-veil .rv-n small{font-size:.42em;font-weight:700;color:var(--muted);margin-left:6px;letter-spacing:0}
+.rv-veil .rv-track{width:min(340px,80%);height:8px;border-radius:999px;background:var(--surface-2);overflow:hidden}
+.rv-veil .rv-fill{height:100%;width:0;border-radius:inherit;background:var(--accent);transition:width .35s ease}
+.rv-veil .rv-s{display:inline-flex;align-items:center;gap:6px;font-size:14px;font-weight:600;color:var(--muted)}
+.rv-veil .rv-s svg{width:15px;height:15px;flex:none}
+.rv-veil.is-compact{min-height:0;padding:14px 12px;gap:8px;border-radius:12px}
+.rv-veil.is-compact .rv-n{font-size:22px}
+/* 문제 그림(v2.9) */
+.qi{display:block;max-width:100%;max-height:min(38vh,420px);width:auto;height:auto;margin:0 auto;border-radius:12px;object-fit:contain;
+  background:var(--surface-2);box-shadow:inset 0 0 0 1px var(--line);cursor:zoom-in}
+.qi.is-sm{max-height:120px;border-radius:8px}
+.wl .qi,.wc .qi,.dd .qi{max-height:min(24vh,260px)}
+.dn-qcard .qi,.race-quiz-card .qi,.vq-tq-card .qi,.vq-pop .qi{max-height:min(24vh,230px)}
+.qi-wrap{display:flex;justify-content:center;min-width:0}
+.qi-zoom{position:fixed;inset:0;z-index:600;display:grid;place-items:center;padding:20px;background:rgba(15,15,20,.82);cursor:zoom-out;animation:fadeIn .15s ease}
+.qi-zoom img{max-width:100%;max-height:100%;border-radius:10px;box-shadow:0 20px 60px rgba(0,0,0,.4);background:#fff}
+.qi-field{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.qi-field .qi-thumb{width:96px;height:64px;border-radius:8px;object-fit:cover;background:var(--surface-2);box-shadow:inset 0 0 0 1px var(--line);flex:none}
+.qi-field .btn svg{width:16px;height:16px}
+.qi-field .qi-busy{font-size:13px;color:var(--muted)}
 `);
 
 // ── 선지 색상 (미니멀 톤의 4~6색, 객관식·동영상 퀴즈 교사 화면 공용) ──
@@ -79,8 +112,8 @@ export function columnChart(options, { onBarClick } = {}) {
       const bar = el("button", { class: "cc-bar", type: "button", "aria-label": `${optionLetter(i)} 응답자 보기`, onClick: () => onBarClick?.(o.id) }, [fill]);
       const label = el("span", {}, o.label || optionLetter(i));
       const tile = el("div", { class: "cc-tile", role: onBarClick ? "button" : null, tabindex: onBarClick ? "0" : null,
-        onClick: () => onBarClick?.(o.id),
-        onKeydown: (e) => { if (onBarClick && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); onBarClick(o.id); } },
+        onClick: () => { if (!last.veiled) onBarClick?.(o.id); },
+        onKeydown: (e) => { if (onBarClick && !last.veiled && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); onBarClick(o.id); } },
       }, [label, el("span", { class: "cc-key" }, optionLetter(i)), el("span", { class: "cc-tick", html: CHECK_SVG })]);
       const col = el("div", { class: "cc-col" }, [count, bar, tile]);
       col.style.setProperty("--cc-color", color);
@@ -94,9 +127,12 @@ export function columnChart(options, { onBarClick } = {}) {
     else opts.forEach((o, i) => { const t = o.label || optionLetter(i); if (cols[i].label.textContent !== t) cols[i].label.textContent = t; });
     update(last);
   }
-  function update({ counts = {}, correctIds = [], revealed = false } = {}) {
-    last = { counts, correctIds, revealed };
+  // veiled: 결과 가리기(v2.9) — 막대·인원은 숨기고 선지 타일만
+  function update({ counts = {}, correctIds = [], revealed = false, veiled = false } = {}) {
+    last = { counts, correctIds, revealed, veiled };
     const max = Math.max(1, ...cols.map(c => Number(counts[c.id]) || 0));
+    root.classList.toggle("is-veiled", !!veiled);
+    if (veiled) { revealed = false; correctIds = []; }
     root.classList.toggle("is-revealed", !!revealed);
     for (const c of cols) {
       const n = Number(counts[c.id]) || 0;
@@ -104,7 +140,7 @@ export function columnChart(options, { onBarClick } = {}) {
       c.fill.style.height = `${Math.max(2, Math.round((n / max) * 100))}%`;
       c.col.classList.toggle("is-correct", correctIds.includes(c.id));
       c.col.classList.toggle("is-revealed", !!revealed);
-      c.bar.disabled = !onBarClick;
+      c.bar.disabled = !onBarClick || !!veiled;
     }
   }
   root.update = update;
@@ -358,6 +394,91 @@ export function activityBar(ctx, { reveal = false, timer = false, countFn = null
   return bar;
 }
 
+// ── 결과 가리기(v2.9) ──
+// 교사 화면에 결과를 보여도 되나: 마감 · 정답 공개 · 타이머 끝. now = 교사 시계(교사 화면은 Date.now())
+export function resultsOpen(st, now = Date.now()) {
+  const a = st || {};
+  if (a.phase === "ended" || a.reveal === true) return true;
+  return a.phase === "running" && !!a.endsAt && now >= a.endsAt;
+}
+const LOCK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3"/></svg>';
+// 마감 전 자리표시: 큰 응답 수 + 진행 막대 + '마감하면 결과가 보여요'. set(n, m)
+export function resultsVeil({ compact = false, note = "마감하면 결과가 보여요" } = {}) {
+  const n = el("span", {}, "0");
+  const m = el("small", {}, "");
+  const fill = el("div", { class: "rv-fill" });
+  const node = el("div", { class: "rv-veil" + (compact ? " is-compact" : ""), role: "status" }, [
+    el("div", { class: "rv-n" }, [n, m]),
+    el("div", { class: "rv-track" }, [fill]),
+    el("div", { class: "rv-s" }, [el("span", { html: LOCK_SVG }), note]),
+  ]);
+  node.set = (count, total) => {
+    const c = Math.max(0, Number(count) || 0), t = Math.max(0, Number(total) || 0);
+    const ct = String(c), tt = t ? `/ ${t}명 응답` : "명 응답";
+    if (n.textContent !== ct) n.textContent = ct;
+    if (m.textContent !== tt) m.textContent = tt;
+    fill.style.width = `${t ? Math.min(100, Math.round((c / t) * 100)) : 0}%`;
+  };
+  return node;
+}
+
+// ── 문제 그림(v2.9) ──
+const IMG_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-8 9"/></svg>';
+// 화면 표시(학생·교사·기록). 누르면 크게. 그림이 없으면 null
+export function questionImage(img, { small = false } = {}) {
+  const url = img && (img.url || img.thumb);
+  if (!url) return null;
+  const im = el("img", { class: "qi" + (small ? " is-sm" : ""), src: small && img.thumb ? img.thumb : url, alt: "문제 그림", loading: "lazy", decoding: "async", draggable: "false" });
+  im.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const big = el("img", { src: img.url || url, alt: "문제 그림" });
+    const back = el("div", { class: "qi-zoom", role: "dialog", "aria-label": "그림 크게 보기" }, [big]);
+    const close = () => { back.remove(); document.removeEventListener("keydown", onKey, true); };
+    const onKey = (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); close(); } };
+    back.addEventListener("click", close);
+    document.addEventListener("keydown", onKey, true);
+    document.body.appendChild(back);
+  });
+  return el("div", { class: "qi-wrap" }, [im]);
+}
+// 편집기: [그림 넣기] / 작은 미리보기 · [바꾸기] [빼기]. onChange(image|null). lessonId·slideId = 올릴 폴더
+export function imageField({ value = null, lessonId = null, slideId = null, onChange, label = "그림 넣기" } = {}) {
+  let cur = value && value.url ? value : null, busy = false;
+  const input = el("input", { type: "file", accept: "image/*", hidden: true });
+  const root = el("div", { class: "qi-field" });
+  function paint() {
+    const pick = (text, ghost = false) => el("button", { class: "btn btn-sm" + (ghost ? " btn-ghost" : ""), type: "button", disabled: busy, onClick: () => input.click() },
+      [el("span", { html: IMG_SVG }), text]);
+    if (busy) { root.replaceChildren(el("span", { class: "spinner" }), el("span", { class: "qi-busy" }, "그림 올리는 중…"), input); return; }
+    if (!cur) { root.replaceChildren(pick(label, true), input); return; }
+    root.replaceChildren(
+      el("img", { class: "qi-thumb", src: cur.thumb || cur.url, alt: "" }),
+      pick("바꾸기"),
+      el("button", { class: "btn btn-sm btn-ghost", type: "button", onClick: () => { cur = null; paint(); onChange?.(null); } }, "빼기"),
+      input,
+    );
+  }
+  input.addEventListener("change", async () => {
+    const f = input.files && input.files[0];
+    input.value = "";
+    if (!f || busy) return;
+    if (!/^image\//.test(f.type || "")) return;
+    busy = true; paint();
+    try {
+      const r = await storage.uploadSlideImage(lessonId || "media", slideId || newId("img"), f);
+      if (!r || !r.url) throw new Error("업로드 실패");
+      cur = { url: r.url, path: r.path || null, thumb: r.thumb || r.url };
+      onChange?.(cur);
+    } catch (e) {
+      console.warn("[imageField] 업로드 실패", e);
+      toast("그림을 올리지 못했어요", { type: "error" });
+    } finally { busy = false; paint(); }
+  });
+  paint();
+  root.value = () => cur;
+  return root;
+}
+
 // ── 유튜브 IFrame API 1회 로드 ──
 let ytPromise = null;
 export function loadYouTubeApi() {
@@ -383,19 +504,22 @@ export function loadYouTubeApi() {
 }
 
 // ── 문제 편집기 (mcq / videoquiz / dino / race 편집기 공용) ──
-// onChange({ question, options, answerIds }) — 입력마다 호출(저장 디바운스는 코어 담당)
+// onChange({ question, options, answerIds, image }) — 입력마다 호출(저장 디바운스는 코어 담당)
 // answers:false → 정답 표시 칸 없이(설문)
+// imageAt: { lessonId, slideId } 를 주면 질문 아래에 [그림 넣기](v2.9). image = 처음 그림
 export function questionEditor({
   question = "", options = [], answerIds = [], multiple = false,
   maxOptions = 6, minOptions = 2, placeholder = "질문", onChange, answers: withAnswers = true,
+  image = null, imageAt = null,
 } = {}) {
   let q = String(question ?? "");
   let opts = (options || []).map(o => ({ id: o.id || newId("opt"), text: o.text ?? "" }));
   while (opts.length < minOptions) opts.push({ id: newId("opt"), text: "" });
   let answers = (answerIds || []).filter(id => opts.some(o => o.id === id));
+  let img = image && image.url ? image : null;
   const name = newId("qe");
 
-  const emit = () => onChange?.({ question: q, options: opts.map(o => ({ ...o })), answerIds: answers.slice() });
+  const emit = () => onChange?.({ question: q, options: opts.map(o => ({ ...o })), answerIds: answers.slice(), image: img });
 
   const ta = el("textarea", { rows: "2", placeholder, onInput: () => { q = ta.value; emit(); } });
   ta.value = q;
@@ -434,11 +558,13 @@ export function questionEditor({
   }
   render();
 
+  const imgField = imageAt ? imageField({ value: img, lessonId: imageAt.lessonId, slideId: imageAt.slideId, onChange: (v) => { img = v; emit(); } }) : null;
   const root = el("div", { class: "q-editor" }, [
     el("label", { class: "field" }, [ta]),
+    imgField,
     list,
     el("div", {}, [addBtn]),
   ]);
-  root.value = () => ({ question: q, options: opts.map(o => ({ ...o })), answerIds: answers.slice() });
+  root.value = () => ({ question: q, options: opts.map(o => ({ ...o })), answerIds: answers.slice(), image: img });
   return root;
 }

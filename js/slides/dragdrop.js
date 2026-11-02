@@ -9,7 +9,8 @@
 // 가정: 기록 화면(summary)은 교사면 막대 + 표, 학생(자기 응답만 받음)이면 자기 분류 결과를 보여 준다.
 import { el } from "../ui.js";
 import { registerSlideType, injectCss, newId, shuffle } from "./registry.js";
-import { activityBar, countdownPill, choiceBars, whoSheet } from "./common.js";
+import { activityBar, countdownPill, choiceBars, whoSheet, resultsOpen, resultsVeil, questionImage, imageField } from "./common.js";
+// 가정(v2.9): 교사 화면은 마감·정답 공개·타이머 끝 전에는 응답 수만(항목별 막대·학생별 표 가림). 문제 그림 config.image.
 import { answerMatrix, viewSeg, pickRows, matrixIds, rosterSig } from "./answer-matrix.js";
 
 const MIN_B = 2, MAX_B = 4, MIN_I = 2, MAX_I = 12;
@@ -234,10 +235,11 @@ registerSlideType({
     return null;
   },
 
-  Editor({ slide, update, ctx }) {
+  Editor({ slide, lesson, update, ctx }) {
     ensureCss(ctx);
     const cfg = () => slide.config || {};
     const set = (patch) => update({ config: { ...cfg(), ...patch } });
+    const img = imageField({ value: cfg().image, lessonId: lesson?.id, slideId: slide.id, onChange: (v) => set({ image: v }) });
 
     const prompt = el("textarea", { class: "input", rows: 2, placeholder: "안내 (예: 동물과 식물로 나누어 보세요)" });
     prompt.value = cfg().prompt || "";
@@ -307,6 +309,7 @@ registerSlideType({
 
     const root = el("div", { class: "dd-editor" }, [
       el("label", { class: "field" }, [el("span", {}, "안내"), prompt]),
+      img,
       el("div", { class: "field" }, [el("span", {}, "분류"), bucketList, el("div", {}, [addBucket])]),
       el("div", { class: "field" }, [el("span", {}, "항목 · 정답 분류"), itemList, el("div", {}, [addItem])]),
     ]);
@@ -354,6 +357,7 @@ registerSlideType({
     const submitBtn = el("button", { type: "button", class: "btn btn-primary", onClick: () => submit() }, "제출");
     const root = el("div", { class: "dd dd-stu" }, [
       el("div", { class: "dd-head" }, [el("h2", { class: "dd-prompt" }, cfg.prompt || ""), status]),
+      questionImage(cfg.image),
       tray, bucketWrap,
       el("div", { class: "dd-foot" }, [scoreEl, submitBtn]),
     ]);
@@ -538,15 +542,26 @@ registerSlideType({
     });
     const view = viewSeg(slide.id, () => refresh());
     const box = el("div", { class: "am-box" }, [result.el, matrix]);
+    const veil = resultsVeil();
     const root = el("div", { class: "dd dd-teacher" }, [
       el("div", { class: "dd-head" }, [el("h2", { class: "dd-prompt" }, cfg.prompt || ""), view]),
-      bar, box,
+      questionImage(cfg.image),
+      bar, veil, box,
     ]);
-    let sig = rosterSig(ctx);
+    let sig = rosterSig(ctx), endTm = null;
     function refresh() {
       const list = ctx.responses() || [];
       map = placementsBy(list);
       ids = matrixIds(ctx, list);
+      const st = ctx.activity() || {};
+      const open = resultsOpen(st, ctx.now ? ctx.now() : Date.now()); // 마감 전에는 결과를 가린다(v2.9)
+      veil.hidden = open;
+      veil.set(map.size, (ctx.participants() || []).length);
+      view.hidden = !open;
+      box.hidden = !open;
+      if (endTm != null) { ctx.clearTimer?.(endTm); endTm = null; }
+      if (!open && st.phase === "running" && st.endsAt) endTm = ctx.timeout?.(() => { endTm = null; refresh(); }, Math.max(0, st.endsAt - Date.now()) + 30) ?? null;
+      if (!open) return;
       const byStu = view.value() === "student";
       box.classList.toggle("is-matrix", byStu);
       result.el.hidden = byStu;
@@ -574,7 +589,7 @@ registerSlideType({
     const items = cfg.items || [];
     const map = placementsBy(responses);
     const wrap = (kids) => el("div", { class: "dd dd-sum", style: { height: "auto", overflow: "visible" } }, [
-      el("h3", { class: "dd-prompt" }, cfg.prompt || ""), ...kids,
+      el("h3", { class: "dd-prompt" }, cfg.prompt || ""), questionImage(cfg.image, { small: true }), ...kids,
     ]);
     // 학생 기록: 자기 분류 결과
     if (ctx?.role === "student") {

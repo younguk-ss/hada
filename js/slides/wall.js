@@ -15,6 +15,7 @@
 import * as ui from "../ui.js";
 import * as store from "../store.js";
 import { registerSlideType, injectCss, newId } from "./registry.js";
+import { questionImage, imageField } from "./common.js";
 
 const { el } = ui;
 
@@ -670,9 +671,10 @@ registerSlideType({
     return { type: "wall", config: { prompt: "", allowColor: true, showNames: true } };
   },
 
-  Editor({ slide, update, ctx }) {
+  Editor({ slide, lesson, update, ctx }) {
     ensureCss(ctx);
     const cfg = () => slide.config || {};
+    const img = imageField({ value: cfg().image, lessonId: lesson?.id, slideId: slide.id, onChange: (v) => update({ config: { ...cfg(), image: v } }) });
     const prompt = el("textarea", { class: "input", rows: 3, placeholder: "주제 (예: 오늘 배운 점을 남겨 주세요)" });
     prompt.value = cfg().prompt || "";
     prompt.addEventListener("input", () => update({ config: { ...cfg(), prompt: prompt.value } }));
@@ -684,6 +686,7 @@ registerSlideType({
     };
     const root = el("div", { class: "wl-editor" }, [
       el("label", { class: "field" }, [el("span", {}, "주제"), prompt]),
+      img,
       check("allowColor", "학생이 색 고르기"),
       check("showNames", "학생 화면에 이름 보이기"),
     ]);
@@ -706,6 +709,7 @@ registerSlideType({
     const fab = el("button", { type: "button", class: "btn btn-primary btn-lg wl-fab", onClick: () => act.compose() }, "+ 글쓰기");
     const root = el("div", { class: "wl wl-stu" }, [
       el("div", { class: "wl-head" }, [el("h2", { class: "wl-prompt" }, cfg.prompt || ""), status]),
+      questionImage(cfg.image),
       board.el, fab,
     ]);
 
@@ -758,6 +762,7 @@ registerSlideType({
         el("h2", { class: "wl-prompt" }, cfg.prompt || ""),
         el("div", { class: "wl-bar" }, [count, lockBtn, resetBtn]),
       ]),
+      questionImage(cfg.image),
       board.el, fab,
     ]);
     function renderBar() {
@@ -790,6 +795,7 @@ registerSlideType({
     board.refresh();
     return el("div", { class: "wl wl-sum", style: { height: "auto" } }, [
       el("h3", { class: "wl-prompt" }, cfg.prompt || ""),
+      questionImage(cfg.image, { small: true }),
       board.el,
     ]);
   },

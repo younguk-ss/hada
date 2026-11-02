@@ -13,7 +13,7 @@
 import { el } from "../ui.js";
 import { findStudent } from "../store.js";
 import { registerSlideType, newId, injectCss, fmtMs } from "./registry.js";
-import { questionEditor, optionLetter } from "./common.js";
+import { questionEditor, optionLetter, questionImage } from "./common.js";
 
 // ── 상수 ──
 const W = 800, H = 240, GY = 206;       // 논리 캔버스 · 땅(발바닥) 높이
@@ -283,7 +283,7 @@ function normQ(q) {
   while (opts.length < 4) opts.push({ id: newId("opt"), text: "" });
   const raw = Array.isArray(q?.answerIds) ? q.answerIds : (q?.answerId ? [q.answerId] : []);
   const answerIds = raw.filter(id => opts.some(o => o.id === id)).slice(0, 1);
-  return { id: q?.id || newId("q"), question: String(q?.question ?? ""), options: opts, answerIds };
+  return { id: q?.id || newId("q"), question: String(q?.question ?? ""), options: opts, answerIds, image: q?.image && q.image.url ? q.image : null };
 }
 function cfgOf(slide) {
   const c = slide?.config || {};
@@ -387,7 +387,7 @@ function statusPill(phase) {
 }
 
 // ── 편집기 ──
-function Editor({ slide, update, ctx }) {
+function Editor({ slide, lesson, update, ctx }) {
   css(ctx);
   const cfg = cfgOf(slide);
   const save = () => update({
@@ -424,12 +424,14 @@ function Editor({ slide, update, ctx }) {
     const qe = questionEditor({
       question: q.question, options: q.options, answerIds: q.answerIds,
       multiple: false, minOptions: 4, maxOptions: 4, placeholder: "질문을 입력하세요",
-      onChange: ({ question, options, answerIds }) => {
+      image: q.image, imageAt: { lessonId: lesson?.id, slideId: slide.id },
+      onChange: ({ question, options, answerIds, image }) => {
         const cur = cfg.questions.find(x => x.id === q.id);
         if (!cur) return;
         cur.question = question;
         cur.options = options.slice(0, 4);
         cur.answerIds = answerIds.slice(0, 1);
+        cur.image = image || null;
         save();
       },
     });
@@ -608,6 +610,7 @@ function Student({ slide, ctx }) {
     qLayer.replaceChildren(el("div", { class: "dn-qcard" }, [
       el("div", { class: "dn-qnum" }, `문제 ${answered + 1} / ${Q}`),
       el("h2", { class: "dn-qtext" }, q.question || " "),
+      questionImage(q.image),
       el("div", { class: "dn-choices" }, qButtons),
       fb,
     ]));

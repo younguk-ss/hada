@@ -6,9 +6,10 @@
 // 가정: 교사 스테이지 상단 '문항별 | 학생별'(answer-matrix.js). 문항별 = 빈칸별 정답률(행 클릭 → 답별 학생 명단),
 //       학생별 = 학생 × 빈칸 표(행 클릭 → 그 학생 답을 문장 속에 채워 보기). 같은 답 묶음은 normalizeAnswer 기준.
 // 가정: 기록 화면(summary)은 교사면 막대 + 표, 학생(자기 응답만 받음)이면 자기 답을 문장 속에 채워 보여 준다.
+// 가정(v2.9): 교사 화면은 마감·정답 공개·타이머 끝 전에는 응답 수만(빈칸별 막대·학생별 표·패널의 점수 가림). 문제 그림 config.image.
 import { el } from "../ui.js";
 import { registerSlideType, injectCss } from "./registry.js";
-import { activityBar, choiceBars, normalizeAnswer, whoSheet } from "./common.js";
+import { activityBar, choiceBars, normalizeAnswer, whoSheet, resultsOpen, resultsVeil, questionImage, imageField } from "./common.js";
 import {
   ensureQuizCss, statusRow, rosterList, rosterIds, byStudent, nameOf,
   isLocked, clockNow, elapsedMs, actOf, seg, field, quizThumb, sessionSig,
@@ -45,7 +46,7 @@ const CSS = `
 .bl-detail .bl-text { font-size: 18px; line-height: 2.2; }
 `;
 
-const defaults = () => ({ text: "", caseSensitive: false });
+const defaults = () => ({ text: "", caseSensitive: false, image: null });
 const cfgOf = (slide) => ({ ...defaults(), ...(slide.config || {}) });
 function css(ctx) { ensureQuizCss(ctx); (ctx?.injectCss || injectCss)("blank", CSS); }
 
@@ -88,10 +89,11 @@ function textNodes(value) {
 const vlen = (s) => [...String(s)].reduce((n, ch) => n + (/[ᄀ-ᇿ　-鿿가-힯＀-￯]/.test(ch) ? 2 : 1), 0);
 const widthOf = (b) => `${Math.max(4, Math.max(...b.answers.map(vlen)) + 1)}ch`;
 
-function Editor({ slide, update, ctx }) {
+function Editor({ slide, lesson, update, ctx }) {
   css(ctx);
   let cfg = cfgOf(slide);
   const set = (patch) => { cfg = { ...cfg, ...patch }; update({ config: cfg }); renderPreview(); };
+  const img = imageField({ value: cfg.image, lessonId: lesson?.id, slideId: slide.id, onChange: (v) => set({ image: v }) });
   const ta = el("textarea", { class: "input qz-q-input", rows: 5, placeholder: "대한민국의 수도는 [서울]입니다. 대안은 [서울|Seoul]" });
   ta.value = cfg.text;
   ta.addEventListener("input", () => set({ text: ta.value }));
@@ -105,7 +107,7 @@ function Editor({ slide, update, ctx }) {
   }
   renderPreview();
   const caseSeg = seg([{ value: false, label: "대소문자 무시" }, { value: true, label: "대소문자 구분" }], !!cfg.caseSensitive, (v) => set({ caseSensitive: v }));
-  return { el: el("div", { class: "qz-edit" }, [field("", ta), preview, field("영문 채점", caseSeg)]) };
+  return { el: el("div", { class: "qz-edit" }, [field("", ta), img, preview, field("영문 채점", caseSeg)]) };
 }
 
 function Student({ slide, ctx }) {
@@ -143,7 +145,7 @@ function Student({ slide, ctx }) {
   const submitB = el("button", { class: "btn btn-primary btn-lg btn-block qz-submit", type: "button", onClick: submit }, "제출");
   const resultP = el("div", { class: "qz-status" });
 
-  const root = el("div", { class: "qz-stu" }, [status.el, textEl, submitB, resultP]);
+  const root = el("div", { class: "qz-stu" }, [status.el, questionImage(cfg.image), textEl, submitB, resultP]);
 
   const saved = () => mine?.payload?.answers || [];
   const values = () => inputs.map(i => i.value);
@@ -339,9 +341,10 @@ function TeacherLive({ slide, ctx }) {
   });
   const view = viewSeg(slide.id, () => paint());
   const box = el("div", { class: "am-box" }, [stats.el, matrix]);
+  const veil = resultsVeil();
   const root = el("div", { class: "qz-live" }, [
     el("div", { class: "qz-live-head" }, [view, el("span", { style: { flex: "1" } }), status.el, countP]),
-    textEl, box,
+    questionImage(cfg.image), textEl, veil, box,
   ]);
 
   const bar = activityBar(ctx, { reveal: true, timer: true });
@@ -354,9 +357,14 @@ function TeacherLive({ slide, ctx }) {
     map = byStudent(list);
     ids = matrixIds(ctx, list);
     const reveal = !!st.reveal;
-    const byStu = view.value() === "student";
+    const open = resultsOpen(st, clockNow(ctx)); // 마감 전에는 결과를 가린다(v2.9)
+    const byStu = open && view.value() === "student";
     status.set({ state: st });
     countP.textContent = `응답 ${map.size}`;
+    veil.hidden = open;
+    veil.set(map.size, (ctx.participants() || []).length);
+    view.hidden = !open;
+    box.hidden = !open;
     blanks.forEach(b => {
       const s = slots[b.idx];
       s.textContent = reveal ? b.display : circled(b.idx);
@@ -366,11 +374,13 @@ function TeacherLive({ slide, ctx }) {
     box.classList.toggle("is-matrix", byStu);
     stats.el.hidden = byStu;
     matrix.hidden = !byStu;
-    if (byStu) matrix.update(); // 보이는 쪽만 갱신(전환 시 다시 그림)
+    if (!open) { /* 가림: 갱신 생략 */ }
+    else if (byStu) matrix.update(); // 보이는 쪽만 갱신(전환 시 다시 그림)
     else stats.set(blankStats(cfg, blanks, map), reveal);
     roster.set(rosterIds(ctx, list).map(id => {
       const r = map.get(id);
       if (!r) return { id, name: nameOf(ctx, id), value: "—", cls: "none" };
+      if (!open) return { id, name: nameOf(ctx, id), value: "제출", cls: "" };
       const g = gradeBlanks(cfg, r.payload?.answers || []);
       return { id, name: nameOf(ctx, id), value: `${g.ok}/${g.n}`, cls: g.correct ? "ok" : "bad" };
     }));
@@ -425,6 +435,7 @@ function summary(slide, responses = [], session, ctx) {
     matrix.update();
   }
   return el("div", { class: "qz-sum" }, [
+    questionImage(cfg.image, { small: true }),
     shownText(),
     el("div", { class: "qz-sum-meta" }, [
       el("span", { class: "pill pill-muted" }, `응답 ${map.size}`),

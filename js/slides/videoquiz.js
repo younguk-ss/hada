@@ -13,11 +13,13 @@
 // 가정: panel [초기화] = 응답 삭제 + vq/vqAsked/vqRevealed/vqAuto 비움 + 교사 영상 처음으로
 //       (activityBar 에 감싼 ctx 를 넘겨 clearResponses 성공 뒤 setActivity 패치에 덧붙인다).
 // 가정: flow 를 바꿔도 activity.vq 는 그대로 둔다(교사 진행으로 돌아오면 열린 문제가 다시 보임). 교사 플레이어는 유지.
+// 가정(v2.9): 정답이 있는 객관식 결과(막대·인원)는 교사가 [정답 공개]를 누르거나 다음으로 넘어간 뒤(교사 진행), 자율이면 [마감] 뒤에만 보인다.
+//       전원 응답 자동 공개는 쓰지 않는다. 문제마다 그림 q.image.
 import { el, icon } from "../ui.js";
 import * as storeMod from "../store.js";
 import { registerSlideType, newId, injectCss } from "./registry.js";
-import { activityBar, columnChart, whoSheet, optionColor, questionEditor, optionLetter } from "./common.js";
-import { everyoneAnswered, letterKeys } from "./mcq.js";
+import { activityBar, columnChart, whoSheet, optionColor, questionEditor, optionLetter, questionImage, imageField } from "./common.js";
+import { letterKeys } from "./mcq.js";
 import { createPlayer, createPreview, videoSource, videoThumb, ensureMediaCss, fmtSec, parseSec, VIDEO_UNSUPPORTED } from "./video.js";
 
 const ICON = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2.5"/><path d="M10 7.6v4.8l4-2.4z"/><path d="M7 20h10"/><circle cx="12" cy="20" r="1.2"/></svg>`;
@@ -281,6 +283,7 @@ function resultsView(ctx, cfg, { compact = false, who = false } = {}) {
         b.count,
       ]),
       el("div", { class: "vq-r-q" }, q.question || `문제 ${i + 1}`),
+      questionImage(q.image, { small: true }),
       b.chart || b.cards.el,
     ]);
     root.appendChild(b.sec);
@@ -302,7 +305,7 @@ function resultsView(ctx, cfg, { compact = false, who = false } = {}) {
         b.rev = b.graded && !!revealed(b.q.id);
         const ok = rs.filter(r => r.correct === true).length;
         b.count.textContent = b.rev ? `${rs.length}명 · 정답 ${ok}` : `${rs.length}명`;
-        b.chart.update({ counts: countsFor(b.q, rs), correctIds: b.graded ? b.q.answerIds : [], revealed: b.rev });
+        b.chart.update({ counts: countsFor(b.q, rs), correctIds: b.graded ? b.q.answerIds : [], revealed: b.rev, veiled: b.graded && !b.rev });
       } else {
         b.count.textContent = `${rs.length}명`;
         b.cards.set(rs);
@@ -314,7 +317,7 @@ function resultsView(ctx, cfg, { compact = false, who = false } = {}) {
 }
 
 // ── 편집기 ──
-function Editor({ slide, update, ctx }) {
+function Editor({ slide, lesson, update, ctx }) {
   ensureCss(ctx);
   const init = cfgOf(slide);
   let url = init.url;
@@ -391,14 +394,15 @@ function Editor({ slide, update, ctx }) {
       if (q.kind === "mcq") {
         body.replaceChildren(questionEditor({
           question: q.question, options: q.options, answerIds: q.answerIds, multiple: false,
-          maxOptions: 6, minOptions: 2, placeholder: "질문",
-          onChange: (v) => { q.question = v.question; q.options = v.options; q.answerIds = v.answerIds; save(); },
+          maxOptions: 6, minOptions: 2, placeholder: "질문", image: q.image, imageAt: { lessonId: lesson?.id, slideId: slide.id },
+          onChange: (v) => { q.question = v.question; q.options = v.options; q.answerIds = v.answerIds; q.image = v.image || null; save(); },
         }));
       } else {
         const ta = el("textarea", { class: "input", rows: "2", placeholder: q.kind === "short" ? "질문 (단답)" : "질문 (서술)" });
         ta.value = q.question;
         ta.addEventListener("input", () => { q.question = ta.value; save(); });
-        body.replaceChildren(el("div", { class: "field" }, [ta]));
+        const img = imageField({ value: q.image, lessonId: lesson?.id, slideId: slide.id, onChange: (v) => { q.image = v; save(); } });
+        body.replaceChildren(el("div", { class: "field" }, [ta]), img);
       }
     }
     renderBody();
@@ -502,6 +506,7 @@ function selfStudent(cfg, ctx) {
     const parts = [
       el("div", { class: "vq-pop-head" }, [el("span", { class: "pill" }, `${idx + 1} / ${qs.length}`)]),
       el("h2", { class: "vq-q" }, q.question || "문제"),
+      questionImage(q.image),
     ];
     let btns = [];
     if (q.kind === "mcq") {
@@ -683,6 +688,7 @@ function askView(ctx, q, qs) {
   const parts = [
     el("div", { class: "vq-ask-head" }, [el("span", { class: "pill" }, `${qs.indexOf(q) + 1} / ${qs.length}`), resP, subP, endP]),
     el("h2", { class: "vq-q" }, q.question || "문제"),
+    questionImage(q.image),
   ];
   let btns = [], input = null, cnt = null;
   if (isMcq) {
@@ -805,8 +811,7 @@ function TeacherLive({ slide, ctx }) {
   let mode = null;            // 'teacher'(교사 진행) | 'student'(자율)
   let v = vqState(ctx.activity());
   let card = null;            // 열린 문제 결과 카드
-  let stopPoll = null, lastAsk = null, ticks = 0; // lastAsk = { qid, at } 기록 반영 전 같은 문제 중복 방지
-  const autoBusy = new Set(); // 자동 공개 예약한 문제
+  let stopPoll = null, lastAsk = null; // lastAsk = { qid, at } 기록 반영 전 같은 문제 중복 방지
 
   const rsFor = (qid) => latestBy((ctx.responses() || []).filter(r => (r.itemKey || "") === qid));
   const openQ = (s) => (s.qid ? qs.find(x => x.id === s.qid) || null : null);
@@ -818,7 +823,6 @@ function TeacherLive({ slide, ctx }) {
     setActivity: { value: (patch) => {
       if (resetting) {
         resetting = false;
-        autoBusy.clear();
         lastAsk = null;
         patch = { ...patch, vq: { state: "playing" }, vqAsked: [], vqRevealed: [], vqAuto: [] };
         player?.pause();
@@ -834,7 +838,6 @@ function TeacherLive({ slide, ctx }) {
   // 재생 위치 폴링(교사 진행): 안 물은 문제 시점에 닿으면 멈추고 문제 열기
   function tick() {
     if (mode !== "teacher" || !player) return;
-    if (++ticks % 8 === 0) checkAuto(); // 접속 변화는 훅이 없어 2초마다
     const a = ctx.activity();
     const s = vqState(a);
     if (openQ(s) || a.phase === "ended" || !qs.length) return;
@@ -865,14 +868,16 @@ function TeacherLive({ slide, ctx }) {
         countP,
       ]),
       el("h2", { class: "vq-tq-q" }, q.question || "문제"),
+      questionImage(q.image),
       chart || cards.el,
       el("div", { class: "vq-tq-actions" }, [revealB, goB]),
     ]);
     function update() {
       const rs = rsFor(q.id);
       countP.textContent = `응답 ${rs.length}/${(ctx.participants() || []).length}`;
-      const rev = graded && isRevealed(v, q.id);
-      if (chart) chart.update({ counts: countsFor(q, rs), correctIds: graded ? q.answerIds : [], revealed: rev });
+      const rev = graded && (isRevealed(v, q.id) || ctx.activity().phase === "ended");
+      // 정답이 있는 문제는 [정답 공개] 전에는 막대·인원을 가린다(v2.9)
+      if (chart) chart.update({ counts: countsFor(q, rs), correctIds: graded ? q.answerIds : [], revealed: rev, veiled: graded && !rev });
       else cards.set(rs);
       if (revealB) {
         revealB.classList.toggle("active", rev);
@@ -893,23 +898,6 @@ function TeacherLive({ slide, ctx }) {
     if (!player) return;
     if (player.getTime() + 1 < q.atSec) player.seek(q.atSec); // 재마운트로 처음에 있으면 그 시점부터
     player.play();
-  }
-
-  // 전원 응답(객관식) → 자동 정답 공개 1회 (교사 클라이언트)
-  function checkAuto() {
-    if (mode !== "teacher") return;
-    const s = vqState(ctx.activity());
-    const q = openQ(s);
-    if (!q || q.kind !== "mcq" || !(q.answerIds || []).length) return;
-    if (s.revealed.includes(q.id) || s.auto.includes(q.id) || autoBusy.has(q.id)) return;
-    if (!everyoneAnswered(ctx, rsFor(q.id).map(r => r.studentId))) return;
-    autoBusy.add(q.id);
-    // 다음 틱에: 훅 안에서 setActivity 재진입 방지
-    later(ctx, () => {
-      const now = vqState(ctx.activity());
-      if (now.qid !== q.id || now.revealed.includes(q.id) || now.auto.includes(q.id)) return;
-      ctx.setActivity({ vqRevealed: [...now.revealed, q.id], vqAuto: [...now.auto, q.id] });
-    }, 0);
   }
 
   // 열린 문제 카드(교사 진행에서만)
@@ -935,7 +923,9 @@ function TeacherLive({ slide, ctx }) {
     bar.update?.();
     const s = vqState(ctx.activity());
     const paced = mode === "teacher";
-    results.update(ctx.responses(), { currentId: paced ? s.qid : null, revealed: (id) => !paced || isRevealed(s, id) });
+    // 결과는 마감 뒤(자율) 또는 그 문제를 공개·지나간 뒤(교사 진행)에만(v2.9)
+    const ended = ctx.activity().phase === "ended";
+    results.update(ctx.responses(), { currentId: paced ? s.qid : null, revealed: (id) => ended || (paced && isRevealed(s, id)) });
   }
 
   function setMode(m) {
@@ -950,19 +940,18 @@ function TeacherLive({ slide, ctx }) {
   const partSig = () => (ctx.participants() || []).join(",");
   let sSig = partSig();
   setMode(flowOf(ctx));
-  checkAuto();
 
   return {
     el: root,
     panel,
-    onActivity() { syncStage(); paintPanel(); checkAuto(); },
-    onResponses() { card?.update(); paintPanel(); checkAuto(); },
+    onActivity() { syncStage(); paintPanel(); },
+    onResponses() { card?.update(); paintPanel(); },
     onSession() {
       setMode(flowOf(ctx));
       const k = partSig();
       if (k === sSig) return;
       sSig = k;
-      card?.update(); paintPanel(); checkAuto();
+      card?.update(); paintPanel();
     },
     destroy() {
       stopPoll?.(); stopPoll = null;

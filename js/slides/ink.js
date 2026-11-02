@@ -15,6 +15,8 @@
 //       학생 화면은 스테이지 전체가 보기 영역이고, 도구바가 덮는 만큼만 맞춤에서 비운다(이동하면 도구바 뒤로도 보임).
 //       가로로 남는 화면이면 도구바를 왼쪽 세로 2열로 옮겨 슬라이드를 키운다(어느 쪽이 더 크게 보이는지 계산해 선택).
 // 가정: 갤러리 온라인 점은 realtime.currentChannel().onPresence로 갱신(없으면 onSession 때만).
+// 팝업 상호작용(v2.9, js/popup.js): 편집기에서 슬라이드 위에 핀(상호작용)을 넣고 끌어 옮긴다. 수업 중 교사가 핀(개별·모둠이면 머리 줄 버튼)을
+//       누르면 ctx.openPopup → 교사·학생 화면에 팝업. 학생 화면에는 자유 이동(flow 'student')·복습일 때만 핀이 보인다.
 // 펜 기기(v2.6.1, js/pen-input.js): 펜을 처음 쓰면 그 기기에서는 손가락 필기를 끈다(손바닥 오인 방지). 도구바 끝 ✋ 버튼(펜 기기에서만 보임)으로
 //       손가락 필기를 다시 켜고 끈다. 도구바는 두 번 탭 확대를 막고(touch-action: manipulation), 글자 선택이 생기지 않는다.
 import * as ui from "../ui.js";
@@ -27,6 +29,7 @@ import { registerSlideType, effectiveMode, groupStudents, newId, injectCss } fro
 import { renderSlide } from "../lesson-view.js";
 import { paintStrokes } from "../canvas.js";
 import { pageRectFor } from "../zoom-view.js";
+import { hotspotLayer, hotspotInspector, hotspotChips, openHotspotEditor, hotspotsOf } from "../popup.js";
 
 const { el } = ui;
 
@@ -511,7 +514,33 @@ function Editor({ slide, lesson, update, ctx }) {
       if (ok) viewer.clearAll();
     },
   }, "전체 지우기");
-  const bar = makeToolbar(() => viewer, { extras: [clearBtn] });
+  // 팝업 상호작용: 핀 넣기 · 끌어 옮기기 · 눌러 고치기
+  const saveHotspots = (list) => { update({ config: { ...(slide.config || {}), hotspots: list } }); hs.refresh(); hsInsp.refresh(); };
+  const addHotspot = () => {
+    const n = hotspotsOf(slide).length;
+    openHotspotEditor({ lesson, at: { x: 0.5 + ((n % 5) - 2) * 0.06, y: 0.5 }, onSave: (h) => saveHotspots([...hotspotsOf(slide), h]) });
+  };
+  const editHotspot = (h) => openHotspotEditor({
+    lesson, hotspot: h,
+    onSave: (n) => saveHotspots(hotspotsOf(slide).map(o => (o.id === n.id ? n : o))),
+    onDelete: () => saveHotspots(hotspotsOf(slide).filter(o => o.id !== h.id)),
+  });
+  const hs = hotspotLayer(viewer.frame, {
+    getSlide: () => slide, mode: "edit",
+    onMove: (h, x, y) => saveHotspots(hotspotsOf(slide).map(o => (o.id === h.id ? { ...o, x, y } : o))),
+    onEdit: editHotspot,
+  });
+  const hsInsp = hotspotInspector({
+    getSlide: () => slide, onAdd: addHotspot, onEdit: editHotspot,
+    onDelete: async (h) => {
+      const ok = await ctx.confirm("이 팝업 상호작용을 뺄까요?", { ok: "빼기", danger: true });
+      if (ok) saveHotspots(hotspotsOf(slide).filter(o => o.id !== h.id));
+    },
+  });
+  const popBtn = el("button", { type: "button", class: "btn btn-sm btn-ghost", title: "슬라이드 위에 팝업 상호작용(핀) 넣기", onClick: addHotspot },
+    [ui.icon ? ui.icon("plus", 16) : null, "팝업"]);
+
+  const bar = makeToolbar(() => viewer, { extras: [popBtn, clearBtn] });
   const zp = zoomPill(() => viewer);
   wrap.append(bar, stage, zp);
   bar.apply();
@@ -526,6 +555,7 @@ function Editor({ slide, lesson, update, ctx }) {
   const inspector = el("div", { class: "ink-inspector" }, [
     el("div", { class: "field" }, [el("label", {}, "배경 이미지"), bgBox, el("div", { class: "ink-insp-row" }, [btnReplace, btnRemove]), fileIn]),
     el("div", { class: "field" }, [el("label", {}, "기본 모드"), modeSeg]),
+    hsInsp,
   ]);
   let busy = false;
   function syncInspector() {
@@ -565,6 +595,7 @@ function Editor({ slide, lesson, update, ctx }) {
       if (!res || !res.url) throw new Error("업로드 실패");
       update({ bg: res.url, bgPath: res.path || null, thumb: res.thumb || res.url }); // 옛 이미지는 보존(스냅샷 참조)
       viewer.refresh();
+      hs.refresh();
     } catch (e) {
       console.warn("[ink] 배경 업로드 실패", e);
       ctx.toast("이미지를 올리지 못했어요");
@@ -583,7 +614,7 @@ function Editor({ slide, lesson, update, ctx }) {
   return {
     el: wrap,
     inspector,
-    destroy() { viewer.destroy(); },
+    destroy() { hs.destroy(); viewer.destroy(); },
   };
 }
 
@@ -591,7 +622,9 @@ function Editor({ slide, lesson, update, ctx }) {
 function Student({ slide, session, me, ctx }) {
   ctx.injectCss("ink", CSS);
   const wrap = el("div", { class: "ink-wrap ink-stu" });
-  let viewer = null, bar = null, key = null, stage = null, offPage = null;
+  let viewer = null, bar = null, key = null, stage = null, offPage = null, hs = null;
+  // 팝업 핀: 자유 이동·복습(flow 'student')일 때만 학생이 눌러 연다
+  const pinMode = () => (ctx.openPopup && (ctx.session() || session)?.flow === "student" ? "open" : "hidden");
 
   function scopeFor() {
     const ss = ctx.session() || session;
@@ -607,6 +640,7 @@ function Student({ slide, session, me, ctx }) {
   function teardown() {
     try { offPage && offPage(); } catch (_) {}
     offPage = null;
+    hs?.destroy(); hs = null;
     viewer?.destroy(); viewer = null;
     bar?.remove(); bar = null;
     stage = null;
@@ -654,12 +688,14 @@ function Student({ slide, session, me, ctx }) {
     bar.bindZoom(viewer);
     offPage = viewer.zoom?.onChange((kind) => { if (kind === "page") placeBar(); }) || null;
     placeBar();
+    if (hotspotsOf(slide).length) hs = hotspotLayer(viewer.frame, { getSlide: () => slide, mode: pinMode(), onOpen: (h) => ctx.openPopup?.(h.id) });
   }
   function check() {
     const s = scopeFor();
     const k = `${s.scope}|${s.scopeId}|${!!s.readOnly}`;
     if (k !== key) { key = k; mount(s); }
     else viewer?.refresh();
+    hs?.setMode(pinMode());
   }
   check();
 
@@ -682,11 +718,16 @@ function TeacherLive({ slide, session, ctx }) {
   let zoom = null;                             // 확대 모달 { viewer, fit, modal, kind, id }
   let presCh = null, presOff = null;
   let gbModal = null;
+  let hs = null, hsChips = null;               // 팝업 핀(전체·발표) / 머리 줄 버튼(개별·모둠)
+  const openPop = (h) => ctx.openPopup?.(h.id);
+  const activePop = () => (ctx.popupId ? ctx.popupId() : null);
 
   const curMode = () => effectiveMode(slide, ctx.session() || session);
 
   function teardownBody() {
     fit?.destroy(); fit = null;
+    hs?.destroy(); hs = null;
+    hsChips = null;
     viewer?.destroy(); viewer = null;
     bar = null;
     gal?.destroy(); gal = null;
@@ -712,6 +753,7 @@ function TeacherLive({ slide, session, ctx }) {
       wrap.replaceChildren(bar, stage, zp);
       bar.apply();
       zp.bindZoom(viewer);
+      if (hotspotsOf(slide).length) hs = hotspotLayer(viewer.frame, { getSlide: () => slide, mode: ctx.openPopup ? "open" : "hidden", onOpen: openPop, activeId: activePop });
     } else {
       gal = makeGallery(bodyKey);
       wrap.replaceChildren(gal.el);
@@ -729,7 +771,8 @@ function TeacherLive({ slide, session, ctx }) {
       lastKey = ""; update();
     }, "seg-sm");
     const countNote = el("span", { class: "ink-note" });
-    const head = el("div", { class: "ink-gal-head" }, [countNote, viewSeg]);
+    hsChips = hotspotsOf(slide).length && ctx.openPopup ? hotspotChips({ getSlide: () => slide, onOpen: openPop, activeId: activePop }) : null;
+    const head = el("div", { class: "ink-gal-head" }, [hsChips, countNote, viewSeg]);
     const emptyBox = el("div", { class: "ink-stage" });
     let emptyViewer = null, emptyFit = null;
     const tiles = new Map(); // id → { node, mini, dot, name, cnt }
@@ -996,6 +1039,8 @@ function TeacherLive({ slide, session, ctx }) {
     else if (viewer) viewer.refresh();
     else gal?.update();
     zoom?.viewer?.refresh();
+    hs?.refresh();
+    hsChips?.set();
     attachPresence();
   }
 

@@ -6,16 +6,13 @@
 // 가정: 잠기는 순간 제출하지 않은 변경은 버리고 제출본을 보여 준다(정답 공개 ✓/✗ 가 실제 제출과 일치하도록).
 // 가정: endsAt·startedAt 은 교사 시계 기준. 코어가 ctx.now()(학생 기기의 교사 시계 추정)를 주면 그것으로 비교하고,
 //       없으면 Date.now()(보정 없음). common.countdownPill/phasePill 은 Date.now() 를 쓰므로 toLocalTime 으로 바꿔 넘긴다.
-// 가정: 정답 표시 = reveal || phase 'ended' || 전원 응답. 전원 응답 = 대상(접속 중 ∩ 참여자, 접속 정보 없으면 참여자)
-//       모두가 제출(개수 비교 대신 '대상 전원 포함'으로 판정 — 접속 끊긴 응답자가 끼어도 정확하게).
-// 가정: 전원 응답 시 교사 클라이언트가 1회 setActivity({ phase:'ended', reveal:true, autoRevealed:true }).
-//       autoRevealed 는 '다시 받기' 뒤에도 남으므로(얕은 병합) 학생은 그 뒤 로컬 전원 응답 판정을 쓰지 않고,
-//       교사는 '다시 받기'·재마운트 때 이미 전원 응답이면 다시 쏘지 않는다(응답이 비거나 대상이 늘면 다시 장전).
+// 가정(v2.9): 정답 표시 = reveal || phase 'ended'(마감·타이머 끝). 전원 응답 자동 공개는 쓰지 않는다 — 결과는 늘 교사가 연다.
+//       교사 화면도 마감 전에는 응답 수만(막대·인원·학생별 답 가림, common.resultsVeil).
 // 가정: 교사 스테이지 막대 타일의 모서리 번호(.cc-key)는 학생 화면과 맞추려고 A/B/C 로 바꿔 쓴다(letterKeys).
 import { el } from "../ui.js";
 import { findStudent } from "../store.js";
 import { registerSlideType, newId, injectCss } from "./registry.js";
-import { activityBar, columnChart, whoSheet, optionColor, phasePill, questionEditor, optionLetter } from "./common.js";
+import { activityBar, columnChart, whoSheet, optionColor, phasePill, questionEditor, optionLetter, resultsOpen, resultsVeil, questionImage } from "./common.js";
 
 // ── 공용 헬퍼 (short.js, blank.js 도 사용) ──
 
@@ -169,23 +166,6 @@ export function ensureQuizCss(ctx) {
   (ctx?.injectCss || injectCss)("quiz", QUIZ_CSS);
 }
 
-// 전원 응답 판정 대상: 접속 중 ∩ 참여자 (접속 정보가 비면 참여자 전체). 학생 측 online() 은 빈 Set → 참여자
-export function answerTargetIds(ctx) {
-  const parts = ctx?.participants?.() || [];
-  let online = null;
-  try { online = ctx?.online?.() || null; } catch { online = null; }
-  if (online && online.size) return parts.filter(id => online.has(id));
-  return parts.slice();
-}
-
-// 대상 전원이 응답했나 (대상 ≥ 1명). answeredIds: 응답한 학생 id 들(iterable)
-export function everyoneAnswered(ctx, answeredIds) {
-  const target = answerTargetIds(ctx);
-  if (!target.length) return false;
-  const set = answeredIds instanceof Set ? answeredIds : new Set(answeredIds || []);
-  return target.every(id => set.has(id));
-}
-
 // columnChart 타일 모서리 번호 → A/B/C (학생 화면 글자와 맞춤). common 이 글자를 쓰게 되면 그대로 무해
 export function letterKeys(chart) {
   chart?.querySelectorAll?.(".cc-key").forEach((k, i) => { k.textContent = optionLetter(i); });
@@ -227,6 +207,8 @@ const QUIZ_CSS = `
 .qz-sum { display: grid; gap: 12px; }
 .qz-sum .qz-q { font-size: 17px; }
 .qz-sum-meta { display: flex; gap: 6px; flex-wrap: wrap; }
+.qz-live .rv-veil { flex: 1 1 auto; }
+.qz-live .qi { max-height: min(34cqh, 360px); }
 `;
 
 // ── mcq ──
@@ -253,6 +235,7 @@ const defaults = () => ({
   answerIds: [],
   multiple: false,
   timerSec: null,
+  image: null,
 });
 
 function cfgOf(slide) {
@@ -317,13 +300,8 @@ function later(ctx, fn, ms) {
   const id = setTimeout(fn, ms);
   return () => clearTimeout(id);
 }
-function every(ctx, fn, ms) {
-  if (typeof ctx?.interval === "function") { const id = ctx.interval(fn, ms); return () => ctx.clearTimer?.(id); }
-  const id = setInterval(fn, ms);
-  return () => clearInterval(id);
-}
 
-function Editor({ slide, update, ctx }) {
+function Editor({ slide, lesson, update, ctx }) {
   ensureQuizCss(ctx);
   let cfg = cfgOf(slide);
   const set = (patch) => { cfg = { ...cfg, ...patch }; update({ config: cfg }); };
@@ -333,8 +311,8 @@ function Editor({ slide, update, ctx }) {
   function renderQ() {
     box.replaceChildren(questionEditor({
       question: cfg.question, options: cfg.options, answerIds: cfg.answerIds, multiple: !!cfg.multiple,
-      placeholder: "질문을 입력하세요",
-      onChange: ({ question, options, answerIds }) => set({ question, options, answerIds }),
+      placeholder: "질문을 입력하세요", image: cfg.image, imageAt: { lessonId: lesson?.id, slideId: slide.id },
+      onChange: ({ question, options, answerIds, image }) => set({ question, options, answerIds, image: image || null }),
     }));
   }
   renderQ();
@@ -378,15 +356,14 @@ function Student({ slide, ctx }) {
   const root = el("div", { class: "qz-stu mcq-stu" }, [
     status.el,
     el("h2", { class: "qz-q" }, cfg.question || slide.title || ""),
+    questionImage(cfg.image),
     el("div", { class: "qz-choices" }, btns.map(x => x.b)),
     submitB,
   ]);
 
-  // 정답 표시: 공개 · 마감 · 전원 응답(자동 공개 뒤 '다시 받기'면 전원 응답은 무시)
+  // 정답 표시: 정답 공개 · 마감(타이머 끝 포함) — 교사가 결과를 열 때만(v2.9)
   function revealed() {
-    if (st.reveal === true || st.phase === "ended") return true;
-    if (st.autoRevealed) return false;
-    return everyoneAnswered(ctx, byStudent(ctx.responses?.() || []).keys());
+    return st.reveal === true || st.phase === "ended";
   }
   const locked = (rev = revealed()) => rev || isLocked(st, clockNow(ctx));
 
@@ -469,11 +446,14 @@ function TeacherLive({ slide, ctx }) {
   const status = statusRow({ ctx });
   const countP = el("span", { class: "pill" });
   const chart = chartFor(cfg, () => openWho(ctx, cfg, ctx.responses() || [], rev));
+  const veil = resultsVeil();
   const root = el("div", { class: "qz-live mcq-live" }, [
     el("div", { class: "mcq-head" }, [
       el("h2", { class: "qz-q" }, cfg.question || slide.title || ""),
       el("div", { class: "mcq-meta" }, [status.el, countP]),
     ]),
+    questionImage(cfg.image),
+    veil,
     chart,
   ]);
 
@@ -481,59 +461,38 @@ function TeacherLive({ slide, ctx }) {
   const roster = rosterList();
   const panel = el("div", { class: "qz-panel" }, [bar, roster.el]);
 
-  const everyone = (map = byStudent(ctx.responses() || [])) => everyoneAnswered(ctx, map.keys());
-
-  // 전원 응답 → 자동 마감·정답 공개 (교사 클라이언트 1회). armed=false 면 응답이 비거나 대상이 늘 때까지 쉬기
-  let armed = true, firing = false, lastAll = everyone();
-  if (lastAll && (st.phase === "ended" || st.autoRevealed)) armed = false;
-  function checkAuto(all) {
-    lastAll = all;
-    if (!all) { armed = true; return; }
-    if (!armed || firing || st.phase === "ended") return;
-    armed = false; firing = true;
-    // 다음 틱에: 훅 안에서 setActivity 재진입 방지
-    later(ctx, () => {
-      firing = false;
-      if (!everyone()) { armed = true; return; }
-      if (ctx.activity().phase === "ended") return;
-      ctx.setActivity({ phase: "ended", reveal: true, endsAt: null, autoRevealed: true });
-    }, 0);
-  }
-
-  let sSig = sessionSig(ctx);
+  let sSig = sessionSig(ctx), endTm = null;
   function paint() {
     const list = ctx.responses() || [];
     const map = byStudent(list);
-    const all = everyone(map);
-    rev = st.reveal === true || st.phase === "ended" || (all && (armed || firing));
+    const total = (ctx.participants() || []).length;
+    const open = resultsOpen(st, clockNow(ctx)); // 마감 전에는 결과를 가린다(칠판 화면 미리 보기 방지)
+    rev = open;
+    veil.hidden = open;
+    veil.set(map.size, total);
     status.set({ state: st });
     countP.textContent = `응답 ${map.size}/${(ctx.participants() || []).length}`;
-    chart.update({ counts: countsOf(cfg, map), correctIds: graded ? cfg.answerIds : [], revealed: graded && rev });
-    roster.set(rosterIds(ctx, list).map(id => rosterRow(ctx, cfg, id, map.get(id))));
+    chart.update({ counts: countsOf(cfg, map), correctIds: graded ? cfg.answerIds : [], revealed: graded && rev, veiled: !open });
+    roster.set(rosterIds(ctx, list).map(id => (open ? rosterRow(ctx, cfg, id, map.get(id))
+      : { id, name: nameOf(ctx, id), value: map.has(id) ? "제출" : "—", cls: map.has(id) ? "" : "none" })));
     bar.update();
-    checkAuto(all);
+    // 타이머가 끝나는 순간 결과가 열리게(마감 전환을 기다리지 않음)
+    if (endTm) { endTm(); endTm = null; }
+    if (!open && st.phase === "running" && st.endsAt) endTm = later(ctx, paint, Math.max(0, st.endsAt - clockNow(ctx)) + 30);
   }
   paint();
-  // 접속(presence) 변화는 훅이 없어 2초마다 전원 응답만 다시 본다
-  const stopPoll = every(ctx, () => { const all = everyone(); if (all !== lastAll) paint(); }, 2000);
 
   return {
     el: root,
     panel,
-    onActivity(s) {
-      const prev = st;
-      st = actOf(ctx, s);
-      // '다시 받기'(ended → 다른 단계): 이미 전원 응답이면 다시 쏘지 않는다
-      if (prev.phase === "ended" && st.phase !== "ended") armed = !everyone();
-      paint();
-    },
+    onActivity(s) { st = actOf(ctx, s); paint(); },
     onResponses() { paint(); },
     onSession() {
       const k = sessionSig(ctx);
       if (k === sSig) return;
       sSig = k; paint();
     },
-    destroy() { stopPoll(); status.destroy(); bar.destroy?.(); },
+    destroy() { if (endTm) endTm(); status.destroy(); bar.destroy?.(); },
   };
 }
 
@@ -552,6 +511,7 @@ function summary(slide, responses = [], session, ctx) {
   roster.set(sortIds(ctx, [...map.keys()]).map(id => rosterRow(ctx, cfg, id, map.get(id))));
   return el("div", { class: "qz-sum mcq-sum" }, [
     el("div", { class: "qz-q" }, cfg.question || slide.title || ""),
+    questionImage(cfg.image, { small: true }),
     el("div", { class: "qz-sum-meta" }, [
       el("span", { class: "pill pill-muted" }, `응답 ${map.size}`),
       scored.length ? el("span", { class: "pill pill-ok" }, `정답률 ${Math.round((okN / scored.length) * 100)}%`) : null,

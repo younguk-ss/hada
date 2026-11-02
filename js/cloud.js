@@ -723,10 +723,31 @@ export async function cloudDuplicateLesson(lessonId) {
       if (img) { s.bg = img.url; s.bgPath = img.path; s.thumb = img.thumb; }
       else s.bgPath = null; // 복사 실패 시 URL만 공유(원본 삭제 시 함께 사라질 수 있음)
     })));
+    // 문제 그림(config 속 image — 문제별·팝업 상호작용 속까지, v2.9)도 새 자료 폴더로
+    await Promise.all(copy.map(s => upLimit(() => copyConfigImages(s.config, nid, s.id))));
   }
   const lesson = { id: nid, teacherId: src.teacherId, title: `${src.title} (복사본)`, createdAt: Date.now(), updatedAt: Date.now(), slides: copy, worksheet: wsCopy };
   const r = await cloudCreateLesson(lesson);
   return r;
+}
+
+// config 안의 모든 image({ url, path, thumb })를 lessonId 폴더로 복사해 제자리에서 바꾼다. 실패하면 path만 비움(URL 공유)
+async function copyConfigImages(config, lessonId, slideId) {
+  const refs = [];
+  const walk = (o) => {
+    if (!o || typeof o !== "object") return;
+    if (Array.isArray(o)) { o.forEach(walk); return; }
+    for (const [k, v] of Object.entries(o)) {
+      if (k === "image" && v && typeof v === "object" && v.path) refs.push(v);
+      else walk(v);
+    }
+  };
+  walk(config);
+  for (const img of refs) {
+    let c = null;
+    try { c = await copySlideImage(img.path, lessonId, slideId); } catch (_) { c = null; }
+    if (c) { img.url = c.url; img.path = c.path; img.thumb = c.thumb; } else img.path = null;
+  }
 }
 
 // ── 세션 ──

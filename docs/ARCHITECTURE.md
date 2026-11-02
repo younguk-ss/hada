@@ -348,6 +348,8 @@ ctx = {
 - **응답형(mcq, short, blank, wordcloud, dragdrop, wall)**: 학생은 슬라이드에 도달하면 **바로 응답 가능**(`phase:'idle'` = 받는 중). `'ended'` = 마감(입력 잠금, pill '마감'). `'running'` = 타이머 진행 중. 마감 전까지 재제출(upsert) 가능. `reveal:true`면 학생에게 정답/결과 공개.
 - **교사 공통 바** `activityBar(ctx, { reveal: bool, timer: bool })`(common.js): `응답 12/25` · `[마감]`↔`[다시 받기]` · `[정답 공개]` 토글(reveal 옵션 시) · `[타이머]`(timer 옵션 시, 프리셋 30/60/90/120초 sheet) · `[초기화]`(confirm → clearResponses, phase idle, reveal false). 반환 el은 `.update()` 메서드를 가진다(onActivity/onResponses에서 호출).
 - **타이머**: `setActivity({ phase:'running', startedAt, endsAt })`. 학생·교사 모두 `countdownPill(endsAt)`(10초 이하 빨강). `endsAt` 도달 시 **교사 클라이언트**가 `setActivity({ phase:'ended' })`, 학생은 로컬로도 잠금.
+- **결과 가리기(v2.9)**: 정답이 있는 활동(mcq·blank·dragdrop·short·videoquiz)의 교사 화면(칠판에 띄움)은 마감·정답 공개·타이머 끝(`common.resultsOpen`) 전에는 결과(막대·인원·학생별 답·도구 패널의 답)를 가리고 `resultsVeil`(큰 응답 수 `n / m명 응답` + 진행 막대 + '마감하면 결과가 보여요')만 보인다. mcq는 선지 타일은 그대로(`columnChart.update({ veiled })`). '전원 응답 → 자동 공개'는 없앴다(결과는 늘 교사가 연다). 학생 mcq 정답 표시도 공개·마감 뒤에만. videoquiz는 문제마다 [정답 공개]·지나감(교사 진행) 또는 [마감](자율) 뒤.
+- **문제 그림(v2.9)**: `config.image`(문제가 여럿이면 `q.image`) = `{ url, path, thumb }`. 편집기 `common.imageField`(`questionEditor({ image, imageAt:{ lessonId, slideId } })`에도 내장) → `storage.uploadSlideImage`(수업 자료 폴더). 화면 `common.questionImage`(누르면 크게, 기록은 작게). 모든 상호작용·게임 타입(mcq·poll·short·blank·wordcloud·dragdrop·wall·videoquiz·dino·race). 자료 복제 때 `cloud.copyConfigImages`가 config 안의 모든 image를 새 폴더로 복사. 그림을 올리는 중이면 팝업·수업 중 추가 창의 저장을 막는다.
 - **게임(dino, race)**: `phase:'running'`일 때만 플레이. 교사 `[시작]`(idle→running) / `[종료]`(→ended) / `[다시]`(clearResponses → idle). 결과 `submit(payload, { itemKey:'result', score, correct, timeMs })`. TeacherLive = 리더보드.
 - 교사가 `running` 중인 게임 슬라이드에서 다른 슬라이드로 이동하면 teacher.js가 `confirmDialog('게임을 종료하고 넘어갈까요?')` → 예: `ended`로 만든 뒤 이동(코어 규칙: `def.category==='game' && activity.phase==='running'`).
 
@@ -524,6 +526,7 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 - **수업 자료 카드**: 썸네일(cover) · 제목 · `n장 · 날짜` · `[시작]`(primary) · `⋯` 메뉴(편집, 복제(선택), 삭제). 카드 탭 = 편집기. 새 수업: `[+ 새 수업]` → 제목 promptDialog → 빈 ink 1장으로 생성 → 편집기. `[PDF·이미지로 만들기]` → 파일 선택 → `fileToSlides` 진행률 → 생성 → 편집기.
 - **편집기**: 열 때 `lesson.slides===null`이면 `cloudFetchLessonSlides`(진행률 pill). 레일: 썸네일(`def.thumb`), 탭=선택, 길게 누르기/`⋯`=복제·삭제·위/아래(드래그 정렬은 pointer 이벤트로, HTML5 DnD 금지). 레일 하단 `[+ 슬라이드]` → 모달 그리드(카테고리 섹션, 아이콘+라벨, 탭 즉시 현재 뒤에 삽입) · `[+ 파일]`(PDF/이미지 → ink 여러 장). 스테이지 = `mountSlideHost({role:'editor'})`. 인스펙터 = 제목 input + `def.Editor().inspector`(있으면) + validate 경고. 변경 → 300ms 디바운스 `cloudSaveLesson` + 상단 pill `저장됨/저장 중…/저장 실패 [다시]`.
 - **시작**: `수업 이름` 입력 창(기본값 = 같은 자료의 직전 수업 이름 또는 자료 제목, 예: '임진왜란 3학년 2반') → `cloudStartSession({lesson, teacher, title})` await → 성공 `/live/:id`, 실패 toast. flow 기본 teacher. 기록 화면에서 이름 바꾸기(patchSession title).
+- **상단 바 세 구역(v2.9)**: 왼쪽(`←` · 제목 · 저장 중 · 코드) | 가운데(`◀ n/N ▶`) | 오른쪽(모드 seg · 모둠 · 진행 방식 · 종료). 넓은 화면(>1100px)은 `grid 1fr auto 1fr`로 가운데가 늘 가운데 → 모드 seg가 생기고 없어져도 ◀ ▶ 자리가 그대로(연속 클릭이 빗나가지 않게). 좁은 화면은 모드·모둠 자리를 보이지 않게 비워 둔 채(`.is-off` = visibility hidden) 같은 효과. 진행 방식 이름은 ≤1280px에서 아이콘만.
 - **수업 진행 `/live/:id`** (v2.7 정리 — 한 기능은 한 자리): 상단 바는 수업 흐름만 — `←`(대시보드, 수업은 계속) · 제목 · **코드 pill `ABC123`**(탭 → QR 모달: 큰 코드 + QR + URL 복사 + 아래 줄 `복습 코드 XYZ789 [복습 QR] [빈 학습지]`) · `◀ 3/12 ▶`(가운데 숫자 탭 → 썸네일 스트립 팝오버로 점프) · (ink일 때만) 모드 seg `발표·전체·개별·모둠` · (모둠 모드일 때만) `[👥 2모둠 · 미배정 n]`(= ink `actions.groups()` 모둠 편성 창, 모둠이 없을 때 모둠으로 바꾸면 창이 바로 뜸) · flow 토글(`교사 진행`/`자유 이동`) · `[종료]`. 학습지 화면에서는 모드 seg·모둠 버튼을 숨기고, ◀ ▶·스트립을 누르면 슬라이드 화면으로 돌아간다.
   - 본문 = 스테이지 | 패널(한 번에 하나) | **오른쪽 아이콘 레일**(64px, 이름표 달린 칸): `📝 학습지`(있을 때만, 배지 = 지금 쓰는 학생 수, 고정 중이면 자물쇠) · `참여`(배지 = 접속 수 → 패널: 참가자 목록 — 온라인 점, 이름, 미제출(응답형), 모둠) · `추가`(레일 왼쪽 작은 창: 지금 슬라이드 다음에 끼워 넣을 8종) · `도구`(그 슬라이드 플러그인의 `panel`이 있을 때만 — 마감·정답 공개·타이머·응답자 등. 패널 제목 `도구 · 객관식`). 같은 칸을 다시 누르거나 ×·Esc → 닫힘. 넓은 화면(진입 시 ≥1100px)은 도구가 있는 슬라이드로 오면 도구를 저절로 펼치고(교사가 직접 닫으면 다시 열 때까지 멈춤), 도구가 없는 슬라이드(필기 등)에서는 닫혀 스테이지가 넓다. ≤1024px에서 패널은 레일 옆에 겹쳐 뜬다. 필기 슬라이드(ink)는 panel이 없다(모드는 상단 바에만).
   - **상호작용 추가**(맨 앞 `[빈 슬라이드]` = 흰 필기 슬라이드(모드 전체)를 창 없이 바로 끼워 넣고 이동, 0.7초 연타 방지 · 정답 없는 상호작용·미디어: 담벼락·주관식 서술형·워드클라우드·설문·웹 링크·임베드·동영상): 타입 탭 → 그 타입의 `Editor`를 창에 띄워 내용 입력 → `[추가하고 이동]`(validate 경고면 toast 후 창 유지) → `cloudInsertSessionSlide`로 현재 슬라이드 **다음**에 끼워 넣고 바로 그 슬라이드로(진행 중 게임이면 이동과 같은 확인). 이 수업에만 들어가고 수업 자료에는 저장하지 않는다. 학생은 자유 이동 중이어도 새 슬라이드로 옮겨진다(새로 생긴 id 기준).
@@ -561,6 +564,15 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 - **'작성 중'/'작성함'**(`wsStats`): 학생마다 모든 쪽의 자기 획·글자(by = 학생, 지운 것 제외) 중 가장 늦은 ts. 20초 안이면 작성 중, 하나라도 있으면 작성함. 서버 왕복 없이 records만으로 계산(broadcast 없음).
 - **기록·복습·인쇄**: 기록 상세(슬라이드별·학생별)와 학생 '내 기록'은 슬라이드 뒤에 `학습지 n` 섹션을 이어 붙인다(태그 pill '학습지'). 복습 화면도 뒤에 이어서(내 개별 칸에 계속 필기). 학생 인쇄·빈 학습지 인쇄의 선택 격자에 학습지 쪽이 '학습지 · n쪽'으로 함께 나온다.
 - **005 전 DB**: `worksheet_pages`가 없으면 `wsTableMissing` → 학습지 조회·저장을 건너뛰고 편집기 창은 '학습지를 불러오지 못했어요'. `session_snapshots.worksheet`가 없으면 세션 시작·조회가 `slides`만으로 동작.
+
+### 9.6 팝업 상호작용 (v2.9, js/popup.js)
+- **무엇**: 필기 슬라이드의 한 곳(핀)에 상호작용을 붙여 두고, 수업 중 교사가 핀을 누르면 교사·학생 화면에 그 상호작용이 팝업으로 떠서 바로 진행한다(닫으면 슬라이드로).
+- **데이터**: `ink slide.config.hotspots = [{ id:'pop_…', x, y, type, title, config }]`(x,y = 16:10 프레임 비율, 핀 가운데). 팝업 = 가상 슬라이드 `{ id: 핀 id, type, title, config, _parent }`(`popSlideFor`) → 응답 `responses[핀 id]`·활동 `activity[핀 id]`라 마감·공개·기록·복습이 일반 슬라이드와 같다. 넣을 수 있는 타입 `POP_TYPES` = 객관식·주관식·설문·빈칸·워드클라우드·분류·담벼락·웹 링크·임베드·동영상. 편집기 슬라이드 복제는 핀 id를 새로(`freshHotspotIds`).
+- **편집기**: 도구바 `[+ 팝업]` · 인스펙터 '팝업 상호작용'(목록 · 고치기 · 빼기 · `[+ 팝업 상호작용 넣기]`) → 종류 고르기 → 그 타입 편집기 창 → `[넣기]`. 슬라이드 위 핀은 끌어 옮기고(놓을 때 저장), 누르면 고치기 창(빼기·저장).
+- **핀**: 프레임 안 레이어(z-index 2 — 필기 캔버스 위, 핀 밖은 pointer-events 없음)에 40px 원 + 타입 아이콘(이름은 마우스를 올리면). 교사 화면(발표·전체)은 은은한 파동, 열린 핀은 진한 색. 개별·모둠 갤러리에서는 머리 줄 버튼(`hotspotChips`).
+- **세션**: `activity.__pop = { id, at } | null` — 교사가 핀을 누르면 열고 다시 누르기·×·Esc·다른 슬라이드로 이동하면 닫는다(`setPop`, patchSession). 교사 화면은 스테이지 위 팝업(오른쪽에 그 활동의 도구 패널 — 마감·정답 공개·타이머), 학생 화면은 전체 팝업 '선생님이 띄웠어요'(닫기 없음 — 선생님이 닫으면 닫힘). 결과 가리기(§6.3)도 그대로.
+- **자유 이동·복습**: flow 'student'(자유 이동·복습 화면)이면 학생 화면에도 핀이 보이고 눌러서 자기 화면에서만 연다(닫기 가능, 슬라이드를 넘기면 닫힘). 교사 진행이면 학생 화면에 핀을 그리지 않는다.
+- **기록**: 기록 상세(슬라이드별·학생별)와 학생 '내 기록'에 그 슬라이드 바로 뒤에 '팝업' 표지로 이어 붙인다.
 
 ### 9.3 실시간 규칙 요약
 - 교사 변경 → broadcast 선반영(즉시) + DB 디바운스 확정. 수신은 rev 비교.

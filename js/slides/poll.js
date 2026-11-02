@@ -5,7 +5,7 @@
 // 가정: 누가 무엇을 골랐는지는 교사만 본다(막대·타일 탭 → 응답자, 패널 학생 목록). 학생 화면에는 이름이 없다.
 import { el } from "../ui.js";
 import { registerSlideType, newId, injectCss } from "./registry.js";
-import { activityBar, columnChart, whoSheet, optionColor, questionEditor, optionLetter, choiceBars } from "./common.js";
+import { activityBar, columnChart, whoSheet, optionColor, questionEditor, optionLetter, choiceBars, questionImage } from "./common.js";
 import {
   ensureQuizCss, statusRow, rosterList, rosterIds, sortIds, nameOf, byStudent, sessionSig, actOf,
   isLocked, clockNow, elapsedMs, quizThumb, seg, field, letterKeys,
@@ -75,14 +75,14 @@ function rosterRow(ctx, cfg, id, r) {
   return { id, name: nameOf(ctx, id), value: picks || "?" };
 }
 
-function Editor({ slide, update, ctx }) {
+function Editor({ slide, lesson, update, ctx }) {
   ensureCss(ctx);
   let cfg = cfgOf(slide);
   const set = (patch) => { cfg = { ...cfg, ...patch }; update({ config: cfg }); };
   const q = questionEditor({
     question: cfg.question, options: cfg.options, answers: false,
-    placeholder: "질문을 입력하세요",
-    onChange: ({ question, options }) => set({ question, options }),
+    placeholder: "질문을 입력하세요", image: cfg.image, imageAt: { lessonId: lesson?.id, slideId: slide.id },
+    onChange: ({ question, options, image }) => set({ question, options, image: image || null }),
   });
   const multiSeg = seg([{ value: false, label: "하나만" }, { value: true, label: "여러 개" }], !!cfg.multiple, (v) => set({ multiple: v }));
   return { el: el("div", { class: "qz-edit" }, [q, field("", multiSeg)]) };
@@ -113,6 +113,7 @@ function Student({ slide, ctx }) {
   const root = el("div", { class: "qz-stu poll-stu" }, [
     status.el,
     el("h2", { class: "qz-q" }, cfg.question || slide.title || ""),
+    questionImage(cfg.image),
     el("div", { class: "qz-choices" }, btns.map(x => x.b)),
     submitB,
     results,
@@ -188,6 +189,7 @@ function TeacherLive({ slide, ctx }) {
       el("h2", { class: "qz-q" }, cfg.question || slide.title || ""),
       el("div", { class: "poll-meta" }, [status.el, countP]),
     ]),
+    questionImage(cfg.image),
     chart,
   ]);
   const bar = activityBar(ctx, { reveal: true, revealLabel: "결과 공개", timer: true });
@@ -231,6 +233,7 @@ function summary(slide, responses = [], session, ctx) {
   roster.set(sortIds(ctx, [...map.keys()]).map(id => rosterRow(ctx, cfg, id, map.get(id))));
   return el("div", { class: "qz-sum poll-sum" }, [
     el("div", { class: "qz-q" }, cfg.question || slide.title || ""),
+    questionImage(cfg.image, { small: true }),
     el("div", { class: "qz-sum-meta" }, [el("span", { class: "pill pill-muted" }, `응답 ${map.size}`)]),
     chart,
     map.size ? roster.el : null,

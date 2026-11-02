@@ -3,6 +3,8 @@
 // 가정: cloud/realtime/ui/store 는 네임스페이스 import — 다른 에이전트 파일이 아직 덜 됐어도 모듈 링크가 깨지지 않게.
 // 가정: ctx 에 명세 외 보조 함수 timeout(fn, ms)/interval(fn, ms)/clearTimer(id)/lesson/update 를 추가(destroy 시 자동 정리).
 // 가정: sessionView(session) → 플러그인에게 보여 줄 세션(학생 복습: 활동 상태·모드를 바꾼 보기). 쓰기(응답·필기)는 store의 진짜 세션에 한다.
+// 가정(v2.9): onPopup(id) → ctx.openPopup(id) — 필기 슬라이드의 팝업 핀을 눌렀을 때 코어 화면(교사·학생)이 팝업을 연다(js/popup.js).
+//       ctx.popupId() = 지금 열린 팝업 id(교사가 띄운 activity.__pop).
 import * as ui from "../ui.js";
 import * as storeMod from "../store.js";
 import * as cloud from "../cloud.js";
@@ -45,7 +47,7 @@ function toast(msg) {
   else console.log("[toast]", msg);
 }
 
-export function mountSlideHost({ role = "student", root, slide, session, me, lesson, onEditorUpdate, sessionView = null } = {}) {
+export function mountSlideHost({ role = "student", root, slide, session, me, lesson, onEditorUpdate, sessionView = null, onPopup = null } = {}) {
   let curSlide = slide;
   let curSession = session || null;
   let cur = null;          // { key, inst, ctx, wrap, listeners, timers, lastAct, lastSig }
@@ -231,6 +233,9 @@ export function mountSlideHost({ role = "student", root, slide, session, me, les
           if (i >= 0) listeners.splice(i, 1);
         };
       },
+      // 팝업 상호작용(v2.9): 핀 누르기 → 코어가 연다. 편집기·팝업 안에서는 없음
+      openPopup: !isEditor && typeof onPopup === "function" ? (id) => { try { onPopup(id); } catch (e) { console.warn("[host] openPopup", e); } } : null,
+      popupId() { const p = !isEditor ? liveSession()?.activity?.__pop : null; return p && p.id ? p.id : null; },
       groups() { return isEditor ? [] : (liveSession()?.groups || []); },
       myGroup() {
         if (role !== "student" || !me) return null;

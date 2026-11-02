@@ -5,7 +5,7 @@
 // 가정: countdownPill(endsAt) 은 스스로 갱신되는 HTMLElement 를 반환한다(destroy 가 있으면 호출).
 import { el } from "../ui.js";
 import { registerSlideType, injectCss } from "./registry.js";
-import { activityBar, countdownPill } from "./common.js";
+import { activityBar, countdownPill, questionImage, imageField } from "./common.js";
 
 const MAX_LEN = 12, TOP_N = 60, MIN_PX = 14, MAX_PX = 64, PAD = 3;
 const COLORS = ["var(--ink)", "var(--accent)", "var(--ok)", "var(--warn)"];
@@ -230,9 +230,10 @@ registerSlideType({
     return (slide.config?.prompt || "").trim() ? null : "질문을 입력하세요";
   },
 
-  Editor({ slide, update, ctx }) {
+  Editor({ slide, lesson, update, ctx }) {
     ensureCss(ctx);
     const cfg = () => slide.config || {};
+    const img = imageField({ value: cfg().image, lessonId: lesson?.id, slideId: slide.id, onChange: (v) => update({ config: { ...cfg(), image: v } }) });
     const prompt = el("textarea", { class: "input", rows: 3, placeholder: "질문 (예: 오늘 수업을 한 단어로?)" });
     prompt.value = cfg().prompt || "";
     prompt.addEventListener("input", () => update({ config: { ...cfg(), prompt: prompt.value } }));
@@ -251,6 +252,7 @@ registerSlideType({
 
     const root = el("div", { class: "wc-editor" }, [
       el("label", { class: "field" }, [el("span", {}, "질문"), prompt]),
+      img,
       el("div", { class: "field" }, [el("span", {}, "학생당 단어 수"), seg]),
     ]);
     return { el: root };
@@ -283,6 +285,7 @@ registerSlideType({
 
     const root = el("div", { class: "wc wc-stu" }, [
       el("div", { class: "wc-head" }, [el("h2", { class: "wc-prompt" }, cfg.prompt || ""), status]),
+      questionImage(cfg.image),
       form, view,
     ]);
 
@@ -369,6 +372,7 @@ registerSlideType({
 
     const root = el("div", { class: "wc wc-teacher" }, [
       el("div", { class: "wc-head" }, [el("h2", { class: "wc-prompt" }, cfg.prompt || "")]),
+      questionImage(cfg.image),
       bar, cloud.el,
     ]);
 
@@ -413,6 +417,7 @@ registerSlideType({
     cloud.set(countWords(responses, hidden));
     return el("div", { class: "wc wc-sum" }, [
       el("h3", { class: "wc-prompt" }, slide.config?.prompt || ""),
+      questionImage(slide.config?.image, { small: true }),
       cloud.el,
     ]);
   },
