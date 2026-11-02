@@ -21,8 +21,8 @@
 //       자유 이동·복습에서는 슬라이드의 핀을 눌러 스스로 열고 닫는다(내 화면에서만).
 // 가정(공용 태블릿): 대기·수업·복습·내 기록 화면에 늘 '이름 | 로그아웃' 버튼(meChip)을 둔다. 로그아웃 = 기억된 학생을 지우고
 //       입장 화면으로(코드는 이 탭에 남겨 다음 학생은 학년·반·번호·이름만). 수업 중에는 한 번 확인한다(필기·답은 이미 저장됨).
-// 가정: 수업이 끝나면 대기 화면이 아니라 입장 화면('누가 참여하나요?')으로 간다 — 대기 화면은 다음 수업에 자동으로 들어가므로,
-//       다음 시간에 다른 반이 같은 태블릿을 쓰면 앞 학생 이름으로 들어가 버린다. 같은 학생은 이름 버튼 한 번이면 된다.
+// 가정: 수업이 끝나면 대기 화면이 아니라 입장 화면(입력 폼 + '혹시 이 학생인가요?' 카드)으로 간다 — 대기 화면은 다음 수업에 자동으로 들어가므로,
+//       다음 시간에 다른 반이 같은 태블릿을 쓰면 앞 학생 이름으로 들어가 버린다. 같은 학생은 카드 한 번이면 된다.
 import { el, mount, icon, fmtDate, toast, confirmDialog } from "./ui.js";
 import { store, findSession, findStudent, studentLabel, normCode } from "./store.js";
 import { go } from "./router.js";
@@ -421,7 +421,7 @@ export function studentLiveView({ id } = {}) {
     popView.close();
     rememberEnded(id, findSession(id)?.rev);
     root.appendChild(el("div", { class: "stage-overlay" }, "수업이 끝났어요"));
-    // 대기 화면(다음 수업 자동 입장)이 아니라 '누가 참여하나요?' — 다음 시간 다른 반이 이 태블릿을 쓸 수 있음
+    // 대기 화면(다음 수업 자동 입장)이 아니라 입장 화면 — 다음 시간 다른 반이 이 태블릿을 쓸 수 있음
     endTimer = setTimeout(() => { if (!dead) go("/student-login", { replace: true }); }, 2000);
   }
 

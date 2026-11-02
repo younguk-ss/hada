@@ -511,8 +511,8 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 |---|---|---|
 | `/` | (기존) | 랜딩(인트로 유지). 버튼 `교사로 시작` `학생으로 참여` |
 | `/teacher-login` | C | 카드: 이름·비밀번호·`입장` + 작은 `처음이면 자동으로 만들어져요` |
-| `/student-login` | C | 기억된 학생 있으면 `누가 참여하나요?` — 큰 버튼 `홍길동으로 입장`(작게 `6학년 2반 14번 · 코드 ABC123`) + 같은 크기 `다른 학생이에요 · 새로 입력`(코드 채운 빈 폼). 없으면 폼: 코드(1칸, 자동 대문자, 6자) · 학년/반/번호(`repeat(3,minmax(0,1fr))`, `type=text inputmode=numeric`) · 이름 · `입장` |
-| `/student/join?c=CODE` | C | QR. 기억된 학생이 있어도 **바로 들어가지 않고** `누가 참여하나요?`(v2.10, 학년·반이 돌려쓰는 공용 태블릿). 없으면 코드 채운 로그인 폼 |
+| `/student-login` | C | 늘 입력 폼이 위: 코드(1칸, 자동 대문자, 6자) · 학년/반/번호(`repeat(3,minmax(0,1fr))`, `type=text inputmode=numeric`) · 이름 · `입장`. 기억된 학생이 있으면(v2.10.1) `입장` 왼쪽에 점선 카드 `혹시 이 학생인가요? 5학년 1반 3번 김하나`(이름 크게) — 누르면 그 학생으로 입장(코드는 칸의 값 → 기억된 코드). 학년·반·번호를 그 학생과 다르게 치면 카드가 숨고 `입장`이 꽉 찬다. `?form=1`(대기 화면 `코드 바꾸기`)은 학생 정보를 채운 폼, 카드 없음 |
+| `/student/join?c=CODE` | C | QR. 기억된 학생이 있어도 **바로 들어가지 않고** QR 코드를 채운 `/student-login` 폼(학년부터 입력, 기억된 학생은 `입장` 옆 카드로만 — 공용 태블릿에서 남의 이름으로 먼저 누르지 않게, v2.10.1) |
 | `/r/:code` | C | 학습지 복습 QR(짧은 주소). `/student/join`과 같은 처리 — 코드 칸은 교사 코드·복습 코드를 모두 받는다 |
 | `/student/review/:id` | C | 학생 페이스 복습(§9.4), 늘 첫 슬라이드부터. 진행 중인 수업이어도 머물고 위쪽 `[수업 들어가기]` |
 | `/student` | C | 대기 카드: 맨 위 `👤 6-2-14 홍길동 | 로그아웃` · 교사 이름 · `선생님이 수업을 시작하면 자동으로 들어가요` · `코드 바꾸기` · 하단 작은 `내 기록` |
@@ -555,7 +555,7 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 - **입장**: 코드 정규화 → `cloudFindTeacherByCode`(없으면 '코드를 확인해 주세요') → `cloudJoinStudent`(서버 id 채택, studentProfile 저장 + lastCode) → `cloudFetchLiveSession(teacherId)` → 있으면 `cloudAddParticipant` → `/student/live/:id`; 없으면 `/student`(대기, `watchTeacherLive`로 자동 입장).
 - **수업 화면 `/student/live/:id`**: store에 없으면 `cloudFetchSession(id, {forStudentId})`. `subscribeSession` + `joinSessionChannel`(presence) + `send('session:hello')`. 상단 바: 로고(작게) · 제목 · 모드 pill(ink일 때만, `전체`/`개별`/`모둠 · 2모둠`) · `3 / 12`(자유 이동이면 `◀ ▶`) · `나가기` · `👤 홍길동 | 로그아웃`(≤720px 이름만·≤420px 아이콘만). 스테이지 = `mountSlideHost({role:'student'})`.
   - flow teacher: currentSlide를 따른다. flow student: 로컬 인덱스(처음엔 currentSlide).
-  - 세션 status가 live가 아니게 되면 `수업이 끝났어요` 2초 → `/student-login`(`누가 참여하나요?`, v2.10). 대기 화면은 다음 수업에 자동 입장하므로, 다음 시간 다른 반이 같은 태블릿을 쓰면 앞 학생 이름으로 들어가 버리기 때문. 같은 학생은 이름 버튼 한 번.
+  - 세션 status가 live가 아니게 되면 `수업이 끝났어요` 2초 → `/student-login`(입력 폼 + `혹시 이 학생인가요?` 카드, v2.10). 대기 화면은 다음 수업에 자동 입장하므로, 다음 시간 다른 반이 같은 태블릿을 쓰면 앞 학생 이름으로 들어가 버리기 때문. 같은 학생은 카드 한 번.
   - `나가기` → 채널 leave → `/student`.
 - **로그아웃**(v2.10): 대기·수업·복습·내 기록 화면의 `이름 | 로그아웃` 버튼(수업 중에만 한 번 확인). studentProfile·whoStudent를 지우고 `/student-login` 폼으로 — 코드는 이 탭(sessionStorage `hada:joinCode`)에 남겨 다음 학생은 학년·반·번호·이름만 입력.
 - **내 기록**: `cloudListSessionsForStudent` → 세션 → 읽기 전용 학생별 뷰(교사 기록의 학생별 컴포넌트와 같은 구조를 student.js가 간단히 구현: 슬라이드마다 ink 읽기 전용 / `def.summary`에 내 응답만 넘김). 상세 위 `[복습하기]`(진행 중이면 `[수업 들어가기]`).

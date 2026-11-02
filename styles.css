@@ -786,20 +786,23 @@ body:has(.float-toolbar, .stu-toolbar, .ink-float) .toast-stack { bottom: calc(8
   height: 56px !important;
 }
 .code-input::placeholder, .code-field input::placeholder { letter-spacing: .32em; color: #cfcbc2; font-weight: 600; }
-.remembered { display: grid; gap: 10px; justify-items: center; }
-.remembered .btn, .remembered-btn {
-  width: 100%; height: auto; min-height: 72px;
-  padding: 14px 18px;
-  display: grid; gap: 4px; justify-items: center;
-  white-space: normal; line-height: 1.3; text-align: center;
-  border-radius: var(--radius);
+/* 입장 줄: 기억된 학생이 있으면 [혹시 이 학생인가요? 카드 | 입장] — 폼이 먼저, 카드는 아래에서 덜 눈에 띄게 */
+.submit-row { display: flex; gap: 10px; align-items: stretch; min-width: 0; margin-top: 4px; }
+.auth-card .submit-row .btn-primary { margin-top: 0; }
+.submit-row.has-suggest .btn-primary { flex: 0 0 auto; width: auto; min-width: 96px; height: auto; }
+.suggest-btn {
+  flex: 1 1 auto; min-width: 0;
+  display: grid; gap: 2px; align-content: center; justify-items: start; text-align: left;
+  padding: 10px 14px; border: 1.5px dashed var(--line-strong); border-radius: 12px;
+  background: var(--surface-2); color: var(--ink); font: inherit; cursor: pointer;
 }
-.remembered-btn { background: var(--accent); color: #fff; border: 0; font-size: 17px; font-weight: 650; }
-.remembered .sub, .remembered-btn small { font-size: 13px; font-weight: 500; opacity: .8; }
-.remembered-q { justify-self: stretch; font-size: 15px; font-weight: 650; color: var(--ink-2); margin: 0 0 2px; }
-.remembered-name { font-size: 19px; font-weight: 700; overflow-wrap: anywhere; }
-.remembered .remembered-other { min-height: 56px; display: flex; gap: 8px; font-size: 16px; font-weight: 650; border-color: var(--line-strong); }
-.remembered-other:disabled, .remembered-btn:disabled { opacity: .6; }
+.suggest-btn[hidden] { display: none; }
+.suggest-btn:disabled { opacity: .6; }
+.suggest-btn .spinner { justify-self: center; }
+@media (hover: hover) { .suggest-btn:hover { border-color: var(--accent); background: var(--accent-soft); } }
+.suggest-q { font-size: 12px; font-weight: 600; color: var(--muted); }
+.suggest-num { font-size: 15px; font-weight: 650; color: var(--ink-2); }
+.suggest-name { font-size: 21px; font-weight: 750; line-height: 1.2; overflow-wrap: anywhere; }
 .error, .auth-err { color: var(--danger); font-size: 13px; margin: 0; min-height: 18px; text-align: center; }
 @media (max-width: 400px) {
   .auth-card { padding: 24px 18px 20px; border-radius: var(--radius); }

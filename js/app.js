@@ -4,9 +4,10 @@
 // 가정: 교사 로그인 상태에서 /teacher-login에 오면 /teacher로 보낸다(로그아웃은 대시보드).
 // 가정: /student-login?form=1 은 기억된 학생이 있어도 폼을 연다(대기 화면 '코드 바꾸기'). 이때 학생 정보는 채우고 코드는 비운다.
 // 가정: 참여 등록(cloudAddParticipant)은 여기서 하지 않는다 — 수업 화면 진입 시 student.js가 1회 처리.
-// 가정: QR 입장(/student/join?c=, /r/CODE)은 기억된 학생이 있어도 바로 들어가지 않고 '누가 참여하나요?'를 먼저 보인다
-//       ([홍길동으로 입장] / [다른 학생이에요]) — 학년·반이 돌려쓰는 공용 태블릿에서 앞 학생 이름으로 들어가지 않게. lastCode는 입장 성공 시 저장.
-//       [다른 학생이에요]는 QR 코드를 채운 빈 폼(학년부터 입력). 새 학생으로 입장하면 기억된 학생이 그 학생으로 바뀐다.
+// 가정(v2.10.1, 공용 태블릿): 입장 화면은 늘 입력 폼이 위(QR이면 코드를 채우고 학년 칸에 커서) — 기억된 학생이 있어도 바로 들어가지 않는다.
+//       기억된 학생은 [입장] 왼쪽의 작은 카드 '혹시 이 학생인가요? 5학년 1반 3번 김하나'로만(누르면 그 학생으로 입장, 코드는 칸의 값 → 기억된 코드).
+//       학년·반·번호를 기억된 학생과 다르게 치면 카드는 숨는다(남의 이름을 잘못 누르지 않게). 새 학생으로 입장하면 기억된 학생이 바뀐다.
+//       lastCode는 입장 성공 시 저장.
 // 가정: 코드 칸 하나로 교사 코드와 수업별 복습 코드(학습지 QR, /r/CODE)를 함께 받는다 — 교사 코드를 먼저 찾고 없으면 복습 코드.
 //       복습 코드로 들어오면 lastCode(대기 화면용 교사 코드)는 이전 값을 두고, 없을 때만 그 수업 선생님의 코드로 채운다.
 // 가정: 복습 코드(학습지 QR·기록의 복습 링크)는 수업이 진행 중이어도 늘 학생 페이스 복습으로 보낸다(첫 슬라이드부터).
@@ -33,13 +34,6 @@ function redirect(path) { setTimeout(() => go(path, { replace: true }), 0); }
 function ssGet(k) { try { return sessionStorage.getItem(k); } catch { return null; } }
 function ssSet(k, v) { try { v == null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v); } catch {} }
 const isEnter = (e) => e.key === "Enter" && !e.isComposing && e.keyCode !== 229;
-// 이름 뒤 '로/으로' (받침 없음·ㄹ받침 → 로)
-function josaRo(name) {
-  const c = String(name || "").trim().slice(-1).charCodeAt(0) - 0xac00;
-  if (!(c >= 0 && c < 11172)) return "(으)로";
-  const j = c % 28;
-  return j === 0 || j === 8 ? "로" : "으로";
-}
 function failView() {
   mount(el("main", { class: "center-page" }, el("div", { class: "empty" }, "화면을 불러오지 못했어요")));
 }
@@ -148,13 +142,13 @@ route("/teacher-login", () => {
 });
 
 // ── 학생 입장 ──
-// opts.autoCode: QR 입장 — 기억된 학생이면 이 코드로 '누가 참여하나요?'(바로 들어가지 않음)
+// opts.autoCode: QR 입장 — 이 코드를 채운 폼(기억된 학생이 있어도 바로 들어가지 않음)
 function studentLoginView(params = {}, { autoCode = null } = {}) {
   const v = template("tpl-student-login");
   mount(v);
   let dead = false, busy = false;
   const q = (sel) => v.querySelector(sel);
-  const remembered = q("#s-remembered"), againBtn = q("#s-again"), otherBtn = q("#s-other"), form = q("#s-form");
+  const againBtn = q("#s-again"), form = q("#s-form"), submitRow = q(".submit-row");
   const codeI = q("#s-code"), gradeI = q("#s-grade"), classI = q("#s-class"), numI = q("#s-num"), nameI = q("#s-name");
   const submitBtn = q("#s-submit"), err = q("#s-err");
   q(".back").onclick = () => go("/");
@@ -162,7 +156,7 @@ function studentLoginView(params = {}, { autoCode = null } = {}) {
   const profile = currentStudent();
   const preset = normCode(params.c || ssGet("hada:joinCode") || "");
   const rememberedCode = normCode(autoCode || (profile && profile.lastCode) || "");
-  const canRemember = !!(profile && profile.id && rememberedCode) && !params.form;
+  const suggest = !!(profile && profile.id) && !params.form; // [입장] 왼쪽 '혹시 이 학생인가요?'
 
   // 입력 정규화
   codeI.addEventListener("input", () => {
@@ -191,7 +185,6 @@ function studentLoginView(params = {}, { autoCode = null } = {}) {
     nameI.value = p ? String(p.name ?? "") : "";
   }
   function showForm({ keepStudent = false, code = "" } = {}) {
-    remembered.hidden = true;
     form.hidden = false;
     err.textContent = "";
     fillStudent(keepStudent ? profile : null);
@@ -206,9 +199,9 @@ function studentLoginView(params = {}, { autoCode = null } = {}) {
   function setBusy(btn, on) {
     if (btn === againBtn) {
       againBtn.disabled = on;
-      otherBtn.disabled = on;
+      submitBtn.disabled = on;
       againBtn.setAttribute("aria-busy", on ? "true" : "false");
-      if (on) { againBtn._kids = [...againBtn.childNodes]; againBtn.replaceChildren(el("span", { class: "spinner", style: { borderColor: "rgba(255,255,255,.35)", borderTopColor: "#fff" } })); }
+      if (on) { againBtn._kids = [...againBtn.childNodes]; againBtn.replaceChildren(el("span", { class: "spinner" })); }
       else if (againBtn._kids) { againBtn.replaceChildren(...againBtn._kids); }
     } else {
       btn.classList.toggle("loading", on);
@@ -282,20 +275,31 @@ function studentLoginView(params = {}, { autoCode = null } = {}) {
   }
   submitBtn.onclick = submitForm;
 
-  if (canRemember) {
-    remembered.hidden = false;
-    form.hidden = true;
+  if (suggest) {
+    // 폼이 먼저(코드는 QR → 이 탭에 남긴 코드 → 기억된 코드), 기억된 학생은 [입장] 왼쪽 카드로만
+    showForm({ code: autoCode ? rememberedCode : (preset || rememberedCode || "") });
     againBtn.replaceChildren(
-      el("span", { class: "remembered-name" }, `${profile.name}${josaRo(profile.name)} 입장`),
-      el("small", {}, `${profile.grade}학년 ${profile.classNum}반 ${profile.num}번 · 코드 ${rememberedCode}`),
+      el("span", { class: "suggest-q" }, "혹시 이 학생인가요?"),
+      el("span", { class: "suggest-num" }, `${profile.grade}학년 ${profile.classNum}반 ${profile.num}번`),
+      el("span", { class: "suggest-name" }, profile.name),
     );
-    againBtn.onclick = () => join({
-      code: rememberedCode, grade: profile.grade, classNum: profile.classNum, num: profile.num, name: profile.name,
-    }, againBtn);
-    // QR이면 그 코드, 아니면 기억된 코드를 채운 빈 폼 — 학년·반·번호·이름만 새로
-    otherBtn.onclick = () => showForm({ code: autoCode ? rememberedCode : (preset || rememberedCode || "") });
-  } else if (profile && (params.form || !rememberedCode)) {
-    // 코드 바꾸기 · 코드 없이 기억된 학생: 학생 정보는 채우고 코드만 입력
+    againBtn.setAttribute("aria-label", `혹시 이 학생인가요? ${profile.grade}학년 ${profile.classNum}반 ${profile.num}번 ${profile.name}(으)로 입장`);
+    againBtn.onclick = () => {
+      const code = normCode(codeI.value) || rememberedCode;
+      if (!code) { err.textContent = "코드 6자리를 입력해 주세요"; codeI.focus(); return; }
+      join({ code, grade: profile.grade, classNum: profile.classNum, num: profile.num, name: profile.name }, againBtn);
+    };
+    // 학년·반·번호를 기억된 학생과 다르게 치면 카드를 숨긴다(이름은 한글 조합 중 글자가 달라 보여 비교하지 않음)
+    const same = (inp, v) => !inp.value || parseInt(inp.value, 10) === Number(v);
+    const syncSuggest = () => {
+      const show = same(gradeI, profile.grade) && same(classI, profile.classNum) && same(numI, profile.num);
+      againBtn.hidden = !show;
+      submitRow.classList.toggle("has-suggest", show);
+    };
+    for (const inp of [gradeI, classI, numI]) inp.addEventListener("input", syncSuggest);
+    syncSuggest();
+  } else if (profile && params.form) {
+    // 코드 바꾸기: 학생 정보는 채우고 코드만 입력
     showForm({ keepStudent: true, code: preset || "" });
   } else {
     showForm({ code: preset || "" });
