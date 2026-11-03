@@ -10,10 +10,13 @@
 // 가정: 기록 요약(summary)은 결과가 1명뿐이면(학생 '내 기록') 순위 칸을 숨긴다.
 // 가정: 결과 payload 에 run(= activity.startedAt)을 덧붙인다 → 교사 [다시]→[시작] 사이 idle 패치를 놓쳐도 이전 판 결과로 '완료' 처리하지 않음.
 // 가정: 마지막 답을 고르는 즉시 제출(0.8초 피드백은 화면만) — 그 사이 [종료]돼도 결과 유지.
+// 가정(v2.11): 효과음(js/slides/game-sound.js) — 학생: 배경음악(플레이 중)·카운트다운·점프·충돌·정답·오답·완주 팡파르,
+//       교사: 진행 중 배경음악 + 완주할 때마다 짧은 소리. 🔊 버튼으로 기기마다 음소거.
 import { el } from "../ui.js";
 import { findStudent } from "../store.js";
 import { registerSlideType, newId, injectCss, fmtMs } from "./registry.js";
 import { questionEditor, optionLetter, questionImage } from "./common.js";
+import * as sound from "./game-sound.js";
 
 // ── 상수 ──
 const W = 800, H = 240, GY = 206;       // 논리 캔버스 · 땅(발바닥) 높이
@@ -135,7 +138,7 @@ function drawWorld(g, w, { moving = false } = {}) {
 
 // ── 게임 엔진 (캔버스 + rAF 루프) ──
 // onPass(passes) → true 면 이번 프레임에서 멈춤(문제), onHit(hits)
-function createEngine(canvas, { auto = false, onPass, onHit } = {}) {
+function createEngine(canvas, { auto = false, onPass, onHit, onJump } = {}) {
   const g = canvas.getContext("2d");
   let w = newWorld();
   let isAuto = !!auto, frozen = !auto;
@@ -155,7 +158,7 @@ function createEngine(canvas, { auto = false, onPass, onHit } = {}) {
     drawWorld(g, w, { moving: !frozen });
   }
 
-  function doJump() { w.vy = JUMP_V; w.air = true; w.buf = -1; }
+  function doJump() { w.vy = JUMP_V; w.air = true; w.buf = -1; try { onJump?.(); } catch (_) {} }
 
   function step(dt) {
     w.t += dt;
@@ -486,13 +489,15 @@ function Student({ slide, ctx }) {
   const hudQ = el("span", { class: "pill" });
   const hudHit = el("span", { class: "pill" });
   const hudNext = el("span", { class: "pill pill-muted" });
-  const hud = el("div", { class: "dn-hud", hidden: true }, [hudQ, hudHit, hudNext]);
+  const sndBtn = sound.soundToggle({ className: "btn btn-sm btn-icon dn-snd" });
+  const hud = el("div", { class: "dn-hud", hidden: true }, [hudQ, hudHit, hudNext, sndBtn]);
+  sound.attach();
   const hint = el("div", { class: "dn-hint", hidden: true }, "탭하거나 스페이스로 점프");
   const result = el("div", { class: "dn-result", hidden: true });
   const qLayer = el("div", { class: "dn-qlayer", hidden: true });
   const root = el("div", { class: "dn-stu", onPointerdown: onTap }, [msg, hud, game, hint, result, qLayer]);
 
-  const engine = createEngine(canvas, { auto: true, onPass, onHit });
+  const engine = createEngine(canvas, { auto: true, onPass, onHit, onJump: () => { if (mode === "play") sound.play("jump"); } });
   document.addEventListener("keydown", onKey);
 
   // 가정: ctx.timeout(host 보조 함수, destroy 시 자동 정리)이 없으면 setTimeout. gen/dead 검사로 늦은 콜백 무시.
@@ -527,6 +532,7 @@ function Student({ slide, ctx }) {
     game.classList.remove("is-hit");
     void game.offsetWidth; // 애니메이션 재시작
     game.classList.add("is-hit");
+    if (mode === "play") sound.play("hit");
     try { navigator.vibrate?.(40); } catch {}
   }
 
@@ -548,12 +554,14 @@ function Student({ slide, ctx }) {
     hint.hidden = !(mode === "play" || mode === "count");
     result.hidden = !(mode === "done" || mode === "over");
     root.classList.toggle("is-playing", playing);
+    sound.bgm(playing && mode !== "count" ? "dino" : null); // 플레이·문제 동안 배경음악
     if (!game.hidden) engine.fit();
   }
 
   function showCount(n) {
     overlay.replaceChildren(el("div", { class: "dn-count" }, String(n)));
     overlay.hidden = false;
+    sound.play("count");
   }
 
   function closeQuestion() {
@@ -591,6 +599,7 @@ function Student({ slide, ctx }) {
       overlay.hidden = true;
       t0 = performance.now();
       mode = "play";
+      sound.play("go");
       engine.freeze(false);
       layout();
       if (meId) ctx.send("dino:progress", { sid: meId, answered: 0, correct: 0, hits: 0 });
@@ -634,6 +643,7 @@ function Student({ slide, ctx }) {
     });
     fb.textContent = ok ? "정답!" : "아쉬워요";
     fb.className = `dn-fb ${ok ? "ok" : "bad"}`;
+    if (answered < Q) sound.play(ok ? "correct" : "wrong"); // 마지막 문제는 완주 팡파르로
     const hits = engine.world.hits;
     if (meId) ctx.send("dino:progress", { sid: meId, answered, correct, hits });
     engine.setSpeed(BASE_SPEED * Math.pow(SPEED_UP, answered));
@@ -667,6 +677,7 @@ function Student({ slide, ctx }) {
 
   function toDone() {
     if (mode !== "done") {
+      if (inGame()) sound.play("finish"); // 이 화면에서 끝까지 풀었을 때만(다시 열어 결과만 볼 땐 조용히)
       gen++;
       mode = "done";
       overlay.hidden = true; closeQuestion();
@@ -769,6 +780,7 @@ function Student({ slide, ctx }) {
       gen++;
       engine.destroy();
       document.removeEventListener("keydown", onKey);
+      sound.bgm(null); sound.detach(); sndBtn.release();
     },
   };
 }
@@ -806,9 +818,12 @@ function TeacherLive({ slide, ctx }) {
   const pillBox = el("span", { class: "dn-pillbox" });
   const countP = el("span", { class: "pill" });
   const body = el("div", { class: "dn-live-body" });
+  sound.attach();
+  const sndBtn = sound.soundToggle();
+  let doneSeen = null; // 완주 수(새로 늘면 짧은 소리)
   const root = el("div", { class: "dn-live" }, [
     el("div", { class: "dn-live-head" }, [
-      el("h2", {}, slide.title || "공룡 점프"), pillBox, countP, el("span", { class: "dn-spacer" }), ctlHead,
+      el("h2", {}, slide.title || "공룡 점프"), pillBox, countP, el("span", { class: "dn-spacer" }), sndBtn, ctlHead,
     ]),
     body,
   ]);
@@ -848,6 +863,8 @@ function TeacherLive({ slide, ctx }) {
     const ct = `완주 ${doneN}/${m}`, kt = `${doneN}/${m}명`;
     if (countP.textContent !== ct) countP.textContent = ct;
     if (kvDone.textContent !== kt) kvDone.textContent = kt;
+    if (doneSeen != null && doneN > doneSeen && phase === "running") sound.play("finishSoft");
+    doneSeen = doneN;
     if (phase === "idle") { boardSig = ""; return; }
     const name = namer(ctx);
     const sig = rowsSig(rows, name);
@@ -861,6 +878,7 @@ function TeacherLive({ slide, ctx }) {
     const changed = ph !== phase;
     if (changed) {
       phase = ph;
+      sound.bgm(ph === "running" ? "dino" : null);
       pillBox.replaceChildren(statusPill(ph));
       ctlHead.update(ph); ctlPanel.update(ph);
       if (preview) { preview.engine.destroy(); preview = null; }
@@ -888,7 +906,7 @@ function TeacherLive({ slide, ctx }) {
       sessSig = sig;
       paintBoard();
     },
-    destroy() { if (preview) preview.engine.destroy(); preview = null; },
+    destroy() { if (preview) preview.engine.destroy(); preview = null; sound.bgm(null); sound.detach(); sndBtn.release(); },
   };
 }
 
@@ -952,6 +970,8 @@ const CSS = `
 .dn-msg { font-size: 18px; font-weight: 600; text-align: center; padding: 8px 0; }
 .dn-hud { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .dn-hud .pill { font-variant-numeric: tabular-nums; }
+.dn-hud .dn-snd { margin-left: auto; }
+.gs-toggle.is-muted { color: var(--muted); }
 .dn-game { position: relative; width: 100%; aspect-ratio: 800 / 240; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; flex: none; box-sizing: border-box; }
 .dn-game canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 .dn-game.is-preview { opacity: .8; }

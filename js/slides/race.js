@@ -2,8 +2,10 @@
 // 결정적 시뮬레이션 + 이산 이벤트(race:answer, race:finish)만 보낸다. 위치 스트림 없음.
 // 모든 클라이언트가 같은 규칙(simulate)으로 같은 조의 모든 차를 계산해 그린다.
 // 가정: 이벤트·결과 payload 에 slideId·startedAt·name 필드를 덧붙인다(다른 경기 이벤트 거르기·이름 표시용).
-// 가정: 상대 차의 race:answer 가 체크포인트 도착 후 17초(제한 15초+2초) 안에 안 오면 '15초 시점 오답'으로 가정해 진행
+// 가정: 상대 차의 race:answer 가 체크포인트 도착 후 (제한+2초) 안에 안 오면 '제한 시점 오답'으로 가정해 진행
 //       (재접속·이벤트 유실 시 차가 영원히 서 있지 않게). 실제 이벤트가 오면 그 값으로 다시 계산한다.
+// 가정(v2.11): 문제 제한 시간 = config.quizSec(편집기에서 10·15·20·30·45·60초, 기본 20초). 시뮬레이션에 넘겨 모든 화면이 같은 값으로 계산.
+//       오답 = 미끄러짐 1.5초(멈춤) + 감속 2.5초. 효과음(js/slides/game-sound.js): 배경음악·부스터·미끄러짐·결승·카운트다운, 🔊 음소거.
 // 가정: 시간 기준은 교사 시계의 activity.startedAt. 학생 기기는 교사 시계를 추정해 쓴다:
 //       race 자체 표본(학생 race:ping → 교사 race:clock {sentAt}, 표본 = sentAt - 수신 시각, 최근 8개 최댓값 + 30ms)이 있으면 그것,
 //       없으면 코어 ctx.now()(있다면), 그것도 없으면 Date.now(). 교사 화면은 자기 시계(Date.now()) 그대로.
@@ -25,14 +27,15 @@ import { el, icon } from "../ui.js";
 import { findStudent } from "../store.js";
 import { registerSlideType, newId, injectCss, groupStudents } from "./registry.js";
 import { questionEditor, optionLetter, questionImage } from "./common.js";
+import * as sound from "./game-sound.js";
 
 // ── 규칙 상수 ──
 const BASE = 1 / 12000;          // 랩/ms (1랩 12초)
-const QUIZ_MS = 15000;           // 문제 제한
+const QUIZ_SECS = [10, 15, 20, 30, 45, 60], QUIZ_SEC = 20; // 문제 제한(초) 고를 수 있는 값 · 기본
 const BOOST_MS = 2500, BOOST_MUL = 2.0;
-const SPIN_MS = 1000;
+const SPIN_MS = 1500;            // 오답 미끄러짐(멈춤)
 const SLOW_MS = 2500, SLOW_MUL = 0.5;
-const GUESS_MS = QUIZ_MS + 2000; // 상대 답 미수신 시 오답 가정까지
+const GUESS_EXTRA = 2000;        // 상대 답 미수신 시 '제한 + 이만큼' 뒤 오답 가정
 const COUNT_MS = 3000;
 const END_DELAY = 3000;
 
@@ -64,7 +67,9 @@ function cfgOf(slide) {
       image: q.image && q.image.url ? q.image : null,
     };
   });
-  return { laps, questions };
+  const qs = Number(c.quizSec);
+  const quizSec = QUIZ_SECS.includes(qs) ? qs : QUIZ_SEC;
+  return { laps, questions, quizSec, quizMs: quizSec * 1000 };
 }
 
 // ── 결정적 시뮬레이션 ──
@@ -113,7 +118,7 @@ function modeAt(wins, t) {
 
 // t: startedAt 기준 ms. ansOf(k) → {correct, at}|null. guessAfter: 상대 차 오답 가정(ms) 또는 null
 // → { p(랩), mode: grid|drive|boost|slow|spin|quiz|done, spinF, k, arriveAt, cross[], finishAt, correct }
-function simulate(t, Q, laps, ansOf, guessAfter = null) {
+function simulate(t, Q, laps, ansOf, guessAfter = null, quizMs = QUIZ_SEC * 1000) {
   const res = { p: -0.006, mode: "grid", spinF: 0, k: 0, arriveAt: 0, cross: [], finishAt: null, correct: 0 };
   if (!(t >= 0)) return res;
   let t0 = 0, p0 = 0, wins = [];
@@ -134,7 +139,7 @@ function simulate(t, Q, laps, ansOf, guessAfter = null) {
     const a = ansOf(k);
     let at, ok;
     if (a) { at = Math.max(Number(a.at) || 0, tArr); ok = !!a.correct; }
-    else if (guessAfter != null && t >= tArr + guessAfter) { at = tArr + QUIZ_MS; ok = false; }
+    else if (guessAfter != null && t >= tArr + guessAfter) { at = tArr + quizMs; ok = false; }
     if (at == null || t < at) {
       res.p = target; res.mode = "quiz"; res.k = k; res.arriveAt = tArr;
       return res;
@@ -251,13 +256,13 @@ const frac = p => ((p % 1) + 1) % 1;
 const laneR = lane => R + (lane - 1.5) * LANE_W;
 
 // 조의 차 목록 계산 (학생·교사 공용)
-function groupCars(group, t, { Q, laps, rs, results, meId = null, mineSim = null, nameFn }) {
+function groupCars(group, t, { Q, laps, quizMs, rs, results, meId = null, mineSim = null, nameFn }) {
   return (group.memberIds || []).slice(0, 4).map((sid, lane) => {
     let sim;
     if (sid === meId && mineSim) sim = mineSim;
     else {
       const m = rs.answers.get(sid);
-      sim = simulate(t, Q, laps, k => m?.get(k) || null, GUESS_MS);
+      sim = simulate(t, Q, laps, k => m?.get(k) || null, quizMs + GUESS_EXTRA, quizMs);
     }
     const done = results.has(sid) || sim.mode === "done";
     return {
@@ -725,6 +730,9 @@ const CSS = `
 .race-hud .rh { background: rgba(24,20,14,.74); color: #fff; border-radius: 999px; padding: 4px 10px; font-weight: 800; font-size: 14px; font-variant-numeric: tabular-nums; letter-spacing: .02em; }
 .race-hud .rh-sub { font-weight: 600; font-size: 12px; }
 .race-hud .rh:empty { display: none; }
+.race-hud .rh-snd { margin-left: auto; pointer-events: auto; width: 34px; height: 34px; padding: 0; border: 0; border-radius: 50%; background: rgba(24,20,14,.62);
+  color: #fff; display: grid; place-items: center; cursor: pointer; }
+.race-hud .rh-snd.is-muted { background: rgba(24,20,14,.42); color: rgba(255,255,255,.75); }
 .race-count { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; font-size: clamp(48px, 12vw, 128px); font-weight: 900; color: #fff; text-shadow: 0 4px 18px rgba(0,0,0,.45); z-index: 3; }
 .race-count:empty { display: none; }
 .race-count.pop { animation: race-pop .9s ease-out; }
@@ -822,6 +830,7 @@ function Editor({ slide, lesson, update, ctx }) {
     config: {
       ...(slide.config || {}),
       laps: cfg.laps,
+      quizSec: cfg.quizSec,
       questions: cfg.questions.map(q => ({ id: q.id, question: q.question, options: q.options.map(o => ({ ...o })), answerId: q.answerId, image: q.image || null })),
     },
   });
@@ -835,6 +844,7 @@ function Editor({ slide, lesson, update, ctx }) {
   requestAnimationFrame(drawPreview);
 
   const lapsSeg = seg([1, 2, 3].map(v => ({ value: v, label: `${v}바퀴` })), cfg.laps, v => { cfg.laps = v; emit(); drawPreview(); });
+  const timeSeg = seg(QUIZ_SECS.map(v => ({ value: v, label: `${v}초` })), cfg.quizSec, v => { cfg.quizSec = v; cfg.quizMs = v * 1000; emit(); });
 
   const list = el("div", { class: "race-qlist" });
   function renderList() {
@@ -876,6 +886,7 @@ function Editor({ slide, lesson, update, ctx }) {
     el: el("div", { class: "race-edit" }, [
       prevWrap,
       el("div", { class: "field" }, [el("label", {}, "바퀴 수"), lapsSeg]),
+      el("div", { class: "field" }, [el("label", {}, "문제 푸는 시간"), timeSeg]),
       list,
       el("div", {}, [addBtn]),
     ]),
@@ -887,9 +898,11 @@ function Editor({ slide, lesson, update, ctx }) {
 function Student({ slide, me, ctx }) {
   ensureCss(ctx);
   const cfg = cfgOf(slide);
-  const Q = cfg.questions.length, laps = cfg.laps;
+  const Q = cfg.questions.length, laps = cfg.laps, QUIZ_MS = cfg.quizMs;
   const meId = me?.id || null;
   if (me?.id && me?.name) NAMES.set(me.id, me.name);
+  sound.attach();
+  const sndBtn = sound.soundToggle({ className: "rh-snd" });
   let act = ctx.activity() || { phase: "idle" };
   let race = null;
   let needDraw = true, lastSim = null, cdText = "", flashTm = null;
@@ -897,7 +910,7 @@ function Student({ slide, me, ctx }) {
 
   const track = new TrackView(() => ({ laps, Q }));
   const hudLap = el("span", { class: "rh" }), hudTime = el("span", { class: "rh" }), hudLast = el("span", { class: "rh rh-sub" });
-  const hud = el("div", { class: "race-hud" }, [hudLap, hudTime, hudLast]);
+  const hud = el("div", { class: "race-hud" }, [hudLap, hudTime, hudLast, sndBtn]);
   const countEl = el("div", { class: "race-count" });
   const flashEl = el("div", { class: "race-flash" });
   const stage = el("div", { class: "race-stage" }, [track.canvas, hud, countEl, flashEl]);
@@ -922,7 +935,7 @@ function Student({ slide, me, ctx }) {
     pings++; lastPing = t;
     ctx.send("race:ping", { slideId: slide.id });
   }
-  const mySim = t => simulate(t, Q, laps, k => race.mine.get(k) || null, null);
+  const mySim = t => simulate(t, Q, laps, k => race.mine.get(k) || null, null, QUIZ_MS);
 
   function makeRace(key, sa) {
     const rs = raceStore(key);
@@ -942,6 +955,7 @@ function Student({ slide, me, ctx }) {
     if (race) race.endSeen = act.phase === "ended" ? (race.endSeen ?? now()) : null; // endedAt 없을 때 멈출 시각
     checkMine();
     paintStatic();
+    if (act.phase !== "running" || !race?.group) sound.bgm(null);
     needDraw = true;
     loop.kick();
   }
@@ -1009,6 +1023,7 @@ function Student({ slide, me, ctx }) {
     const ai = q ? q.options.findIndex(o => o.id === q.answerId) : -1;
     if (correct) flash("정답! 부스터", true);
     else flash(`${optId ? "아쉬워요" : "시간 초과"}${ai >= 0 ? ` · 정답 ${optionLetter(ai)}` : ""}`, false);
+    sound.play(correct ? "boost" : "slip");
     hideQuiz();
   }
 
@@ -1110,7 +1125,7 @@ function Student({ slide, me, ctx }) {
     const t = tNow();
     const live = act.phase === "running";
     const results = resultsMap(ctx.responses(), race.startedAt, race.rs);
-    const cars = groupCars(race.group, t, { Q, laps, rs: race.rs, results, meId, mineSim: sim, nameFn });
+    const cars = groupCars(race.group, t, { Q, laps, quizMs: QUIZ_MS, rs: race.rs, results, meId, mineSim: sim, nameFn });
     if (track.draw(cars, dt, live)) needDraw = false;
 
     // HUD
@@ -1123,6 +1138,12 @@ function Student({ slide, me, ctx }) {
     const lapList = myRes?.lapMs?.length ? myRes.lapMs : lapsOf(cross);
     hudLast.textContent = lapList.length ? `지난 랩 ${fmtClock(lapList[lapList.length - 1])}` : "";
 
+    // 소리: 달리는 동안 배경음악, 이번 화면에서 달리다가 결승하면 팡파르
+    const racing = live && t >= 0 && !done;
+    if (racing) race.sawRun = true;
+    sound.bgm(racing ? "race" : null);
+    if (done && race.sawRun && !race.finSnd) { race.finSnd = true; sound.play("finish"); }
+
     // 카운트다운
     let txt = "";
     if (live && t < 0) txt = String(Math.ceil(-t / 1000));
@@ -1133,6 +1154,7 @@ function Student({ slide, me, ctx }) {
       countEl.classList.remove("pop");
       void countEl.offsetWidth;
       if (txt) countEl.classList.add("pop");
+      if (txt) sound.play(txt === "GO!" ? "go" : "count");
     }
     quizTimer();
 
@@ -1200,6 +1222,7 @@ function Student({ slide, me, ctx }) {
       loop.stop();
       ro?.disconnect();
       tk.clearAll();
+      sound.bgm(null); sound.detach(); sndBtn.release();
     },
   };
 }
@@ -1236,7 +1259,9 @@ function standingsTable(rows, { laps, Q, ended, nameFn, liveOf }) {
 function TeacherLive({ slide, ctx }) {
   ensureCss(ctx);
   const cfg = cfgOf(slide);
-  const Q = cfg.questions.length, laps = cfg.laps;
+  const Q = cfg.questions.length, laps = cfg.laps, quizMs = cfg.quizMs;
+  sound.attach();
+  const sndBtn = sound.soundToggle();
   let act = ctx.activity() || { phase: "idle" };
   let race = null; // { key, startedAt, rs, groups, tiles, endTimer, panelSig }
   let needDraw = true, cdText = "", previewView = null, built = false;
@@ -1262,7 +1287,7 @@ function TeacherLive({ slide, ctx }) {
   const statePill = el("span", { class: "pill" });
   const countPill = el("span", { class: "pill pill-muted" });
   const head = el("div", { class: "race-head" }, [
-    el("span", { class: "race-title" }, slide.title || "레이싱 퀴즈"), statePill, countPill, el("span", { class: "race-sp" }), ctl1.el,
+    el("span", { class: "race-title" }, slide.title || "레이싱 퀴즈"), statePill, countPill, el("span", { class: "race-sp" }), sndBtn, ctl1.el,
   ]);
   const grid = el("div", { class: "race-grid" });
   const countEl = el("div", { class: "race-count" });
@@ -1548,7 +1573,7 @@ function TeacherLive({ slide, ctx }) {
     }
     idleInfo.hidden = !!race;
     if (!race) {
-      const t = `참여 ${rosterIds().length}명 · 시작을 누르면 조가 편성돼요`;
+      const t = `참여 ${rosterIds().length}명 · 문제마다 ${cfg.quizSec}초 · 시작을 누르면 조가 편성돼요`;
       if (idleInfo.textContent !== t) idleInfo.textContent = t;
     }
   }
@@ -1557,7 +1582,7 @@ function TeacherLive({ slide, ctx }) {
     const map = new Map();
     for (const g of race.groups) for (const sid of g.memberIds || []) {
       const m = race.rs.answers.get(sid);
-      const s = simulate(t, Q, laps, k => m?.get(k) || null, GUESS_MS);
+      const s = simulate(t, Q, laps, k => m?.get(k) || null, quizMs + GUESS_EXTRA, quizMs);
       map.set(sid, {
         lapMs: lapsOf(s.cross), correct: s.correct,
         label: s.mode === "grid" ? "출발 전" : s.mode === "done" ? "결승" : `LAP ${Math.min(laps, s.cross.length + 1)}`,
@@ -1611,6 +1636,7 @@ function TeacherLive({ slide, ctx }) {
 
   function frame(dt) {
     if (!race) {
+      sound.bgm(null);
       if (needDraw && (focus ? focusView : previewView)?.draw([], 0, false)) needDraw = false;
       return;
     }
@@ -1621,16 +1647,21 @@ function TeacherLive({ slide, ctx }) {
     const ft = focusTile();
     if (ft) {
       // 크게 보기: 보이는 캔버스(이 조)만 그린다 — 숨은 미니 트랙은 쉰다
-      const cars = groupCars(ft.group, t, { Q, laps, rs: race.rs, results, nameFn });
+      const cars = groupCars(ft.group, t, { Q, laps, quizMs, rs: race.rs, results, nameFn });
       drawn = focusView.draw(cars, dt, liveRun);
       paintFocusStatus(cars, t, results);
     } else {
       for (const tile of race.tiles) {
-        const cars = groupCars(tile.group, t, { Q, laps, rs: race.rs, results, nameFn });
+        const cars = groupCars(tile.group, t, { Q, laps, quizMs, rs: race.rs, results, nameFn });
         drawn = tile.view.draw(cars, dt, liveRun) && drawn;
       }
     }
     if (drawn) needDraw = false;
+    // 소리: 경주 중 배경음악(전원 완주하면 끔), 새로 결승한 학생마다 짧은 소리
+    const assigned = race.groups.reduce((n, g) => n + (g.memberIds || []).length, 0);
+    sound.bgm(liveRun && t >= 0 && results.size < assigned ? "race" : null);
+    if (race.finN == null) race.finN = results.size;
+    else if (results.size > race.finN) { race.finN = results.size; if (liveRun) sound.play("finishSoft"); }
     let txt = "";
     if (liveRun && t < 0) txt = String(Math.ceil(-t / 1000));
     else if (liveRun && t < 800) txt = "GO!";
@@ -1640,6 +1671,7 @@ function TeacherLive({ slide, ctx }) {
       countEl.classList.remove("pop");
       void countEl.offsetWidth;
       if (txt) countEl.classList.add("pop");
+      if (txt) sound.play(txt === "GO!" ? "go" : "count");
     }
   }
   const busy = () => (focus ? focusView.busy() : !!race?.tiles?.some(t => t.view.busy()));
@@ -1701,6 +1733,7 @@ function TeacherLive({ slide, ctx }) {
       document.removeEventListener("keydown", onKey);
       if (race?.endTimer != null) tk.cancel(race.endTimer);
       tk.clearAll();
+      sound.bgm(null); sound.detach(); sndBtn.release();
     },
   };
 }

@@ -401,7 +401,7 @@ ctx = {
 | video | 동영상 | media | `{url:''}` |
 | videoquiz | 동영상 퀴즈 | media | `{url:'', questions:[]}` |
 | dino | 공룡 점프 | game | `{questions:[], jumpsPerQuestion:3}` |
-| race | 레이싱 퀴즈 | game | `{questions:[], laps:2}` |
+| race | 레이싱 퀴즈 | game | `{questions:[], laps:2, quizSec:20}` |
 
 **ink** (`js/slides/ink.js`)
 - 모드: `none`(발표) 학생 readOnly — **교사 필기는 whole scope에 저장되어 학생에게 실시간 표시**; `whole` 모두 같은 캔버스(scope whole); `individual` 학생 각자(scope individual/studentId); `group` 모둠 공유(scope group/groupId), 미배정 학생은 `모둠을 기다리고 있어요` 한 줄 → 배정되면 자동 전환.
@@ -452,8 +452,9 @@ ctx = {
 - config `{questions:[{id, question, options:[{id,text}]×4, answerId}], laps:2}` (4지선다 고정, 정답 1개 교사 선택). questions ≥1.
 - **조 편성**(교사 `[시작]` 시 1회): `ids = online ∩ participants`(없으면 participants), `groupStudents(ids, 4)` → `activity = { phase:'running', startedAt: Date.now()+3000 /*3초 카운트다운*/, groups:[{id:'g1', name:'1조', memberIds}] }`. n=0이면 toast('참여 학생이 없어요'). lane = memberIds 인덱스(0~3).
 - **주행**: 입력 없음. 자동 주행, 기본 속도 = `1랩/12초`. 트랙 = 캔버스 둥근 직사각형(스타디움형) 오벌, 연석(빨강/흰색 줄무늬), 체크 무늬 결승선, 4개 레인. 차는 위에서 본 카트(색 4종: 초록·빨강·파랑·노랑) + 이름표.
-- **퀴즈 체크포인트**: Q문항, k번째(1..Q) 문제는 진행도 `laps*k/(Q+1)`(랩 단위)에서 차가 정지하고 4지선다 오버레이(15초 제한, 미응답=오답).
-- **정답** = 부스터: 2.5초 동안 속도 ×2.0(불꽃 효과). **오답** = 미끄러짐: 1초 정지(스핀) 후 2.5초 동안 ×0.5.
+- **퀴즈 체크포인트**: Q문항, k번째(1..Q) 문제는 진행도 `laps*k/(Q+1)`(랩 단위)에서 차가 정지하고 4지선다 오버레이(제한 = `config.quizSec`, 편집기 '문제 푸는 시간' 10·15·20·30·45·60초, 기본 20초 — v2.11. 미응답=오답. 시뮬레이션에 넘겨 모든 화면이 같은 값).
+- **정답** = 부스터: 2.5초 동안 속도 ×2.0(불꽃 효과). **오답** = 미끄러짐: 1.5초 정지(스핀, v2.11에서 1초→1.5초) 후 2.5초 동안 ×0.5.
+- **효과음(v2.11, `js/slides/game-sound.js`)**: Web Audio로 합성(소리 파일 없음), 모두 작게. 학생 — 달리는 동안 배경음악, 카운트다운 삑·GO, 정답 부스터 쉭, 오답 타이어 끼익, 결승 팡파르(이 화면에서 달리다가 결승했을 때만). 교사 — 경주 중 배경음악(전원 완주하면 끔), 카운트다운, 학생이 결승할 때마다 짧은 소리. 공룡 점프도 같은 모듈(배경음악·점프·충돌·정답·오답·완주). HUD·머리 줄의 🔊 버튼 = 기기마다 음소거(`localStorage hada:gameSound`). 브라우저 정책상 첫 탭 뒤부터 소리가 난다(게임 화면이 붙어 있는 동안 첫 누르기에서 깨움), 탭이 숨겨지면 배경음악 멈춤.
 - **결정적 시뮬레이션 + 이산 이벤트**(위치 스트림 금지): 각 클라이언트는 같은 규칙으로 모든 차를 시뮬레이션한다. 학생은 `race:answer {sid, gid, k, correct, at /* startedAt 기준 ms */}`(문항당 1회)와 `race:finish {sid, gid, lapMs:[…], totalMs, correct, total}`만 보낸다. 수신자는 상대 차가 체크포인트 k에 도달하면 해당 answer 이벤트가 올 때까지 정지 상태로 그린다.
 - **랩타임**: 랩 경계 통과 시 `lapMs.push(now - lapStart)`(문제 시간 포함). 결승(진행도 ≥ laps) → `submit({lapMs,totalMs,correct,total,gid}, {itemKey:'result', score:correct, timeMs:totalMs})` + `race:finish`.
 - **학생 화면**: 자기 조 트랙만(최대 4대, 이름표, 랩 `1/2`, 지난 랩타임). 미배정(늦게 입장) → `다음 경기에 참여해요`. 결승 후 조 내 순위·랩타임 카드, 다른 차 계속 표시.
