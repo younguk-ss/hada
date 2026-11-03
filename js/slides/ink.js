@@ -834,6 +834,9 @@ function Student({ slide, session, me, ctx }) {
     stage = null;
   }
   // 도구바 위치(아래 가로 / 왼쪽 세로) 중 맞춤 대상이 더 크게 보이는 쪽을 골라 그만큼만 맞춤에서 비운다
+  // v2.12: 자리를 바꾼 직후의 측정은 옛 자리일 수 있다(동작 줄이기 설정의 짧은 전환이 원인이었음) → 다음 프레임에 한 번 더 재고,
+  //        잰 값이 도구바가 차지할 수 있는 폭을 넘으면 잘라 슬라이드가 한쪽으로 밀리지 않게
+  let barRaf = 0;
   function placeBar() {
     const z = viewer?.zoom;
     if (!z || !stage || !bar) return;
@@ -845,10 +848,13 @@ function Student({ slide, session, me, ctx }) {
     const bottomH = page(W - 20, H - 84 - 20);            // 도구바(56) + 아래 여백(8+틈)
     const sideH = page(W - 120 - 20, H - 20);             // 2열(100) + 왼쪽 여백(8+틈)
     const side = sideH > bottomH * 1.04 && H >= 280;
+    const moved = wrap.classList.contains("bar-side") !== side;
     wrap.classList.toggle("bar-side", side);
     wrap.classList.toggle("bar-compact", side && H < 540);
     const sr = stage.getBoundingClientRect(), br = bar.getBoundingClientRect();
-    z.setInsets(side ? { left: Math.max(0, br.right - sr.left) + 2 } : { bottom: Math.max(0, sr.bottom - br.top) + 2 });
+    z.setInsets(side ? { left: Math.min(200, Math.max(0, br.right - sr.left) + 2) }
+      : { bottom: Math.min(160, Math.max(0, sr.bottom - br.top) + 2) });
+    if (moved && !barRaf) barRaf = requestAnimationFrame(() => { barRaf = 0; placeBar(); });
   }
   const ro = new ResizeObserver(() => placeBar());
   ro.observe(wrap);
@@ -891,7 +897,7 @@ function Student({ slide, session, me, ctx }) {
     el: wrap,
     onActivity: check,
     onSession: check,
-    destroy() { ro.disconnect(); teardown(); },
+    destroy() { ro.disconnect(); cancelAnimationFrame(barRaf); teardown(); },
   };
 }
 

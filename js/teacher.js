@@ -40,7 +40,8 @@ import { joinSessionChannel } from "./realtime.js";
 import { getSlideType, listSlideTypes, createSlide, CATEGORIES, effectiveMode, injectCss, mountSlideHost } from "./slides/index.js";
 import { renderSlide } from "./lesson-view.js";
 import { openStudentPrint, openBlankPrint, printStudents, printRecordView, reviewUrl } from "./print.js";
-import { wsPages, wsForced, setWsForce, wsPageTitle, wsStats, makeWsSessionView, wsCss } from "./worksheet.js";
+import { wsPages, wsForced, setWsForce, wsPageTitle, wsStats, makeWsSessionView, wsCss, wsRecord, wsLastTs } from "./worksheet.js";
+import { pageRectFor } from "./zoom-view.js";
 import { createPopupView, popOf, findPopSlide, setPop, freshHotspotIds, hotspotsOf, popSlideFor } from "./popup.js";
 
 const TABS = ["lessons", "records", "students", "code"];
@@ -115,6 +116,23 @@ const TEACHER_CSS = `
 .t-loading { min-height:100vh; min-height:100dvh; display:grid; place-items:center; }
 .t-print-only { display:none; }
 @media print { .t-print-only { display:block; } .chips { display:none !important; } }
+/* 수업 기록 '학습지'(v2.12): 학생 한 명의 학습지를 종이 부분만 크게 */
+.t-ws-chips .chip { gap:6px; }
+.t-ws-chips .chip.is-empty { color:var(--muted); }
+.t-ws-chips .chip.active .ws-cnt { background:rgba(255,255,255,.22); color:#fff; }
+.t-ws-head { display:flex; align-items:center; gap:6px; margin:14px 0 12px; min-width:0; }
+.t-ws-who { flex:1; min-width:0; display:flex; align-items:baseline; gap:4px 10px; flex-wrap:wrap; }
+.t-ws-who strong { font-size:17px; }
+.t-ws-who span { font-size:13px; color:var(--muted); font-variant-numeric:tabular-nums; }
+.t-ws-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(min(100%, 360px), 1fr)); gap:18px; align-items:start; }
+.t-ws-card { margin:0; display:grid; gap:8px; min-width:0; }
+.t-ws-card figcaption { display:flex; align-items:center; gap:8px; min-width:0; font-size:14px; font-weight:650; color:var(--ink-2); }
+.t-ws-card figcaption .muted { font-weight:500; font-size:12.5px; }
+.t-wsp { position:relative; overflow:hidden; aspect-ratio:0.7071; background:#fff; border:1px solid var(--line); border-radius:8px; box-shadow:var(--shadow-1); }
+.t-wsp-in { position:absolute; left:0; top:0; width:100%; visibility:hidden; }
+.t-wsp.ready .t-wsp-in { visibility:visible; }
+.t-wsp-in > .slide-frame { width:100% !important; margin:0; border-radius:0; box-shadow:none; }
+@media print { .t-ws-grid { grid-template-columns:1fr 1fr; } .t-ws-card { break-inside:avoid; } .t-wsp { box-shadow:none; } }
 `;
 function ensureCss() { injectCss("teacher-views", TEACHER_CSS); }
 
@@ -2065,12 +2083,14 @@ export function sessionDetailView({ id } = {}) {
       if (r && r.error) { toast("이름을 바꾸지 못했어요", { type: "error" }); return; }
       if (!disposed) render();
     }
-    // 학생별 보기에서는 그 학생 결과를 학습지처럼, 슬라이드별 보기는 화면 그대로 인쇄
+    // 학생별 보기에서는 그 학생 결과를 학습지처럼, 학습지 보기는 그 학생 학습지만, 슬라이드별 보기는 화면 그대로 인쇄
     async function printView() {
       const cur = findSession(id);
       if (!cur) return;
       if (mode === "students" && picked) {
         await printStudents({ session: cur, studentIds: [picked], slideIds: (cur.slidesSnapshot || []).map(x => x.id), teacher });
+      } else if (mode === "worksheet" && picked && wsPages(cur).length) {
+        await printStudents({ session: cur, studentIds: [picked], slideIds: wsPages(cur).map(p => p.id), teacher });
       } else {
         await printRecordView();
       }
@@ -2120,7 +2140,11 @@ export function sessionDetailView({ id } = {}) {
           renderContent();
         },
       }, label);
-      const seg = el("div", { class: "seg", role: "group" }, [segBtn("slides", "슬라이드별"), segBtn("students", "학생별")]);
+      const hasWs = wsPages(s).length > 0;
+      if (!hasWs && mode === "worksheet") mode = "slides";
+      const seg = el("div", { class: "seg", role: "group" }, [
+        segBtn("slides", "슬라이드별"), segBtn("students", "학생별"), hasWs ? segBtn("worksheet", "학습지") : null,
+      ]);
       box.replaceChildren(head, meta, el("div", { class: "t-detail-bar" }, seg), content);
       renderContent();
     }
@@ -2130,9 +2154,10 @@ export function sessionDetailView({ id } = {}) {
       const s = findSession(id);
       if (!s) return;
       const slides = s.slidesSnapshot || [];
-      if (!slides.length) { content.replaceChildren(el("div", { class: "empty empty-box" }, "슬라이드가 없어요")); return; }
       // 학습지 쪽은 슬라이드 뒤에 이어서(개별 필기 갤러리 / 그 학생 필기)
       const ws = wsPages(s).map((p, i) => ({ ...p, title: wsPageTitle(p, i), mode: "individual" }));
+      if (mode === "worksheet" && ws.length) { renderWorksheet(s, ws); return; }
+      if (!slides.length) { content.replaceChildren(el("div", { class: "empty empty-box" }, "슬라이드가 없어요")); return; }
       // 팝업 상호작용(v2.9)은 그 슬라이드 바로 뒤에 '팝업' 표지로
       const popsOf = (sl) => hotspotsOf(sl).map(h => popSlideFor(h, sl));
       if (mode === "slides") {
@@ -2172,6 +2197,82 @@ export function sessionDetailView({ id } = {}) {
       content.replaceChildren(chips, el("h2", { class: "t-print-only" }, st ? studentLabel(st) : "학생"), ...sections, ...wsSections);
     }
 
+    // 학습지(v2.12): 학생을 골라 그 학생 학습지만 — 쪽마다 종이 부분을 잘라 크게. ←/→(또는 ◀ ▶)로 다음 학생
+    // 칩의 숫자 = 그 학생이 직접 쓴 쪽 수(교사 첨삭 제외, worksheet.js wsLastTs)
+    function renderWorksheet(s, ws) {
+      wsCss();
+      const parts = participantsOf(s);
+      if (!parts.length) { content.replaceChildren(el("div", { class: "empty empty-box" }, "아직 아무도 없어요")); return; }
+      if (!picked || !parts.some(p => p.id === picked)) picked = parts[0].id;
+      const wrote = (sid) => ws.filter(p => wsLastTs(wsRecord(s, sid, p.id), sid) > 0).length;
+      const label = (p) => (p.st ? studentLabel(p.st) : "학생");
+      const chips = el("div", { class: "chips no-print t-ws-chips" }, parts.map(p => {
+        const n = wrote(p.id);
+        return el("button", {
+          class: "chip" + (p.id === picked ? " active" : "") + (n ? "" : " is-empty"), type: "button",
+          title: n ? `학습지 ${n}쪽 작성` : "아직 쓰지 않았어요",
+          onClick: () => { if (picked !== p.id) { picked = p.id; renderContent(); } },
+        }, [label(p), n ? el("span", { class: "ws-cnt" }, String(n)) : null]);
+      }));
+      const at = parts.findIndex(p => p.id === picked);
+      const cur = parts[at];
+      const n = wrote(picked);
+      const head = el("div", { class: "t-ws-head" }, [
+        el("button", { class: "btn btn-icon btn-ghost no-print", type: "button", "aria-label": "이전 학생", title: "이전 학생 (←)", disabled: at <= 0, onClick: () => wsNav(-1) }, icon("chevron-left")),
+        el("div", { class: "t-ws-who" }, [el("strong", {}, label(cur)), el("span", {}, n ? `학습지 ${ws.length}쪽 중 ${n}쪽 작성` : "아직 쓰지 않았어요")]),
+        el("button", { class: "btn btn-icon btn-ghost no-print", type: "button", "aria-label": "다음 학생", title: "다음 학생 (→)", disabled: at >= parts.length - 1, onClick: () => wsNav(1) }, icon("chevron-right")),
+      ]);
+      const grid = el("div", { class: "t-ws-grid" }, ws.map((p, k) => el("figure", { class: "t-ws-card" }, [
+        wsPageView(s, p, picked),
+        el("figcaption", {}, [el("span", { class: "t-sum-num" }, String(k + 1)), p.title,
+          wsLastTs(wsRecord(s, picked, p.id), picked) ? null : el("span", { class: "muted" }, "· 빈 쪽")]),
+      ])));
+      content.replaceChildren(chips, head, grid);
+    }
+    function wsNav(d) {
+      const s = findSession(id);
+      if (!s) return;
+      const parts = participantsOf(s);
+      const at = parts.findIndex(p => p.id === picked);
+      const next = parts[at + d];
+      if (!next) return;
+      picked = next.id;
+      renderContent();
+    }
+    // 학습지 한 쪽(읽기 전용): 16:10 틀을 그리고 종이 영역(zoom-view pageRectFor)만 보이게 자른다
+    function wsPageView(s, page, studentId) {
+      const box = el("div", { class: "t-wsp" });
+      const inner = el("div", { class: "t-wsp-in" });
+      box.appendChild(inner);
+      try {
+        const v = renderSlide({ root: inner, slide: page, session: s, scope: "individual", scopeId: studentId, readOnly: true });
+        if (v) frames.push(v);
+      } catch (e) {
+        console.warn("[detail] 학습지 표시 실패", e);
+        box.classList.add("ready");
+        inner.replaceChildren(el("div", { class: "muted" }, "이 쪽을 불러오지 못했어요"));
+        return box;
+      }
+      const show = (r) => {
+        const pw = r.x1 - r.x0, ph = r.y1 - r.y0;
+        if (pw > 0 && ph > 0) {
+          box.style.aspectRatio = String((pw * 1.6) / ph);
+          Object.assign(inner.style, { width: 100 / pw + "%", left: (-r.x0 / pw) * 100 + "%", top: (-r.y0 / ph) * 100 + "%" });
+        }
+        box.classList.add("ready");
+      };
+      pageRectFor(page.thumb || page.bg).then(({ paper }) => show(paper), () => show({ x0: 0, y0: 0, x1: 1, y1: 1 }));
+      return box;
+    }
+    const onWsKey = (e) => {
+      if (mode !== "worksheet" || disposed || e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.isComposing) return;
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      if (isTypingTarget(e.target) || document.documentElement.classList.contains("has-layer")) return;
+      e.preventDefault();
+      wsNav(e.key === "ArrowLeft" ? -1 : 1);
+    };
+    document.addEventListener("keydown", onWsKey);
+
     // 학생 한 명의 필기(읽기 전용)
     function inkFor(s, slide, studentId) {
       const R = s.records || {};
@@ -2210,6 +2311,7 @@ export function sessionDetailView({ id } = {}) {
 
     return () => {
       disposed = true;
+      document.removeEventListener("keydown", onWsKey);
       offStore();
       closePop();
       clearFrames();

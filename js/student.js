@@ -76,6 +76,26 @@ const CSS = `
   .stu-review .slide-count { min-width:44px; font-size:14px; }
   .stu-review .stu-top > .btn-ghost { padding:0 8px; }
 }
+/* 복습 미리보기 띠(v2.12): 머리 줄 바로 아래. 띠를 접으면(display:none) 줄 번호가 밀리지 않게 칸을 정해 둔다 */
+.stu-review { grid-template-rows:auto auto minmax(0, 1fr); }
+.stu-review > .stu-top { grid-row:1; }
+.stu-review > .rv-strip { grid-row:2; }
+.stu-review > .stu-stage { grid-row:3; }
+.rv-strip { position:relative; z-index:19; display:flex; align-items:center; gap:8px; min-width:0; overflow-x:auto; overflow-y:hidden;
+  padding:8px max(12px, var(--sar)) 8px max(12px, var(--sal)); background:var(--surface); border-bottom:1px solid var(--line);
+  overscroll-behavior-x:contain; touch-action:pan-x; scrollbar-width:thin; }
+.rv-strip[hidden] { display:none; }
+.rv-strip .rv-item { width:104px; touch-action:pan-x; }
+.rv-thumb { position:absolute; inset:0; overflow:hidden; background:#fff; pointer-events:none; }
+.rv-thumb > * { width:100%; height:100%; }
+.rv-sep { flex:none; align-self:stretch; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px;
+  margin-left:2px; padding:0 2px 0 10px; border-left:1px solid var(--line); color:var(--ink-2); font-size:11px; font-weight:700; white-space:nowrap; }
+.rv-sep span:first-child { font-size:18px; line-height:1; }
+.rv-count { gap:2px; cursor:pointer; }
+.rv-count .icon { color:var(--muted); transition:transform .15s ease; }
+.rv-count[aria-expanded="true"] .icon { transform:rotate(180deg); }
+@media (max-width:520px), (max-height:560px) { .rv-strip { gap:6px; padding-top:6px; padding-bottom:6px; } .rv-strip .rv-item { width:88px; } }
+@media (max-width:420px) { .rv-count .icon { display:none; } }
 `;
 
 const MODE_LABEL = { none: "발표", whole: "전체", individual: "개별", group: "모둠" };
@@ -581,6 +601,16 @@ export function studentLiveView({ id } = {}) {
 //       보내지 않고 위쪽에 [수업 들어가기]만 띄운다. 같은 탭에서 새로고침했을 때만 보던 슬라이드를 이어서 연다(sessionStorage).
 //       수업 때 선생님·친구들이 쓴 기록(전체·모둠 칠판 필기, 담벼락·워드클라우드 등 응답)은 그대로 보이고, 문제는 복습하는 학생도 다시 푼다.
 const REVIEW_POS = "hada:review:"; // + sessionId:studentId → 이 탭에서 마지막으로 본 슬라이드(새로고침용)
+// 가정(v2.12): 복습 미리보기 띠 — 머리 줄 아래 번호 붙은 작은 그림(캔바·PPT처럼), 지금 슬라이드 강조, 누르면 이동. 학습지 쪽은 📝 구분선 뒤에.
+//       [n / N]을 눌러 접고 펴며 기기마다 기억(localStorage). 처음에는 화면 높이가 넉넉할 때(560px 이상)만 편다.
+//       그림은 띠에 보일 때 그리고(IntersectionObserver), 필기 슬라이드·학습지는 내가 쓴 필기까지 얹는다. 떠난 슬라이드는 다시 그린다.
+//       학습지가 있으면 오른쪽 가장자리 📝 탭: 슬라이드 ↔ 학습지(마지막으로 본 쪽)를 바로 오간다.
+const STRIP_KEY = "hada:reviewStrip";
+function stripPref() {
+  try { const v = localStorage.getItem(STRIP_KEY); if (v === "on" || v === "off") return v === "on"; } catch {}
+  return (window.innerHeight || 800) >= 560;
+}
+const reduceMotion = () => { try { return matchMedia("(prefers-reduced-motion: reduce)").matches; } catch { return false; } };
 const ANSWER_TYPES = new Set(["mcq", "blank", "dragdrop", "short"]);
 // 페이지를 새로고침해서 바로 이 복습 화면이 열렸는가(그때만 보던 곳 이어서) — 첫 화면에서 한 번만 쓴다
 const LOAD_HASH = typeof location !== "undefined" ? location.hash : "";
@@ -638,7 +668,10 @@ export function studentReviewView({ id } = {}) {
   const answerBtn = el("button", { class: "btn btn-sm", type: "button", hidden: true, onClick: toggleAnswer }, [icon("eye", 16), answerLabel]);
   const prevBtn = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "이전", onClick: () => step(-1) }, icon("chevron-left"));
   const nextBtn = el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "다음", onClick: () => step(1) }, icon("chevron-right"));
-  const countEl = el("span", { class: "slide-count" }, "");
+  let stripOn = stripPref();
+  const countText = el("span", {}, "");
+  const countEl = el("button", { class: "slide-count rv-count", type: "button", "aria-controls": "rv-strip", onClick: () => setStrip(!stripOn, true) },
+    [countText, icon("chevron-down", 14)]);
   const exitBtn = el("button", { class: "btn btn-ghost", type: "button", onClick: () => go("/student/records") }, "나가기");
   // 지금 진행 중인 수업이면 선생님 수업으로 들어가는 버튼(복습은 그대로 내 페이스)
   const liveBtn = el("button", { class: "btn btn-sm btn-primary stu-live-btn", type: "button", hidden: true,
@@ -652,7 +685,10 @@ export function studentReviewView({ id } = {}) {
   const resume = reviewReload && location.hash === LOAD_HASH;
   reviewReload = false;
   const stage = el("div", { class: "stu-stage" }, [el("div", { class: "center" }, el("span", { class: "spinner", "aria-label": "불러오는 중" }))]);
-  const rroot = el("div", { class: "stu stu-review" }, [top, stage]);
+  const strip = el("nav", { class: "rv-strip", id: "rv-strip", "aria-label": "슬라이드 미리보기", hidden: true });
+  const wsTabEl = wsTab({ onClick: jumpWs });
+  wsTabEl.set({ hidden: true });
+  const rroot = el("div", { class: "stu stu-review" }, [top, strip, stage, wsTabEl]);
   mount(rroot);
   // 팝업 상호작용: 슬라이드의 핀을 눌러 스스로 열고 닫는다(복습용 세션 보기로)
   let localPop = null;
@@ -666,6 +702,121 @@ export function studentReviewView({ id } = {}) {
   function destroyHost() {
     if (host) { try { host.destroy(); } catch (e) { console.warn("[review] host.destroy", e); } }
     host = null;
+  }
+
+  // ── 미리보기 띠 ──
+  let stripList = null, stripItems = [], stripActive = -1, stripIO = null;
+  const stripSeen = new Set(); // 띠에 보이는 칸 번호
+  strip.addEventListener("click", (e) => {
+    const b = e.target.closest(".rv-item");
+    if (b && strip.contains(b)) goTo(Number(b.dataset.i));
+  });
+  // 마우스 휠(세로)로도 띠를 가로로 넘긴다
+  strip.addEventListener("wheel", (e) => {
+    if (Math.abs(e.deltaY) <= Math.abs(e.deltaX) || strip.scrollWidth <= strip.clientWidth) return;
+    e.preventDefault();
+    strip.scrollLeft += e.deltaY;
+  }, { passive: false });
+  // 필기 슬라이드·학습지 그림에는 내 필기(개별 칸)도 얹는다 — 복습 화면에 보이는 것과 같게
+  function stripThumb(s, sl) {
+    let view = sl;
+    const rec = sl.type === "ink" ? s.records?.[me.id]?.[sl.id] : null;
+    if (rec) {
+      const rm = new Set(rec.removed || []);
+      const fresh = (x) => !!x && !(x.id && rm.has(x.id));
+      view = {
+        ...sl,
+        strokes: [...(sl.strokes || []).filter((x, i) => !!x && !(x.id ? rm.has(x.id) : rm.has("#" + i))), ...(rec.strokes || []).filter(fresh)],
+        texts: [...(sl.texts || []).filter(fresh), ...(rec.texts || []).filter(fresh)],
+      };
+    }
+    const def = getSlideType(sl.type);
+    try {
+      const n = typeof def.thumb === "function" ? def.thumb(view) : null;
+      if (n instanceof Node) return n;
+    } catch (e) { console.warn("[review] 미리보기 그림 실패", sl.type, e); }
+    return el("div", { class: "thumb-generic" }, [el("span", { class: "thumb-icon", html: def.icon || "" }), el("span", { class: "thumb-title" }, sl.title || def.label || "")]);
+  }
+  function fillThumb(i) {
+    const b = stripItems[i], s = findSession(id), sl = stripList && stripList[i];
+    if (!b || !s || !sl) return;
+    b._filled = true;
+    b.firstChild.replaceChildren(stripThumb(s, sl));
+  }
+  function buildStrip(list, nSlides) {
+    stripIO?.disconnect();
+    stripSeen.clear();
+    stripList = list; stripActive = -1;
+    stripItems = list.map((sl, i) => {
+      const label = i < nSlides ? `${i + 1}. ${sl.title || getSlideType(sl.type).label || ""}` : `${i + 1}. ${sl.title || "학습지"}`;
+      return el("button", { class: "rail-item rv-item", type: "button", "data-i": String(i), title: label, "aria-label": label },
+        [el("div", { class: "rv-thumb" }), el("span", { class: "rail-num" }, String(i + 1))]);
+    });
+    const kids = stripItems.slice();
+    if (nSlides < list.length) kids.splice(nSlides, 0, el("div", { class: "rv-sep", "aria-hidden": "true" }, [el("span", {}, "📝"), el("span", {}, "학습지")]));
+    strip.replaceChildren(...kids);
+    if (typeof IntersectionObserver !== "function") { stripItems.forEach((_, i) => fillThumb(i)); return; }
+    stripIO = new IntersectionObserver((ents) => {
+      for (const en of ents) {
+        const i = Number(en.target.dataset.i);
+        if (!en.isIntersecting) { stripSeen.delete(i); continue; }
+        stripSeen.add(i);
+        if (!en.target._filled) fillThumb(i);
+      }
+    }, { root: strip, rootMargin: "0px 320px" });
+    stripItems.forEach(b => stripIO.observe(b));
+  }
+  function syncStrip(list) {
+    if (stripList !== list) buildStrip(list, slidesSrc ? slidesSrc.length : list.length);
+    if (stripActive === idx) return;
+    const old = stripItems[stripActive];
+    if (old) {
+      old.classList.remove("active");
+      old.removeAttribute("aria-current");
+      // 방금 떠난 슬라이드: 거기서 쓴 필기가 보이게 다시 그린다(보이지 않으면 보일 때)
+      if (old._filled) { old._filled = false; if (stripSeen.has(stripActive)) fillThumb(stripActive); }
+    }
+    stripActive = idx;
+    const b = stripItems[idx];
+    if (b) { b.classList.add("active"); b.setAttribute("aria-current", "true"); }
+    revealActive();
+  }
+  // 지금 슬라이드 칸이 띠 밖이면 가운데로(이미 보이면 그대로 — 누른 칸이 손가락 밑에서 달아나지 않게)
+  function revealActive() {
+    const b = stripItems[stripActive];
+    if (!b || strip.hidden) return;
+    const L = strip.scrollLeft, W = strip.clientWidth, x = b.offsetLeft, w = b.offsetWidth;
+    if (x >= L + 12 && x + w <= L + W - 12) return;
+    const left = Math.max(0, x - (W - w) / 2);
+    try { strip.scrollTo({ left, behavior: reduceMotion() ? "auto" : "smooth" }); } catch { strip.scrollLeft = left; }
+  }
+  // 화면 크기·방향이 바뀌면 지금 칸이 띠 밖으로 밀려날 수 있다
+  let revealTimer = 0;
+  const onResize = () => { clearTimeout(revealTimer); revealTimer = setTimeout(revealActive, 150); };
+  window.addEventListener("resize", onResize);
+  function setStrip(on, user) {
+    stripOn = !!on;
+    strip.hidden = !stripOn || !stripList;
+    countEl.setAttribute("aria-expanded", String(stripOn));
+    countEl.title = stripOn ? "미리보기 접기" : "슬라이드 미리보기";
+    if (user) { try { localStorage.setItem(STRIP_KEY, stripOn ? "on" : "off"); } catch {} }
+    if (!strip.hidden) revealActive();
+  }
+
+  // ── 학습지 바로 가기(오른쪽 📝 탭): 슬라이드 ↔ 학습지 마지막으로 본 쪽 ──
+  let backSlide = 0, backWs = -1;
+  function jumpWs() {
+    const nS = slidesSrc ? slidesSrc.length : 0;
+    if (!slides || slides.length <= nS) return;
+    if (idx >= nS) goTo(clamp(backSlide, 0, Math.max(0, nS - 1)));
+    else goTo(backWs >= nS ? backWs : nS);
+  }
+  function syncWsTab() {
+    const nS = slidesSrc ? slidesSrc.length : 0, nW = slidesWs ? slidesWs.length : 0;
+    if (!nS || !nW) { wsTabEl.set({ hidden: true }); return; }
+    const onWs = idx >= nS;
+    if (onWs) backWs = idx; else backSlide = idx;
+    wsTabEl.set({ hidden: false, open: onWs, label: onWs ? "슬라이드" : "학습지" });
   }
 
   function reviewSlides(s) {
@@ -704,12 +855,21 @@ export function studentReviewView({ id } = {}) {
     setText(titleEl, "title", s.title || "");
     titleEl.title = s.title || "";
     liveBtn.hidden = s.status !== "live";
-    if (!n) { destroyHost(); stage.replaceChildren(el("div", { class: "empty" }, "슬라이드가 없어요")); return; }
+    if (!n) {
+      destroyHost(); strip.hidden = true; wsTabEl.set({ hidden: true });
+      stage.replaceChildren(el("div", { class: "empty" }, "슬라이드가 없어요"));
+      return;
+    }
     idx = clamp(idx, 0, n - 1);
     const slide = list[idx];
-    setText(countEl, "count", `${idx + 1} / ${n}`);
+    setText(countText, "count", `${idx + 1} / ${n}`);
     prevBtn.disabled = idx <= 0;
     nextBtn.disabled = idx >= n - 1;
+    const firstStrip = !stripList;
+    syncStrip(list);
+    if (firstStrip) setStrip(stripOn);
+    syncWsTab();
+    wsPrefetch(list, idx); // 앞뒤 슬라이드·학습지 배경을 미리 받아 둔다
     const can = hadAnswer(slide, s.activity?.[slide.id]);
     answerBtn.hidden = !can;
     if (can) {
@@ -731,15 +891,16 @@ export function studentReviewView({ id } = {}) {
     if (dirty) { dirty = false; render(); }
   }
 
-  function step(d) {
+  function goTo(i) {
     if (!slides || !slides.length) return;
-    const next = clamp(idx + d, 0, slides.length - 1);
-    if (next === idx) return;
+    const next = clamp(i, 0, slides.length - 1);
+    if (next === idx || !Number.isFinite(next)) return;
     idx = next;
     localPop = null;
     ssSet(posKey, String(idx));
     render();
   }
+  const step = (d) => goTo(idx + d);
   function toggleAnswer() {
     const slide = slides && slides[idx];
     if (!slide) return;
@@ -794,6 +955,9 @@ export function studentReviewView({ id } = {}) {
     clearTimeout(loadTimer);
     document.removeEventListener("keydown", onKey);
     try { offStore && offStore(); } catch (e) { console.warn(e); }
+    stripIO?.disconnect();
+    window.removeEventListener("resize", onResize);
+    clearTimeout(revealTimer);
     popView.close();
     destroyHost();
   };

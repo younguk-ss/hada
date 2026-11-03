@@ -1316,7 +1316,9 @@ body:has(.float-toolbar, .stu-toolbar, .ink-float) .toast-stack { bottom: calc(8
 .stu .topbar .brand, .stu-top .brand, .stu-bar .brand { font-size: 13px; flex: none; }
 .stu > .stage, .stu-stage { padding: 12px max(12px, var(--sar)) max(12px, var(--sab)) max(12px, var(--sal)); }
 /* 필기 슬라이드: 스테이지 전체가 확대·이동 보기 영역(여백은 js/zoom-view.js가 맞춤에서 둔다) */
-.stu-stage:has(> .slide-host[data-type="ink"]) { padding: 0 var(--sar) var(--sab) var(--sal); }
+.stu-stage:has(> .slide-host[data-type="ink"]) { padding: 0 var(--sar) var(--sab) var(--sal); overflow: hidden; }
+/* 필기 화면은 확대·이동을 스스로 하므로 스크롤 막대를 두지 않는다(잠깐 넘친 도구바 때문에 생긴 막대가 폭을 바꿔 다시 맞춤을 부르지 않게) */
+.stu .ws-stage { overflow: hidden; }
 /* 필기 화면에서는 페이지 자체 확대를 막는다(슬라이드만 두 손가락으로 확대) */
 .stu:has(.zoom-view) { touch-action: pan-x pan-y; }
 
@@ -1393,8 +1395,12 @@ html:has(.zoom-view), html:has(.zoom-view) body { overscroll-behavior: none; } /
 :fullscreen .live, .live:fullscreen { height: 100vh; }
 
 /* ───────────────────────── 20. 접근성 · 인쇄 ───────────────────────── */
+/* 동작 줄이기(윈도우 '애니메이션 효과' 끔·태블릿 '애니메이션 제거' 등).
+   주의(v2.12): 전에는 transition-duration: .01ms 로 줄였는데, 기본 transition-property 가 all 이라 모든 요소의 모든 스타일 변경이
+   '아주 짧은 전환'이 되어, 바꾼 직후 위치를 재면(getBoundingClientRect) 옛 값이 나왔다 → 복습·수업 필기 화면에서 도구바를 옆으로
+   옮긴 직후 잰 자리가 옛 자리라 슬라이드가 한쪽으로 쏠려 잘렸다(넘길 때마다 되풀이). 전환을 아예 끈다(transitionend 를 쓰는 코드 없음). */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition: none !important; }
   .intro-type.play .bracket { opacity: 1; }
 }
 
