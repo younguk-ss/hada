@@ -4,8 +4,12 @@
 // 가정: 이벤트·결과 payload 에 slideId·startedAt·name 필드를 덧붙인다(다른 경기 이벤트 거르기·이름 표시용).
 // 가정: 상대 차의 race:answer 가 체크포인트 도착 후 (제한+2초) 안에 안 오면 '제한 시점 오답'으로 가정해 진행
 //       (재접속·이벤트 유실 시 차가 영원히 서 있지 않게). 실제 이벤트가 오면 그 값으로 다시 계산한다.
-// 가정(v2.11): 문제 제한 시간 = config.quizSec(편집기에서 10·15·20·30·45·60초, 기본 20초). 시뮬레이션에 넘겨 모든 화면이 같은 값으로 계산.
-//       오답 = 미끄러짐 1.5초(멈춤) + 감속 2.5초. 효과음(js/slides/game-sound.js): 배경음악·부스터·미끄러짐·결승·카운트다운, 🔊 음소거.
+// 가정(v2.14): 문제 제한 시간 = 문제마다 q.sec(편집기 문제 칸에서 10~120초, 기본 20초). sec 가 없는 옛 문제는 config.quizSec(v2.11 전체 값) → 20초.
+//       시뮬레이션에 문제별 제한(lims)을 넘겨 모든 화면이 같은 값으로 계산.
+//       오답 = 2.5초 동안 스핀하며 뒤로 0.2랩 미끄러짐(멈춤) → 그 자리에서 4초 감속. 정답 = 3초 부스터 ×2.5.
+//       찍어서 빨리 답하는 쪽(25% 정답)이 제대로 푸는 쪽보다 확실히 늦게 들어오도록 맞춘 값(v2.13까지는 찍기가 더 빨랐다).
+//       랩 통과는 처음 넘은 한 번만 센다(뒤로 밀려 결승선 뒤로 갔다가 다시 넘어도 랩이 늘지 않음).
+//       효과음(js/slides/game-sound.js): 배경음악·부스터·미끄러짐·결승·카운트다운, 🔊 음소거.
 // 가정: 시간 기준은 교사 시계의 activity.startedAt. 학생 기기는 교사 시계를 추정해 쓴다:
 //       race 자체 표본(학생 race:ping → 교사 race:clock {sentAt}, 표본 = sentAt - 수신 시각, 최근 8개 최댓값 + 30ms)이 있으면 그것,
 //       없으면 코어 ctx.now()(있다면), 그것도 없으면 Date.now(). 교사 화면은 자기 시계(Date.now()) 그대로.
@@ -31,10 +35,11 @@ import * as sound from "./game-sound.js";
 
 // ── 규칙 상수 ──
 const BASE = 1 / 12000;          // 랩/ms (1랩 12초)
-const QUIZ_SECS = [10, 15, 20, 30, 45, 60], QUIZ_SEC = 20; // 문제 제한(초) 고를 수 있는 값 · 기본
-const BOOST_MS = 2500, BOOST_MUL = 2.0;
-const SPIN_MS = 1500;            // 오답 미끄러짐(멈춤)
-const SLOW_MS = 2500, SLOW_MUL = 0.5;
+const QUIZ_SECS = [10, 15, 20, 30, 45, 60, 90, 120], QUIZ_SEC = 20; // 문제 제한(초) 고를 수 있는 값 · 기본
+const BOOST_MS = 3000, BOOST_MUL = 2.5;
+const SPIN_MS = 2500;            // 오답: 스핀하며 뒤로 미끄러짐(그동안 앞으로는 못 감)
+const SLIP_LAP = 0.2;            // 오답 때 뒤로 밀리는 거리(랩) = 기본 속도로 2.4초 달린 만큼
+const SLOW_MS = 4000, SLOW_MUL = 0.5;
 const GUESS_EXTRA = 2000;        // 상대 답 미수신 시 '제한 + 이만큼' 뒤 오답 가정
 const COUNT_MS = 3000;
 const END_DELAY = 3000;
@@ -51,12 +56,14 @@ const COLORS = [
 const ICON = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="12" rx="6"/><rect x="7.5" y="10" width="9" height="4" rx="2"/><path d="M12 6v4M12 14v4"/></svg>`;
 
 // ── 설정 정규화 ──
-function newQuestion() {
-  return { id: newId("q"), question: "", options: Array.from({ length: 4 }, () => ({ id: newId("opt"), text: "" })), answerId: null };
+function newQuestion(sec = QUIZ_SEC) {
+  return { id: newId("q"), question: "", options: Array.from({ length: 4 }, () => ({ id: newId("opt"), text: "" })), answerId: null, sec };
 }
+const secOf = (v, d = QUIZ_SEC) => (QUIZ_SECS.includes(Number(v)) ? Number(v) : d);
 function cfgOf(slide) {
   const c = slide?.config || {};
   const laps = [1, 2, 3].includes(Number(c.laps)) ? Number(c.laps) : 2;
+  const def = secOf(c.quizSec); // v2.11 슬라이드 전체 값 → sec 없는 문제의 기본
   const questions = (Array.isArray(c.questions) ? c.questions : []).map(q => {
     const options = (q.options || []).slice(0, 4).map(o => ({ id: o.id || newId("opt"), text: o.text ?? "" }));
     while (options.length < 4) options.push({ id: newId("opt"), text: "" });
@@ -65,11 +72,28 @@ function cfgOf(slide) {
       id: q.id || newId("q"), question: String(q.question ?? ""), options,
       answerId: options.some(o => o.id === ans) ? ans : null,
       image: q.image && q.image.url ? q.image : null,
+      sec: secOf(q.sec, def),
     };
   });
-  const qs = Number(c.quizSec);
-  const quizSec = QUIZ_SECS.includes(qs) ? qs : QUIZ_SEC;
-  return { laps, questions, quizSec, quizMs: quizSec * 1000 };
+  return { laps, questions, lims: questions.map(q => q.sec * 1000) };
+}
+const limOf = (lims, k) => lims[k - 1] || QUIZ_SEC * 1000;
+// '문제마다 20초' · 문제마다 다르면 '문제마다 10~30초'
+function secText(questions) {
+  const s = questions.map(q => q.sec);
+  const lo = s.length ? Math.min(...s) : QUIZ_SEC, hi = s.length ? Math.max(...s) : QUIZ_SEC;
+  return lo === hi ? `문제마다 ${lo}초` : `문제마다 ${lo}~${hi}초`;
+}
+// 정답률 색: 80% 이상 초록 · 50% 이상 주황 · 그 아래 빨강
+const accCls = pct => (pct >= 80 ? "pill-ok" : pct >= 50 ? "pill-warn" : "pill-danger");
+// 정답 칸: 큰 '맞힌 수/문제 수' + 정답률(푼 문제 중). 아직 하나도 안 풀었으면 0/Q 만
+function accBadge(correct, answered, total) {
+  if (!(answered > 0)) return el("span", { class: "race-acc is-none" }, [el("b", {}, `0/${total}`)]);
+  const pct = Math.round((correct / answered) * 100);
+  return el("span", { class: "race-acc", title: `푼 문제 ${answered}개 중 ${correct}개 정답` }, [
+    el("b", {}, `${correct}/${total}`),
+    el("span", { class: `pill ${accCls(pct)}` }, `${pct}%`),
+  ]);
 }
 
 // ── 결정적 시뮬레이션 ──
@@ -116,16 +140,17 @@ function modeAt(wins, t) {
   return { mode: "drive", spinF: 0 };
 }
 
-// t: startedAt 기준 ms. ansOf(k) → {correct, at}|null. guessAfter: 상대 차 오답 가정(ms) 또는 null
-// → { p(랩), mode: grid|drive|boost|slow|spin|quiz|done, spinF, k, arriveAt, cross[], finishAt, correct }
-function simulate(t, Q, laps, ansOf, guessAfter = null, quizMs = QUIZ_SEC * 1000) {
-  const res = { p: -0.006, mode: "grid", spinF: 0, k: 0, arriveAt: 0, cross: [], finishAt: null, correct: 0 };
+// t: startedAt 기준 ms. ansOf(k) → {correct, at}|null. guess: 상대 차 답이 안 오면 (제한 + GUESS_EXTRA) 뒤 '제한 시점 오답'으로 가정.
+// lims: 문제별 제한(ms) 배열
+// → { p(랩), mode: grid|drive|boost|slow|spin|quiz|done, spinF, k, arriveAt, cross[], finishAt, correct, answered }
+function simulate(t, Q, laps, ansOf, guess = false, lims = []) {
+  const res = { p: -0.006, mode: "grid", spinF: 0, k: 0, arriveAt: 0, cross: [], finishAt: null, correct: 0, answered: 0 };
   if (!(t >= 0)) return res;
-  let t0 = 0, p0 = 0, wins = [];
+  let t0 = 0, p0 = 0, wins = [], nextLap = 1;
   for (let k = 1; k <= Q + 1; k++) {
     const target = k <= Q ? (laps * k) / (Q + 1) : laps;
-    for (let L = Math.floor(p0 + 1e-9) + 1; L <= laps && L <= target + 1e-9; L++) {
-      const tc = reachTime(t0, wins, L - p0);
+    for (; nextLap <= laps && nextLap <= target + 1e-9; nextLap++) {
+      const tc = reachTime(t0, wins, nextLap - p0);
       if (tc > t) break;
       res.cross.push(tc);
     }
@@ -136,19 +161,30 @@ function simulate(t, Q, laps, ansOf, guessAfter = null, quizMs = QUIZ_SEC * 1000
       return res;
     }
     if (k > Q) { res.p = laps; res.mode = "done"; res.finishAt = tArr; return res; }
+    const lim = limOf(lims, k);
     const a = ansOf(k);
     let at, ok;
     if (a) { at = Math.max(Number(a.at) || 0, tArr); ok = !!a.correct; }
-    else if (guessAfter != null && t >= tArr + guessAfter) { at = tArr + quizMs; ok = false; }
+    else if (guess && t >= tArr + lim + GUESS_EXTRA) { at = tArr + lim; ok = false; }
     if (at == null || t < at) {
       res.p = target; res.mode = "quiz"; res.k = k; res.arriveAt = tArr;
       return res;
     }
-    if (ok) res.correct++;
-    wins = ok
-      ? [{ from: at, to: at + BOOST_MS, mul: BOOST_MUL }]
-      : [{ from: at, to: at + SPIN_MS, mul: 0 }, { from: at + SPIN_MS, to: at + SPIN_MS + SLOW_MS, mul: SLOW_MUL }];
-    t0 = at; p0 = target;
+    res.answered++;
+    if (ok) {
+      res.correct++;
+      wins = [{ from: at, to: at + BOOST_MS, mul: BOOST_MUL }];
+      t0 = at; p0 = target;
+      continue;
+    }
+    // 오답: SPIN_MS 동안 스핀하며 SLIP_LAP 만큼 뒤로 미끄러짐(점점 느려짐) → 멈춘 자리에서 감속 출발
+    if (t < at + SPIN_MS) {
+      const f = (t - at) / SPIN_MS;
+      res.p = target - SLIP_LAP * (1 - (1 - f) ** 2); res.mode = "spin"; res.spinF = f;
+      return res;
+    }
+    t0 = at + SPIN_MS; p0 = target - SLIP_LAP;
+    wins = [{ from: t0, to: t0 + SLOW_MS, mul: SLOW_MUL }];
   }
   return res;
 }
@@ -256,13 +292,13 @@ const frac = p => ((p % 1) + 1) % 1;
 const laneR = lane => R + (lane - 1.5) * LANE_W;
 
 // 조의 차 목록 계산 (학생·교사 공용)
-function groupCars(group, t, { Q, laps, quizMs, rs, results, meId = null, mineSim = null, nameFn }) {
+function groupCars(group, t, { Q, laps, lims, rs, results, meId = null, mineSim = null, nameFn }) {
   return (group.memberIds || []).slice(0, 4).map((sid, lane) => {
     let sim;
     if (sid === meId && mineSim) sim = mineSim;
     else {
       const m = rs.answers.get(sid);
-      sim = simulate(t, Q, laps, k => m?.get(k) || null, quizMs + GUESS_EXTRA, quizMs);
+      sim = simulate(t, Q, laps, k => m?.get(k) || null, true, lims);
     }
     const done = results.has(sid) || sim.mode === "done";
     return {
@@ -783,7 +819,7 @@ const CSS = `
 .race-focus-h > b { font-size: 15px; flex: none; }
 .race-focus-st { font-variant-numeric: tabular-nums; }
 .race-chips { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
-.race-chip { display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 10px 0 8px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); font-size: 13px; white-space: nowrap; max-width: 220px; font-variant-numeric: tabular-nums; }
+.race-chip { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 10px 0 8px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); font-size: 13px; white-space: nowrap; max-width: 300px; font-variant-numeric: tabular-nums; }
 .race-chip .nm { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .race-chip .tm { color: var(--ink-2); font-size: 12px; }
 .race-chip .tm.dnf { color: var(--danger); font-weight: 600; }
@@ -804,9 +840,18 @@ const CSS = `
 .race-table tr.win td { font-weight: 700; }
 .race-table .dnf { color: var(--danger); font-weight: 600; }
 .race-table .run { color: var(--muted); }
+.race-table th.acc { color: var(--ink); font-weight: 800; }
+.race-table td.acc { padding-top: 5px; padding-bottom: 5px; }
+.race-acc { display: inline-flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.race-acc b { font-size: 18px; font-weight: 800; color: var(--ink); letter-spacing: -.01em; }
+.race-acc .pill { height: 22px; padding: 0 8px; font-size: 13px; font-weight: 800; }
+.race-acc.is-none b { color: var(--muted); font-weight: 700; }
+.race-panel > .seg { justify-self: start; }
+.race-chip .ac { height: 20px; padding: 0 7px; font-size: 12px; font-weight: 800; }
+.race-qsec { width: auto; flex: none; }
 .race-sum { display: grid; gap: 14px; }
 .race-sum-meta { display: flex; gap: 6px; flex-wrap: wrap; }
-.race-edit { padding: 20px; display: grid; gap: 14px; max-width: 760px; margin: 0 auto; width: 100%; box-sizing: border-box; overflow: auto; height: 100%; align-content: start; }
+.race-edit { padding: 20px; display: grid; grid-auto-rows: max-content; gap: 14px; max-width: 760px; margin: 0 auto; width: 100%; box-sizing: border-box; overflow: auto; height: 100%; align-content: start; }
 .race-edit-prev { border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow-1); max-width: 420px; width: 100%; justify-self: center; }
 .race-qlist { display: grid; gap: 12px; }
 .race-qcard { border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; display: grid; gap: 8px; background: var(--surface); }
@@ -815,11 +860,13 @@ const CSS = `
 `;
 
 // ── 편집기 ──
+// root.set(v) = 밖에서 고른 칸 바꾸기(맞는 값이 없으면 모두 꺼짐)
 function seg(options, value, onPick) {
   const root = el("div", { class: "seg" });
   const paint = v => [...root.children].forEach((b, i) => b.classList.toggle("active", options[i].value === v));
   options.forEach(o => root.appendChild(el("button", { type: "button", onClick: () => { paint(o.value); onPick(o.value); } }, o.label)));
   paint(value);
+  root.set = paint;
   return root;
 }
 
@@ -830,8 +877,7 @@ function Editor({ slide, lesson, update, ctx }) {
     config: {
       ...(slide.config || {}),
       laps: cfg.laps,
-      quizSec: cfg.quizSec,
-      questions: cfg.questions.map(q => ({ id: q.id, question: q.question, options: q.options.map(o => ({ ...o })), answerId: q.answerId, image: q.image || null })),
+      questions: cfg.questions.map(q => ({ id: q.id, question: q.question, options: q.options.map(o => ({ ...o })), answerId: q.answerId, image: q.image || null, sec: q.sec })),
     },
   });
 
@@ -844,12 +890,26 @@ function Editor({ slide, lesson, update, ctx }) {
   requestAnimationFrame(drawPreview);
 
   const lapsSeg = seg([1, 2, 3].map(v => ({ value: v, label: `${v}바퀴` })), cfg.laps, v => { cfg.laps = v; emit(); drawPreview(); });
-  const timeSeg = seg(QUIZ_SECS.map(v => ({ value: v, label: `${v}초` })), cfg.quizSec, v => { cfg.quizSec = v; cfg.quizMs = v * 1000; emit(); });
+  // 문제 푸는 시간: 위 칸 = 모든 문제에 한 번에(모두 같을 때만 켜짐), 문제 칸마다 따로
+  const sameSec = () => (cfg.questions.length && cfg.questions.every(q => q.sec === cfg.questions[0].sec) ? cfg.questions[0].sec : null);
+  const secSels = new Map(); // q.id → select
+  const timeSeg = seg(QUIZ_SECS.map(v => ({ value: v, label: `${v}초` })), sameSec(), v => {
+    for (const q of cfg.questions) { q.sec = v; const s = secSels.get(q.id); if (s) s.value = String(v); }
+    emit();
+  });
 
   const list = el("div", { class: "race-qlist" });
   function renderList() {
+    secSels.clear();
+    timeSeg.set(sameSec());
     if (!cfg.questions.length) { list.replaceChildren(el("div", { class: "empty" }, "아직 문제가 없어요")); return; }
     list.replaceChildren(...cfg.questions.map((q, i) => {
+      const sel = el("select", {
+        class: "input input-sm race-qsec", title: "이 문제 푸는 시간", "aria-label": `${i + 1}번 문제 푸는 시간`,
+        onChange: () => { q.sec = secOf(sel.value); timeSeg.set(sameSec()); emit(); },
+      }, QUIZ_SECS.map(v => el("option", { value: String(v) }, `⏱ ${v}초`)));
+      sel.value = String(q.sec);
+      secSels.set(q.id, sel);
       const del = el("button", { class: "btn btn-icon btn-ghost", type: "button", title: "삭제", onClick: async () => {
         const filled = q.question.trim() || q.options.some(o => o.text.trim());
         if (filled && !(await ctx.confirm("이 문제를 지울까요?", { ok: "삭제", danger: true }))) return;
@@ -869,7 +929,7 @@ function Editor({ slide, lesson, update, ctx }) {
         },
       });
       return el("div", { class: "race-qcard" }, [
-        el("div", { class: "race-qcard-h" }, [el("b", {}, `${i + 1}번`), el("span", { class: "race-sp" }), del]),
+        el("div", { class: "race-qcard-h" }, [el("b", {}, `${i + 1}번`), el("span", { class: "race-sp" }), sel, del]),
         qe,
       ]);
     }));
@@ -877,7 +937,7 @@ function Editor({ slide, lesson, update, ctx }) {
   renderList();
 
   const addBtn = el("button", { class: "btn btn-sm", type: "button", onClick: () => {
-    cfg.questions.push(newQuestion());
+    cfg.questions.push(newQuestion(cfg.questions[cfg.questions.length - 1]?.sec ?? QUIZ_SEC)); // 바로 앞 문제 시간을 이어받음
     renderList(); emit(); drawPreview();
     list.lastElementChild?.querySelector("textarea")?.focus();
   } }, "+ 문제");
@@ -886,7 +946,10 @@ function Editor({ slide, lesson, update, ctx }) {
     el: el("div", { class: "race-edit" }, [
       prevWrap,
       el("div", { class: "field" }, [el("label", {}, "바퀴 수"), lapsSeg]),
-      el("div", { class: "field" }, [el("label", {}, "문제 푸는 시간"), timeSeg]),
+      el("div", { class: "field" }, [
+        el("label", {}, "문제 푸는 시간"), timeSeg,
+        el("div", { class: "hint" }, "여기서 고르면 모든 문제에 적용돼요 · 문제마다 ⏱에서 따로 바꿀 수 있어요"),
+      ]),
       list,
       el("div", {}, [addBtn]),
     ]),
@@ -898,7 +961,8 @@ function Editor({ slide, lesson, update, ctx }) {
 function Student({ slide, me, ctx }) {
   ensureCss(ctx);
   const cfg = cfgOf(slide);
-  const Q = cfg.questions.length, laps = cfg.laps, QUIZ_MS = cfg.quizMs;
+  const Q = cfg.questions.length, laps = cfg.laps, LIMS = cfg.lims;
+  const lim = k => limOf(LIMS, k);
   const meId = me?.id || null;
   if (me?.id && me?.name) NAMES.set(me.id, me.name);
   sound.attach();
@@ -935,7 +999,7 @@ function Student({ slide, me, ctx }) {
     pings++; lastPing = t;
     ctx.send("race:ping", { slideId: slide.id });
   }
-  const mySim = t => simulate(t, Q, laps, k => race.mine.get(k) || null, null, QUIZ_MS);
+  const mySim = t => simulate(t, Q, laps, k => race.mine.get(k) || null, false, LIMS);
 
   function makeRace(key, sa) {
     const rs = raceStore(key);
@@ -999,8 +1063,8 @@ function Student({ slide, me, ctx }) {
     const running = act.phase === "running";
     let sim = mySim(t);
     let guard = 0;
-    while (running && !race.submitted && sim.mode === "quiz" && t >= sim.arriveAt + QUIZ_MS && guard++ < 50) {
-      answer(sim.k, null, sim.arriveAt + QUIZ_MS);
+    while (running && !race.submitted && sim.mode === "quiz" && t >= sim.arriveAt + lim(sim.k) && guard++ < 50) {
+      answer(sim.k, null, sim.arriveAt + lim(sim.k));
       sim = mySim(t);
     }
     if (running && !race.submitted && sim.mode === "quiz") showQuiz(sim); else hideQuiz();
@@ -1014,7 +1078,7 @@ function Student({ slide, me, ctx }) {
     const q = cfg.questions[k - 1];
     const correct = !!optId && optId === q?.answerId;
     const arrive = race.quizK === k ? race.quizArrive : (lastSim?.k === k ? lastSim.arriveAt : 0);
-    const at = Math.round(atOverride ?? Math.min(arrive + QUIZ_MS, Math.max(arrive, now() - race.startedAt)));
+    const at = Math.round(atOverride ?? Math.min(arrive + lim(k), Math.max(arrive, now() - race.startedAt)));
     const v = { correct, at };
     race.mine.set(k, v);
     putAnswer(race.rs, meId, k, v);
@@ -1059,9 +1123,10 @@ function Student({ slide, me, ctx }) {
   }
   function quizTimer() {
     if (!race?.quizK || !race.quizBar) return;
-    const rem = Math.max(0, race.quizArrive + QUIZ_MS - (now() - race.startedAt));
+    const ms = lim(race.quizK);
+    const rem = Math.max(0, race.quizArrive + ms - (now() - race.startedAt));
     const { bar, barWrap, left } = race.quizBar;
-    bar.style.width = `${(rem / QUIZ_MS) * 100}%`;
+    bar.style.width = `${(rem / ms) * 100}%`;
     barWrap.classList.toggle("urgent", rem <= 5000);
     const s = `${Math.ceil(rem / 1000)}초`;
     if (left.textContent !== s) left.textContent = s;
@@ -1125,7 +1190,7 @@ function Student({ slide, me, ctx }) {
     const t = tNow();
     const live = act.phase === "running";
     const results = resultsMap(ctx.responses(), race.startedAt, race.rs);
-    const cars = groupCars(race.group, t, { Q, laps, quizMs: QUIZ_MS, rs: race.rs, results, meId, mineSim: sim, nameFn });
+    const cars = groupCars(race.group, t, { Q, laps, lims: LIMS, rs: race.rs, results, meId, mineSim: sim, nameFn });
     if (track.draw(cars, dt, live)) needDraw = false;
 
     // HUD
@@ -1228,11 +1293,17 @@ function Student({ slide, me, ctx }) {
 }
 
 // ── 교사 ──
+// 한 학생의 정답 현황: 완주했으면 결과, 아니면 지금까지 시뮬레이션(live). 둘 다 없으면(기록의 미완주) null
+function scoreOf(res, live, Q) {
+  if (res) return { correct: res.correct, answered: res.total || Q };
+  if (live) return { correct: live.correct || 0, answered: live.answered || 0 };
+  return null;
+}
+// 조별 표: 순위 · 이름 · 정답(크게, 정답률) · 합계 · 랩
 function standingsTable(rows, { laps, Q, ended, nameFn, liveOf }) {
   const head = el("tr", {}, [
-    el("th", {}, "순위"), el("th", {}, "이름"),
+    el("th", {}, "순위"), el("th", {}, "이름"), el("th", { class: "acc" }, "정답"), el("th", {}, "합계"),
     ...Array.from({ length: laps }, (_, i) => el("th", {}, `LAP${i + 1}`)),
-    el("th", {}, "합계"), el("th", {}, "정답"),
   ]);
   const body = rows.map(r => {
     const res = r.res;
@@ -1245,21 +1316,43 @@ function standingsTable(rows, { laps, Q, ended, nameFn, liveOf }) {
     const total = res ? el("td", {}, fmtClock(res.totalMs))
       : ended ? el("td", { class: "dnf" }, "DNF")
       : el("td", { class: "run" }, live ? live.label : "주행 중");
+    const sc = scoreOf(res, live, Q);
     return el("tr", { class: r.rank === 1 && res ? "win" : "" }, [
       el("td", {}, res ? (r.rank === 1 ? "🏆" : String(r.rank)) : "—"),
       el("td", {}, [el("span", { class: "race-dot", style: { background: COLORS[r.lane % 4].body, marginRight: "6px" } }), nameFn(r.sid)]),
-      ...lapCells,
+      el("td", { class: "acc" }, sc ? [accBadge(sc.correct, sc.answered, Q)] : ""),
       total,
-      el("td", {}, res ? `${res.correct}/${res.total || Q}` : (live ? `${live.correct}/${Q}` : "")),
+      ...lapCells,
     ]);
   });
   return el("div", { class: "race-tbl-wrap" }, [el("table", { class: "race-table" }, [el("thead", {}, [head]), el("tbody", {}, body)])]);
+}
+// 정답순 표(모든 조): 정답 수 → 정답률 → 완주 기록 순. 정답 수가 같으면 같은 순위
+function accuracyTable(groups, results, { Q, nameFn, liveOf }) {
+  const rows = groups.flatMap(g => (g.memberIds || []).slice(0, 4).map((sid, lane) => {
+    const res = results.get(sid) || null;
+    const sc = scoreOf(res, res ? null : liveOf?.(sid), Q) || { correct: 0, answered: 0 };
+    return { sid, lane, g, ...sc, pct: sc.answered ? sc.correct / sc.answered : -1, ms: res?.totalMs ?? Infinity };
+  }));
+  rows.sort((a, b) => (b.correct - a.correct) || (b.pct - a.pct) || (a.ms - b.ms));
+  let rank = 0;
+  const head = el("tr", {}, [el("th", {}, "순위"), el("th", {}, "이름"), el("th", { class: "acc" }, "정답"), el("th", {}, "조")]);
+  const body = rows.map((r, i) => {
+    if (!i || r.correct !== rows[i - 1].correct) rank = i + 1;
+    return el("tr", { class: rank === 1 && r.correct > 0 ? "win" : "" }, [
+      el("td", {}, r.correct > 0 && rank <= 3 ? ["🥇", "🥈", "🥉"][rank - 1] : String(rank)),
+      el("td", {}, [el("span", { class: "race-dot", style: { background: COLORS[r.lane % 4].body, marginRight: "6px" } }), nameFn(r.sid)]),
+      el("td", { class: "acc" }, [accBadge(r.correct, r.answered, Q)]),
+      el("td", { class: "run" }, r.g.name || r.g.id),
+    ]);
+  });
+  return el("div", { class: "race-tbl-wrap" }, [el("table", { class: "race-table is-acc" }, [el("thead", {}, [head]), el("tbody", {}, body)])]);
 }
 
 function TeacherLive({ slide, ctx }) {
   ensureCss(ctx);
   const cfg = cfgOf(slide);
-  const Q = cfg.questions.length, laps = cfg.laps, quizMs = cfg.quizMs;
+  const Q = cfg.questions.length, laps = cfg.laps, LIMS = cfg.lims;
   sound.attach();
   const sndBtn = sound.soundToggle();
   let act = ctx.activity() || { phase: "idle" };
@@ -1309,7 +1402,10 @@ function TeacherLive({ slide, ctx }) {
   const idleInfo = el("div", { class: "race-idle-info" });
   const root = el("div", { class: "race-live" }, [head, wrap, idleInfo]);
   const panelBody = el("div", { class: "race-panel" });
-  const panel = el("div", { class: "race-panel" }, [ctl2.el, panelBody]);
+  let view = "group"; // 패널 표: 조별 | 정답순(모든 조)
+  const viewSeg = seg([{ value: "group", label: "조별" }, { value: "acc", label: "정답순" }], view, v => { view = v; renderPanel(true); });
+  viewSeg.classList.add("seg-sm");
+  const panel = el("div", { class: "race-panel" }, [ctl2.el, viewSeg, panelBody]);
 
   function rosterIds() {
     const parts = ctx.participants() || [];
@@ -1485,18 +1581,23 @@ function TeacherLive({ slide, ctx }) {
     results ||= resultsMap(ctx.responses(), race.startedAt, race.rs);
     const ended = act.phase === "ended";
     const ranks = new Map(standings(ft.group, results).map(r => [r.sid, r]));
+    const t = tNow();
     const items = (ft.group.memberIds || []).slice(0, 4).map((sid, lane) => {
       const r = ranks.get(sid);
       const tm = r?.res ? `${r.rank === 1 ? "🏆 " : ""}${r.rank}위 ${fmtClock(r.res.totalMs)}` : ended ? "DNF" : "";
-      return { lane, name: nameFn(sid), tm };
+      return { lane, name: nameFn(sid), tm, ...scoreOf(r?.res, r?.res ? null : simOf(sid, t), Q) };
     });
-    const sig = JSON.stringify([ft.group.id, race.tiles.length, items.map(i => [i.name, i.tm])]);
+    const sig = JSON.stringify([ft.group.id, race.tiles.length, items.map(i => [i.name, i.tm, i.correct, i.answered])]);
     if (sig === fSig) return;
     fSig = sig;
     fName.textContent = ft.group.name || ft.group.id;
     fChips.replaceChildren(...items.map(i => el("span", { class: "race-chip", style: { borderColor: COLORS[i.lane].body } }, [
       el("span", { class: "race-dot", style: { background: COLORS[i.lane].body } }),
       el("span", { class: "nm" }, i.name),
+      el("span", {
+        class: `ac pill ${i.answered ? accCls(Math.round((i.correct / i.answered) * 100)) : "pill-muted"}`,
+        title: `푼 문제 ${i.answered}개 중 ${i.correct}개 정답`,
+      }, `정답 ${i.correct}/${Q}`),
       i.tm ? el("span", { class: `tm${i.tm === "DNF" ? " dnf" : ""}` }, i.tm) : null,
     ])));
     fPrev.hidden = fNext.hidden = race.tiles.length < 2;
@@ -1573,18 +1674,21 @@ function TeacherLive({ slide, ctx }) {
     }
     idleInfo.hidden = !!race;
     if (!race) {
-      const t = `참여 ${rosterIds().length}명 · 문제마다 ${cfg.quizSec}초 · 시작을 누르면 조가 편성돼요`;
+      const t = `참여 ${rosterIds().length}명 · ${secText(cfg.questions)} · 시작을 누르면 조가 편성돼요`;
       if (idleInfo.textContent !== t) idleInfo.textContent = t;
     }
   }
 
+  const simOf = (sid, t) => {
+    const m = race.rs.answers.get(sid);
+    return simulate(t, Q, laps, k => m?.get(k) || null, true, LIMS);
+  };
   function liveInfo(t) {
     const map = new Map();
     for (const g of race.groups) for (const sid of g.memberIds || []) {
-      const m = race.rs.answers.get(sid);
-      const s = simulate(t, Q, laps, k => m?.get(k) || null, quizMs + GUESS_EXTRA, quizMs);
+      const s = simOf(sid, t);
       map.set(sid, {
-        lapMs: lapsOf(s.cross), correct: s.correct,
+        lapMs: lapsOf(s.cross), correct: s.correct, answered: s.answered,
         label: s.mode === "grid" ? "출발 전" : s.mode === "done" ? "결승" : `LAP ${Math.min(laps, s.cross.length + 1)}`,
       });
     }
@@ -1592,6 +1696,7 @@ function TeacherLive({ slide, ctx }) {
   }
 
   function renderPanel(force = false) {
+    viewSeg.hidden = !race;
     if (!race) {
       panelBody.replaceChildren(el("div", { class: "empty" }, "시작하면 4명씩 조가 만들어져요"));
       return;
@@ -1600,10 +1705,17 @@ function TeacherLive({ slide, ctx }) {
     const results = resultsMap(ctx.responses(), race.startedAt, race.rs);
     const live = liveInfo(tNow());
     const blocks = race.groups.map(g => ({ g, rows: standings(g, results) }));
-    const sig = JSON.stringify([ended, blocks.map(b => b.rows.map(r => [r.sid, nameFn(r.sid), r.res?.totalMs ?? null, live.get(r.sid)?.label, live.get(r.sid)?.correct]))]);
+    const sig = JSON.stringify([view, ended, blocks.map(b => b.rows.map(r => {
+      const l = live.get(r.sid);
+      return [r.sid, nameFn(r.sid), r.res?.totalMs ?? null, l?.label, l?.correct, l?.answered];
+    }))]);
     if (!force && sig === race.panelSig) return;
     race.panelSig = sig;
     race.blocks = new Map(); // gid → 구역(크게 보기 강조용)
+    if (view === "acc") {
+      panelBody.replaceChildren(accuracyTable(race.groups, results, { Q, nameFn, liveOf: sid => live.get(sid) }));
+      return;
+    }
     panelBody.replaceChildren(...blocks.map(({ g, rows }) => {
       const b = el("div", { class: "race-gblock" }, [
         el("button", {
@@ -1647,12 +1759,12 @@ function TeacherLive({ slide, ctx }) {
     const ft = focusTile();
     if (ft) {
       // 크게 보기: 보이는 캔버스(이 조)만 그린다 — 숨은 미니 트랙은 쉰다
-      const cars = groupCars(ft.group, t, { Q, laps, quizMs, rs: race.rs, results, nameFn });
+      const cars = groupCars(ft.group, t, { Q, laps, lims: LIMS, rs: race.rs, results, nameFn });
       drawn = focusView.draw(cars, dt, liveRun);
       paintFocusStatus(cars, t, results);
     } else {
       for (const tile of race.tiles) {
-        const cars = groupCars(tile.group, t, { Q, laps, quizMs, rs: race.rs, results, nameFn });
+        const cars = groupCars(tile.group, t, { Q, laps, lims: LIMS, rs: race.rs, results, nameFn });
         drawn = tile.view.draw(cars, dt, liveRun) && drawn;
       }
     }

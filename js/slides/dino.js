@@ -12,6 +12,9 @@
 // 가정: 마지막 답을 고르는 즉시 제출(0.8초 피드백은 화면만) — 그 사이 [종료]돼도 결과 유지.
 // 가정(v2.11): 효과음(js/slides/game-sound.js) — 학생: 배경음악(플레이 중)·카운트다운·점프·충돌·정답·오답·완주 팡파르,
 //       교사: 진행 중 배경음악 + 완주할 때마다 짧은 소리. 🔊 버튼으로 기기마다 음소거.
+// 가정(v2.14): 문제마다 제한 시간 q.sec(10~120초, 기본 20초) — 넘기면 '시간 초과'(오답). 순위는 그대로 정답 수가 먼저.
+//       오답이면 다시 달리기 시작한 뒤(지나온 선인장이 비켜날 0.25초 뒤, 땅에 있을 때) 공룡이 뒤로 미끄러진다:
+//       세상이 멈춘 채 0.35초 동안 뒤로 64px 밀리고 0.5초 어질어질(점프 불가) → 1.1초에 걸쳐 제자리로.
 import { el } from "../ui.js";
 import { findStudent } from "../store.js";
 import { registerSlideType, newId, injectCss, fmtMs } from "./registry.js";
@@ -27,6 +30,8 @@ const GRAV = 2600, JUMP_V = 840;         // px/s², px/s (최고 높이 ≈ 136p
 const BASE_SPEED = 320, SPEED_UP = 1.06;
 const GAP_MIN = 1.1, GAP_MAX = 2.0;      // 선인장 간격(초)
 const INVULN = 0.8, FEEDBACK_MS = 800;
+const QUIZ_SECS = [10, 15, 20, 30, 45, 60, 90, 120], QUIZ_SEC = 20; // 문제 제한(초) 고를 수 있는 값 · 기본
+const SLIP_WAIT = 0.25, SLIP_SLIDE = 0.35, SLIP_HOLD = 0.5, SLIP_BACK = 1.1, SLIP_PX = 64; // 오답 미끄러짐(초 · px)
 const INK = "#535353", SOFT = "#d6d2c8";
 
 const ICON = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3h7a2 2 0 0 1 2 2v3h-5v1h3"/><path d="M12 3v9a5 5 0 0 1-5 5H6"/><path d="M16 9v3a5 5 0 0 1-5 5"/><path d="M3 9v2a6 6 0 0 0 3 5"/><path d="M8 17v4M12 17v4"/><path d="M16 12h2"/><circle cx="15" cy="5.5" r=".7" fill="currentColor"/></svg>`;
@@ -102,12 +107,24 @@ function newWorld(rand = Math.random) {
     clouds: [{ x: 170, y: 44 }, { x: 460, y: 78 }, { x: 690, y: 34 }],
     pebbles: Array.from({ length: 26 }, () => ({ x: rand() * W, y: GY + 6 + rand() * 22, w: 1 + rand() * 3 })),
     invUntil: -1, hits: 0, passes: 0,
+    slipPend: -1, slipAt: -1, // 오답 미끄러짐: 예약 시각 · 시작 시각(w.t)
   };
 }
 
+// 미끄러짐 진행(초) · 세상이 멈춘 동안인지 · 공룡 x 어긋남(px, 뒤로 = 음수)
+const slipS = w => (w.slipAt >= 0 ? w.t - w.slipAt : Infinity);
+const slipStopped = w => slipS(w) < SLIP_SLIDE + SLIP_HOLD;
+function slipX(w) {
+  const s = slipS(w);
+  if (s < SLIP_SLIDE) { const f = s / SLIP_SLIDE; return -SLIP_PX * (1 - (1 - f) ** 2); }
+  if (s < SLIP_SLIDE + SLIP_HOLD) return -SLIP_PX;
+  if (s < SLIP_SLIDE + SLIP_HOLD + SLIP_BACK) { const f = (s - SLIP_SLIDE - SLIP_HOLD) / SLIP_BACK; return -SLIP_PX * (1 - f * f * (3 - 2 * f)); }
+  return 0;
+}
+
 function dinoBox(w) {
-  const top = GY - DH - w.y;
-  return { x0: DX + 3 * P, x1: DX + 16 * P, y0: top + 2 * P, y1: GY - w.y - P };
+  const top = GY - DH - w.y, x = DX + slipX(w);
+  return { x0: x + 3 * P, x1: x + 16 * P, y0: top + 2 * P, y1: GY - w.y - P };
 }
 function cactusBox(o) {
   return { x0: o.x + 3, x1: o.x + o.w - 3, y0: GY - o.h + 4, y1: GY };
@@ -128,12 +145,27 @@ function drawWorld(g, w, { moving = false } = {}) {
     const top = GY - o.h;
     for (const [x, y, rw, rh] of o.v.r) g.fillRect(o.x + x, top + y, rw, rh);
   }
+  // 미끄러짐: 발밑 흙먼지 · 어질어질 별
+  const x = DX + slipX(w), s = slipS(w), stopped = slipStopped(w);
+  if (s < SLIP_SLIDE + 0.3) {
+    const a = 1 - s / (SLIP_SLIDE + 0.3);
+    g.fillStyle = `rgba(140,130,115,${(0.6 * a).toFixed(3)})`;
+    for (let i = 0; i < 5; i++) g.fillRect(x + 30 + i * 7 + s * 30 * i, GY - 4 - (i % 3) * 3 - s * 14, 4, 3);
+  }
+  if (stopped && s >= SLIP_SLIDE * 0.6) {
+    g.fillStyle = INK;
+    for (let i = 0; i < 2; i++) {
+      const ang = s * 9 + i * Math.PI;
+      const sx = x + 40 + Math.cos(ang) * 14, sy = GY - DH - w.y - 8 + Math.sin(ang) * 4;
+      g.fillRect(sx - 3, sy - 0.75, 6, 1.5); g.fillRect(sx - 0.75, sy - 3, 1.5, 6);
+    }
+  }
   // 공룡 (무적 중 깜빡임)
   const blink = w.t < w.invUntil && Math.floor(w.t * 12) % 2 === 0;
   if (blink) return;
-  const frame = !moving || w.air ? FRAMES.stand : (Math.floor(w.legT * 10) % 2 ? FRAMES.a : FRAMES.b);
+  const frame = !moving || w.air || stopped ? FRAMES.stand : (Math.floor(w.legT * 10) % 2 ? FRAMES.a : FRAMES.b);
   const top = GY - DH - w.y;
-  for (const [c, r, len] of frame) g.fillRect(DX + c * P, top + r * P, len * P, P + 0.4);
+  for (const [c, r, len] of frame) g.fillRect(x + c * P, top + r * P, len * P, P + 0.4);
 }
 
 // ── 게임 엔진 (캔버스 + rAF 루프) ──
@@ -162,8 +194,11 @@ function createEngine(canvas, { auto = false, onPass, onHit, onJump } = {}) {
 
   function step(dt) {
     w.t += dt;
-    w.legT += dt;
-    const sp = w.speed;
+    // 오답 미끄러짐: 예약 시각이 지나고 땅에 있으면 시작. 미끄러지고 어지러운 동안은 세상이 멈춘다
+    if (w.slipPend >= 0 && w.t >= w.slipPend && !w.air) { w.slipAt = w.t; w.slipPend = -1; }
+    const stopped = slipStopped(w);
+    if (!stopped) w.legT += dt;
+    const sp = stopped ? 0 : w.speed;
     // 미리보기: 자동 점프
     if (isAuto && !w.air) {
       const next = w.obs.find(o => o.x + o.w > DX);
@@ -191,7 +226,7 @@ function createEngine(canvas, { auto = false, onPass, onHit, onJump } = {}) {
       if (c.x < -50) { c.x = W + Math.random() * 120; c.y = 26 + Math.random() * 64; }
     }
     // 장애물 생성·이동
-    w.nextIn -= dt;
+    if (!stopped) w.nextIn -= dt;
     if (w.nextIn <= 0) {
       const v = CACTI[Math.floor(Math.random() * CACTI.length)];
       w.obs.push({ x: W + 20, w: v.w, h: v.h, v, hit: false, passed: false });
@@ -212,8 +247,9 @@ function createEngine(canvas, { auto = false, onPass, onHit, onJump } = {}) {
       }
     }
     // 통과
+    const bx = DX + slipX(w) + 3 * P;
     for (const o of w.obs) {
-      if (o.passed || o.x + o.w >= DX + 3 * P) continue;
+      if (o.passed || o.x + o.w >= bx) continue;
       o.passed = true;
       if (isAuto || o.hit) continue;
       w.passes += 1;
@@ -251,7 +287,7 @@ function createEngine(canvas, { auto = false, onPass, onHit, onJump } = {}) {
   return {
     get world() { return w; },
     jump() {
-      if (frozen || !alive) return;
+      if (frozen || !alive || slipStopped(w)) return;
       if (!w.air) doJump();
       else w.buf = w.t + 0.12;
     },
@@ -262,6 +298,7 @@ function createEngine(canvas, { auto = false, onPass, onHit, onJump } = {}) {
     reset() { w = newWorld(); draw(); },
     setAuto(b) { isAuto = !!b; },
     setSpeed(px) { w.speed = px; },
+    slip() { w.slipPend = w.t + SLIP_WAIT; },
     fit,
     destroy() {
       alive = false;
@@ -286,7 +323,8 @@ function normQ(q) {
   while (opts.length < 4) opts.push({ id: newId("opt"), text: "" });
   const raw = Array.isArray(q?.answerIds) ? q.answerIds : (q?.answerId ? [q.answerId] : []);
   const answerIds = raw.filter(id => opts.some(o => o.id === id)).slice(0, 1);
-  return { id: q?.id || newId("q"), question: String(q?.question ?? ""), options: opts, answerIds, image: q?.image && q.image.url ? q.image : null };
+  const sec = QUIZ_SECS.includes(Number(q?.sec)) ? Number(q.sec) : QUIZ_SEC;
+  return { id: q?.id || newId("q"), question: String(q?.question ?? ""), options: opts, answerIds, image: q?.image && q.image.url ? q.image : null, sec };
 }
 function cfgOf(slide) {
   const c = slide?.config || {};
@@ -296,7 +334,13 @@ function cfgOf(slide) {
     jumpsPerQuestion: j >= 1 && j <= 10 ? j : 3,
   };
 }
-const newQuestion = () => normQ({ id: newId("q") });
+const newQuestion = (sec = QUIZ_SEC) => normQ({ id: newId("q"), sec });
+// '문제마다 20초' · 문제마다 다르면 '문제마다 10~30초'
+function secText(questions) {
+  const s = questions.map(q => q.sec);
+  const lo = s.length ? Math.min(...s) : QUIZ_SEC, hi = s.length ? Math.max(...s) : QUIZ_SEC;
+  return lo === hi ? `문제마다 ${lo}초` : `문제마다 ${lo}~${hi}초`;
+}
 
 // ── 결과·순위 ──
 const num = (v, d = 0) => (v == null || !isFinite(+v) ? d : +v);
@@ -356,10 +400,21 @@ function leaderboard(rows, { Q, name, meId = null, big = false, limit = 0, showR
   const head = el("div", { class: "dn-lb-row dn-lb-head" }, [
     showRank ? el("span", {}, "순위") : null,
     el("span", {}, "이름"),
-    el("span", { class: "c-num" }, "정답"),
+    el("span", { class: "c-num c-acc" }, "정답"),
     el("span", { class: "c-num" }, "시간"),
     el("span", { class: "c-num" }, "충돌"),
   ]);
+  // 정답 칸: 큰 '맞힌 수/문제 수' + 정답률(푼 문제 중, 80% 이상 초록 · 50% 이상 주황 · 그 아래 빨강)
+  const accEl = (r) => {
+    const n = r.total || Q, c = r.correct || 0;
+    const done = r.kind === "done" ? n : (r.answered || 0); // 완주 = 모두 풂
+    if (!done) return el("span", { class: "dn-acc is-none" }, [el("b", {}, `0/${n}`)]);
+    const pct = Math.round((c / done) * 100);
+    return el("span", { class: "dn-acc", title: `푼 문제 ${done}개 중 ${c}개 정답` }, [
+      el("b", {}, `${c}/${n}`),
+      el("span", { class: `pill ${pct >= 80 ? "pill-ok" : pct >= 50 ? "pill-warn" : "pill-danger"}` }, `${pct}%`),
+    ]);
+  };
   const rowEl = (r) => {
     let time;
     if (r.kind === "done") time = fmtMs(r.timeMs);
@@ -369,7 +424,7 @@ function leaderboard(rows, { Q, name, meId = null, big = false, limit = 0, showR
     return el("div", { class: `dn-lb-row is-${r.kind}${meId && r.sid === meId ? " is-me" : ""}` }, [
       showRank ? el("span", {}, [rk]) : null,
       el("span", { class: "c-name" }, name(r.sid)),
-      el("span", { class: "c-num" }, `${r.correct || 0}/${r.total || Q}`),
+      el("span", { class: "c-num c-acc" }, [accEl(r)]),
       el("span", { class: "c-num" }, [time]),
       el("span", { class: "c-num" }, String(r.hits || 0)),
     ]);
@@ -413,8 +468,31 @@ function Editor({ slide, lesson, update, ctx }) {
   });
   jumps.value = String(cfg.jumpsPerQuestion);
 
+  // 문제 푸는 시간: 위 칸 = 모든 문제에 한 번에(모두 같을 때만 켜짐), 문제 칸마다 따로
+  const sameSec = () => (cfg.questions.length && cfg.questions.every(q => q.sec === cfg.questions[0].sec) ? cfg.questions[0].sec : null);
+  const secSels = new Map(); // q.id → select
+  const timeSeg = el("div", { class: "seg" }, QUIZ_SECS.map(v => el("button", {
+    type: "button", "data-sec": String(v),
+    onClick: () => {
+      for (const q of cfg.questions) { q.sec = v; const s = secSels.get(q.id); if (s) s.value = String(v); }
+      paintSeg(); save();
+    },
+  }, `${v}초`)));
+  const paintSeg = () => { const v = sameSec(); for (const b of timeSeg.children) b.classList.toggle("active", Number(b.dataset.sec) === v); };
+
   const list = el("div", { class: "dn-qlist" });
   function card(q, i) {
+    const sel = el("select", {
+      class: "input input-sm dn-qsec", title: "이 문제 푸는 시간", "aria-label": `문제 ${i + 1} 푸는 시간`,
+      onChange: () => {
+        const cur = cfg.questions.find(x => x.id === q.id);
+        if (!cur) return;
+        cur.sec = QUIZ_SECS.includes(Number(sel.value)) ? Number(sel.value) : QUIZ_SEC;
+        paintSeg(); save();
+      },
+    }, QUIZ_SECS.map(v => el("option", { value: String(v) }, `⏱ ${v}초`)));
+    sel.value = String(q.sec);
+    secSels.set(q.id, sel);
     const del = el("button", {
       class: "btn btn-icon btn-ghost", type: "button", title: "문제 삭제",
       onClick: async () => {
@@ -439,11 +517,13 @@ function Editor({ slide, lesson, update, ctx }) {
       },
     });
     return el("div", { class: "dn-qedit" }, [
-      el("div", { class: "dn-qedit-head" }, [el("span", { class: "dn-qedit-num" }, `문제 ${i + 1}`), del]),
+      el("div", { class: "dn-qedit-head" }, [el("span", { class: "dn-qedit-num" }, `문제 ${i + 1}`), el("span", { class: "dn-spacer" }), sel, del]),
       qe,
     ]);
   }
   function renderList() {
+    secSels.clear();
+    paintSeg();
     if (!cfg.questions.length) list.replaceChildren(el("div", { class: "empty" }, "아직 문제가 없어요"));
     else list.replaceChildren(...cfg.questions.map(card));
   }
@@ -452,7 +532,7 @@ function Editor({ slide, lesson, update, ctx }) {
   const addBtn = el("button", {
     class: "btn btn-sm", type: "button",
     onClick: () => {
-      cfg.questions.push(newQuestion());
+      cfg.questions.push(newQuestion(cfg.questions[cfg.questions.length - 1]?.sec ?? QUIZ_SEC)); // 바로 앞 문제 시간을 이어받음
       save(); renderList();
       list.querySelector(".dn-qedit:last-child textarea")?.focus();
     },
@@ -461,6 +541,10 @@ function Editor({ slide, lesson, update, ctx }) {
   const root = el("div", { class: "dn-edit" }, [
     preview.el,
     el("label", { class: "field" }, [el("span", {}, "선인장 몇 개마다 문제"), jumps]),
+    el("div", { class: "field" }, [
+      el("span", {}, "문제 푸는 시간"), timeSeg,
+      el("div", { class: "hint" }, "여기서 고르면 모든 문제에 적용돼요 · 문제마다 ⏱에서 따로 바꿀 수 있어요"),
+    ]),
     list,
     el("div", {}, [addBtn]),
   ]);
@@ -616,8 +700,10 @@ function Student({ slide, ctx }) {
     qButtons = q.options.map((o, i) => el("button", {
       class: "choice", type: "button", onClick: () => answer(q, o.id, fb),
     }, [el("span", { class: "choice-key" }, optionLetter(i)), el("span", { class: "choice-text" }, o.text || " ")]));
+    const bar = el("i"), barWrap = el("div", { class: "dn-qbar" }, [bar]), left = el("span", { class: "pill" });
     qLayer.replaceChildren(el("div", { class: "dn-qcard" }, [
-      el("div", { class: "dn-qnum" }, `문제 ${answered + 1} / ${Q}`),
+      el("div", { class: "dn-qtop" }, [el("span", { class: "dn-qnum" }, `문제 ${answered + 1} / ${Q}`), left]),
+      barWrap,
       el("h2", { class: "dn-qtext" }, q.question || " "),
       questionImage(q.image),
       el("div", { class: "dn-choices" }, qButtons),
@@ -625,12 +711,25 @@ function Student({ slide, ctx }) {
     ]));
     qLayer.hidden = false;
     layout();
+    // 제한 시간: 0.1초마다 막대·남은 초, 다 되면 '시간 초과'(오답)
+    const limMs = q.sec * 1000, until = performance.now() + limMs, my = gen, k = answered;
+    const tick = () => {
+      if (my !== gen || dead || mode !== "question" || answered !== k) return;
+      const rem = Math.max(0, until - performance.now());
+      bar.style.width = `${(rem / limMs) * 100}%`;
+      barWrap.classList.toggle("urgent", rem <= 5000);
+      const t = `${Math.ceil(rem / 1000)}초`;
+      if (left.textContent !== t) left.textContent = t;
+      if (rem <= 0) answer(q, null, fb);
+      else later(tick, 100);
+    };
+    tick();
   }
 
   function answer(q, id, fb) {
     if (mode !== "question") return;
     mode = "feedback";
-    const ok = q.answerIds.includes(id);
+    const ok = !!id && q.answerIds.includes(id);
     answered += 1;
     if (ok) correct += 1;
     const timeMs = answered >= Q ? Math.round(performance.now() - t0) : null;
@@ -641,7 +740,7 @@ function Student({ slide, ctx }) {
       if (o.id === id) b.classList.add("selected", ok ? "correct" : "wrong");
       if (!ok && q.answerIds.includes(o.id)) b.classList.add("correct");
     });
-    fb.textContent = ok ? "정답!" : "아쉬워요";
+    fb.textContent = ok ? "정답!" : id ? "아쉬워요" : "시간 초과";
     fb.className = `dn-fb ${ok ? "ok" : "bad"}`;
     if (answered < Q) sound.play(ok ? "correct" : "wrong"); // 마지막 문제는 완주 팡파르로
     const hits = engine.world.hits;
@@ -658,7 +757,7 @@ function Student({ slide, ctx }) {
       if (my !== gen || dead) return;
       closeQuestion();
       if (answered >= Q) toDone();
-      else { mode = "play"; engine.freeze(false); layout(); }
+      else { mode = "play"; engine.freeze(false); if (!ok) engine.slip(); layout(); }
     }, FEEDBACK_MS);
   }
 
@@ -834,6 +933,7 @@ function TeacherLive({ slide, ctx }) {
     el("div", {}, [
       kv("문제", el("b", {}, `${Q}개`)),
       kv("문제 간격", el("b", {}, `선인장 ${cfg.jumpsPerQuestion}개`)),
+      kv("푸는 시간", el("b", {}, secText(cfg.questions).replace("문제마다 ", ""))),
       kv("완주", kvDone),
     ]),
   ]);
@@ -887,7 +987,7 @@ function TeacherLive({ slide, ctx }) {
         preview = previewGame();
         body.replaceChildren(
           preview.el,
-          el("div", { class: "dn-info" }, Q ? `문제 ${Q}개 · 선인장 ${cfg.jumpsPerQuestion}개마다 문제` : "아직 문제가 없어요"),
+          el("div", { class: "dn-info" }, Q ? `문제 ${Q}개 · 선인장 ${cfg.jumpsPerQuestion}개마다 문제 · ${secText(cfg.questions)}` : "아직 문제가 없어요"),
         );
       }
     }
@@ -985,6 +1085,11 @@ const CSS = `
 .dn-qlayer { position: absolute; inset: 0; z-index: 5; display: grid; place-items: center; padding: 16px; background: rgba(247, 246, 242, .9); overflow: auto; touch-action: manipulation; }
 .dn-qcard { width: 100%; max-width: 640px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-lg); box-shadow: var(--shadow-2); padding: 20px; display: flex; flex-direction: column; gap: 14px; box-sizing: border-box; }
 .dn-qnum { font-size: 13px; color: var(--muted); font-weight: 600; }
+.dn-qtop { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.dn-qtop .pill { font-variant-numeric: tabular-nums; }
+.dn-qbar { height: 6px; border-radius: 999px; background: var(--surface-2); overflow: hidden; margin-top: -4px; }
+.dn-qbar i { display: block; height: 100%; width: 100%; background: var(--accent); border-radius: inherit; }
+.dn-qbar.urgent i { background: var(--danger); }
 .dn-qtext { margin: 0; font-size: 21px; line-height: 1.45; font-weight: 700; white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; }
 .dn-choices { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 @media (max-width: 560px) { .dn-choices { grid-template-columns: 1fr; } }
@@ -1007,8 +1112,13 @@ const CSS = `
 .dn-stat b { font-size: 20px; font-variant-numeric: tabular-nums; }
 .dn-sub { font-size: 13px; color: var(--muted); min-height: 18px; }
 .dn-lb { display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
-.dn-lb-row { display: grid; grid-template-columns: 48px minmax(0, 1fr) 64px 112px 52px; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
-.dn-lb.no-rank .dn-lb-row { grid-template-columns: minmax(0, 1fr) 64px 112px 52px; }
+.dn-lb-row { display: grid; grid-template-columns: 48px minmax(0, 1fr) 118px 112px 52px; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.dn-lb.no-rank .dn-lb-row { grid-template-columns: minmax(0, 1fr) 118px 112px 52px; }
+.dn-acc { display: inline-flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.dn-acc b { font-size: 1.2em; font-weight: 800; color: var(--ink); }
+.dn-acc .pill { height: 22px; padding: 0 8px; font-size: 13px; font-weight: 800; }
+.dn-acc.is-none b { color: var(--muted); font-weight: 700; }
+.dn-lb-head .c-acc { color: var(--ink); font-weight: 800; }
 .dn-lb-row:first-child { border-top: 0; }
 .dn-lb-head { font-size: 12px; color: var(--muted); background: var(--surface-2); padding-top: 8px; padding-bottom: 8px; }
 .dn-lb-row .c-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
@@ -1021,12 +1131,16 @@ const CSS = `
 .dn-badge.r3 { background: #f3dcc4; }
 .dn-badge.is-none { background: transparent; color: var(--muted); }
 .dn-lb-gap { padding: 2px 14px; color: var(--muted); text-align: center; border-top: 1px solid var(--line); }
-.dn-lb.is-big .dn-lb-row { font-size: 20px; padding: 14px 20px; grid-template-columns: 60px minmax(0, 1fr) 96px 168px 76px; }
+.dn-lb.is-big .dn-lb-row { font-size: 20px; padding: 14px 20px; grid-template-columns: 60px minmax(0, 1fr) 190px 168px 76px; }
+.dn-lb.is-big .dn-acc b { font-size: 30px; }
+.dn-lb.is-big .dn-acc .pill { height: 30px; padding: 0 12px; font-size: 17px; }
 .dn-lb.is-big .dn-lb-head { font-size: 13px; padding-top: 10px; padding-bottom: 10px; }
 .dn-lb.is-big .dn-badge { width: 40px; height: 40px; font-size: 17px; }
 @media (max-width: 480px) {
-  .dn-lb-row, .dn-lb.is-big .dn-lb-row { grid-template-columns: 36px minmax(0, 1fr) 46px 84px 36px; padding: 10px; gap: 6px; font-size: 14px; }
-  .dn-lb.no-rank .dn-lb-row { grid-template-columns: minmax(0, 1fr) 46px 84px 36px; }
+  .dn-lb-row, .dn-lb.is-big .dn-lb-row { grid-template-columns: 36px minmax(0, 1fr) 92px 84px 36px; padding: 10px; gap: 6px; font-size: 14px; }
+  .dn-lb.no-rank .dn-lb-row { grid-template-columns: minmax(0, 1fr) 92px 84px 36px; }
+  .dn-lb.is-big .dn-acc b { font-size: 18px; }
+  .dn-acc .pill, .dn-lb.is-big .dn-acc .pill { height: 20px; padding: 0 6px; font-size: 11px; }
   .dn-lb-row .pill { font-size: 11px; }
 }
 .dn-live { height: 100%; overflow: auto; padding: 24px 32px; display: flex; flex-direction: column; gap: 18px; box-sizing: border-box; }
@@ -1041,10 +1155,11 @@ const CSS = `
 .dn-panel { display: grid; gap: 14px; }
 .dn-kv { display: flex; justify-content: space-between; gap: 8px; padding: 8px 2px; border-bottom: 1px solid var(--line); font-size: 14px; }
 .dn-kv span { color: var(--muted); }
-.dn-edit { padding: 24px; display: grid; gap: 14px; max-width: 760px; margin: 0 auto; width: 100%; box-sizing: border-box; overflow: auto; height: 100%; align-content: start; }
+.dn-edit { padding: 24px; display: grid; grid-auto-rows: max-content; gap: 14px; max-width: 760px; margin: 0 auto; width: 100%; box-sizing: border-box; overflow: auto; height: 100%; align-content: start; }
 .dn-qlist { display: grid; gap: 12px; }
 .dn-qedit { display: flex; flex-direction: column; gap: 10px; padding: 14px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
-.dn-qedit-head { display: flex; align-items: center; justify-content: space-between; }
+.dn-qedit-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.dn-qsec { width: auto; flex: none; }
 .dn-qedit-num { font-weight: 700; font-size: 14px; color: var(--ink-2); }
 .dn-qedit .q-editor > div:last-child { display: none; }
 .dn-qedit .q-opt .btn-icon { display: none; }

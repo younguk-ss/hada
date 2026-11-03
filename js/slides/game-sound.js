@@ -115,8 +115,8 @@ const FX = {
   },
   // 미끄러짐: 타이어 끼익 + 내려가는 음(미끄러지는 시간과 비슷하게)
   slip() {
-    hiss({ f: 2600, f2: 1400, q: 6, dur: 1.1, vol: 0.07, wobble: 22 });
-    tone({ f: 520, f2: 140, dur: 0.9, type: "triangle", vol: 0.06 });
+    hiss({ f: 2600, f2: 1100, q: 6, dur: 1.7, vol: 0.07, wobble: 22 });
+    tone({ f: 520, f2: 110, dur: 1.4, type: "triangle", vol: 0.06 });
   },
   // 결승: 짧은 팡파르
   finish() {

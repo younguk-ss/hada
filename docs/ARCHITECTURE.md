@@ -401,8 +401,8 @@ ctx = {
 | embed | 임베드 | media | `{html:'', src:''}` |
 | video | 동영상 | media | `{url:''}` |
 | videoquiz | 동영상 퀴즈 | media | `{url:'', questions:[]}` |
-| dino | 공룡 점프 | game | `{questions:[], jumpsPerQuestion:3}` |
-| race | 레이싱 퀴즈 | game | `{questions:[], laps:2, quizSec:20}` |
+| dino | 공룡 점프 | game | `{questions:[{…, sec:20}], jumpsPerQuestion:3}` |
+| race | 레이싱 퀴즈 | game | `{questions:[{…, sec:20}], laps:2}` (옛 `quizSec` = sec 없는 문제의 기본값) |
 
 **ink** (`js/slides/ink.js`)
 - 모드: `none`(발표) 학생 readOnly — **교사 필기는 whole scope에 저장되어 학생에게 실시간 표시**; `whole` 모두 같은 캔버스(scope whole); `individual` 학생 각자(scope individual/studentId); `group` 모둠 공유(scope group/groupId), 미배정 학생은 `모둠을 기다리고 있어요` 한 줄 → 배정되면 자동 전환.
@@ -439,27 +439,29 @@ ctx = {
 **videoquiz**: `session.flow==='teacher'`면 교사 페이스 — 영상은 교사 화면에서만 재생, 학생은 `칠판의 영상을 봐주세요`; 시점 도달 시 교사 클라이언트가 일시정지 + `activity.vq={state:'question',qid}`·`vqAsked`, 학생 화면에 문제, `vqRevealed`(전원 응답 시 자동), `[계속 재생]`. `flow==='student'`면 아래 자율 재생. questions `[{id, atSec, kind:'mcq'|'short'|'essay', question, options?:[{id,text}]×4, answerIds?}]` atSec 오름차순. 250ms 폴링(YouTube `getCurrentTime`)/`timeupdate`. 미응답 문제 중 `atSec <= currentTime`이 있으면 일시정지 + 가장 이른 문제 오버레이(탐색으로 건너뛰어도 걸림). 제출 `submit(payload, { itemKey: q.id, correct })` → 닫고 재생. mcq 자동 채점, short(1줄 100자)/essay(여러 줄 1000자) 채점 없음. 교사 panel: 문제별 결과(mcq 막대, 서술 카드). 편집기: URL + 미리보기 플레이어 + `[현재 시점에 문제 추가]`(플레이어 현재 초 → atSec) + 문제 목록(시점 mm:ss 편집 가능).
 
 **dino (공룡 점프)** — `js/slides/dino.js`
-- config `{questions:[{id, question, options:[{id,text}]×4, answerIds:[id]}], jumpsPerQuestion:3}`, questions ≥1(validate).
+- config `{questions:[{id, question, options:[{id,text}]×4, answerIds:[id], sec}], jumpsPerQuestion:3}`, questions ≥1(validate). `sec` = 문제 제한 시간(v2.14, 10·15·20·30·45·60·90·120초, 기본 20초).
 - 입력: 게임 영역 탭/클릭, Space, ArrowUp = 점프(pointerdown, 공중 점프 불가, `touch-action:none`).
 - 시작: 교사 `[시작]` → 학생 3·2·1 카운트다운 후 `t0 = performance.now()`. running 중 늦게 들어온 학생도 즉시 플레이.
-- 진행: 캔버스(논리 800×240, devicePixelRatio 대응, 폭에 맞춰 스케일). 선인장 1.1~2.0초 랜덤 간격, 기본 속도 320px/s, 문제 하나 풀 때마다 +6%. **장애물을 넘어 통과한 횟수**가 `jumpsPerQuestion`의 배수가 될 때마다 정지 + 문제 오버레이(제한 없음). 답 → 정오 0.8초 표시 → 재개.
+- 진행: 캔버스(논리 800×240, devicePixelRatio 대응, 폭에 맞춰 스케일). 선인장 1.1~2.0초 랜덤 간격, 기본 속도 320px/s, 문제 하나 풀 때마다 +6%. **장애물을 넘어 통과한 횟수**가 `jumpsPerQuestion`의 배수가 될 때마다 정지 + 문제 오버레이(제한 = 문제의 `sec`, 남은 초·막대, 다 되면 '시간 초과' = 오답). 답 → 정오 0.8초 표시 → 재개.
+- **오답 미끄러짐(v2.14)**: 재개 0.25초 뒤(지나온 선인장이 비켜난 뒤, 땅에 있을 때) 세상이 멈춘 채 공룡이 0.35초 동안 뒤로 64px 미끄러지고(흙먼지) 0.5초 어질어질(별, 점프 불가) → 1.1초에 걸쳐 제자리로. 충돌 판정·통과 판정도 미끄러진 자리 기준.
 - 충돌: 게임오버 아님. `hits += 1`, 0.8초 무적 + 깜빡임, 통과로 세지 않음.
 - 종료: 마지막 문제 답 제출 시. `timeMs = performance.now() - t0`. `submit({correct,total,timeMs,hits}, {itemKey:'result', score:correct, correct: correct===total, timeMs})`.
 - 순위: correct 내림차순 → timeMs 오름차순 → hits 오름차순. 학생 종료 화면: `3위 / 24명` · 정답 n/Q · 시간 · 충돌.
+- 리더보드 정답 칸(v2.14): 큰 `맞힌 수/Q` + 정답률 배지(푼 문제 중, 80% 이상 초록 · 50% 이상 주황 · 그 아래 빨강). 교사 화면(`is-big`)은 더 크게.
 - broadcast `dino:progress {sid, answered, correct, hits}` 문제 답할 때마다 → 교사 리더보드 실시간('진행 중' 행 포함).
 - 그래픽: 픽셀 느낌의 단색 공룡/선인장(크롬 공룡 오마주, 캔버스 도형으로 직접 그림 — 외부 이미지 금지), 땅 선, 구름 약간.
 
 **race (레이싱 퀴즈)** — `js/slides/race.js`
-- config `{questions:[{id, question, options:[{id,text}]×4, answerId}], laps:2}` (4지선다 고정, 정답 1개 교사 선택). questions ≥1.
+- config `{questions:[{id, question, options:[{id,text}]×4, answerId, sec}], laps:2}` (4지선다 고정, 정답 1개 교사 선택). questions ≥1.
 - **조 편성**(교사 `[시작]` 시 1회): `ids = online ∩ participants`(없으면 participants), `groupStudents(ids, 4)` → `activity = { phase:'running', startedAt: Date.now()+3000 /*3초 카운트다운*/, groups:[{id:'g1', name:'1조', memberIds}] }`. n=0이면 toast('참여 학생이 없어요'). lane = memberIds 인덱스(0~3).
 - **주행**: 입력 없음. 자동 주행, 기본 속도 = `1랩/12초`. 트랙 = 캔버스 둥근 직사각형(스타디움형) 오벌, 연석(빨강/흰색 줄무늬), 체크 무늬 결승선, 4개 레인. 차는 위에서 본 카트(색 4종: 초록·빨강·파랑·노랑) + 이름표.
-- **퀴즈 체크포인트**: Q문항, k번째(1..Q) 문제는 진행도 `laps*k/(Q+1)`(랩 단위)에서 차가 정지하고 4지선다 오버레이(제한 = `config.quizSec`, 편집기 '문제 푸는 시간' 10·15·20·30·45·60초, 기본 20초 — v2.11. 미응답=오답. 시뮬레이션에 넘겨 모든 화면이 같은 값).
-- **정답** = 부스터: 2.5초 동안 속도 ×2.0(불꽃 효과). **오답** = 미끄러짐: 1.5초 정지(스핀, v2.11에서 1초→1.5초) 후 2.5초 동안 ×0.5.
+- **퀴즈 체크포인트**: Q문항, k번째(1..Q) 문제는 진행도 `laps*k/(Q+1)`(랩 단위)에서 차가 정지하고 4지선다 오버레이(제한 = 문제마다 `q.sec` — v2.14. 편집기 문제 칸의 ⏱(10·15·20·30·45·60·90·120초, 기본 20초, 새 문제는 바로 앞 문제 값), 위 '문제 푸는 시간'을 누르면 모든 문제에 한 번에. sec 없는 옛 문제는 `config.quizSec`(v2.11) → 20초. 미응답=오답. 문제별 제한 배열을 시뮬레이션에 넘겨 모든 화면이 같은 값).
+- **정답** = 부스터: 3초 동안 속도 ×2.5(불꽃 효과). **오답** = 미끄러짐: 2.5초 동안 스핀하며 **뒤로 0.2랩 밀림**(점점 느려짐) → 멈춘 자리에서 4초 동안 ×0.5 (v2.14). 기준: 찍기(1.5초·정답 25%)가 성실하게 푸는 학생(6초·85%)보다 늦게 들어오게 — 2바퀴 5문제 평균 54초 vs 49초(v2.13 규칙에서는 39초 vs 48초로 찍기가 빨랐다). 랩 통과는 처음 넘은 한 번만 센다(뒤로 밀려 결승선 뒤로 갔다가 다시 넘어도 그대로).
 - **효과음(v2.11, `js/slides/game-sound.js`)**: Web Audio로 합성(소리 파일 없음), 모두 작게. 학생 — 달리는 동안 배경음악, 카운트다운 삑·GO, 정답 부스터 쉭, 오답 타이어 끼익, 결승 팡파르(이 화면에서 달리다가 결승했을 때만). 교사 — 경주 중 배경음악(전원 완주하면 끔), 카운트다운, 학생이 결승할 때마다 짧은 소리. 공룡 점프도 같은 모듈(배경음악·점프·충돌·정답·오답·완주). HUD·머리 줄의 🔊 버튼 = 기기마다 음소거(`localStorage hada:gameSound`). 브라우저 정책상 첫 탭 뒤부터 소리가 난다(게임 화면이 붙어 있는 동안 첫 누르기에서 깨움), 탭이 숨겨지면 배경음악 멈춤.
 - **결정적 시뮬레이션 + 이산 이벤트**(위치 스트림 금지): 각 클라이언트는 같은 규칙으로 모든 차를 시뮬레이션한다. 학생은 `race:answer {sid, gid, k, correct, at /* startedAt 기준 ms */}`(문항당 1회)와 `race:finish {sid, gid, lapMs:[…], totalMs, correct, total}`만 보낸다. 수신자는 상대 차가 체크포인트 k에 도달하면 해당 answer 이벤트가 올 때까지 정지 상태로 그린다.
 - **랩타임**: 랩 경계 통과 시 `lapMs.push(now - lapStart)`(문제 시간 포함). 결승(진행도 ≥ laps) → `submit({lapMs,totalMs,correct,total,gid}, {itemKey:'result', score:correct, timeMs:totalMs})` + `race:finish`.
 - **학생 화면**: 자기 조 트랙만(최대 4대, 이름표, 랩 `1/2`, 지난 랩타임). 미배정(늦게 입장) → `다음 경기에 참여해요`. 결승 후 조 내 순위·랩타임 카드, 다른 차 계속 표시.
-- **교사 TeacherLive**: 모든 조의 미니 트랙 그리드(조당 1칸). panel: 조별 표(순위, 이름, 랩1, 랩2, 합계, 정답 n/Q), 조별 우승자 = totalMs 최소(🏆), 미완주 DNF. 버튼 `[시작]` / `[종료]`(미완주 DNF 확정, phase ended) / `[다시]`(clearResponses, idle).
+- **교사 TeacherLive**: 모든 조의 미니 트랙 그리드(조당 1칸). panel: `[조별 | 정답순]`. 조별 표(순위, 이름, **정답**, 합계, 랩1, 랩2 — 정답 칸은 큰 `맞힌 수/Q` + 정답률 배지, 주행 중이면 지금까지 푼 문제 기준), 조별 우승자 = totalMs 최소(🏆), 미완주 DNF. 정답순 = 모든 조 학생을 정답 수 → 정답률 → 기록 순(정답 수가 같으면 같은 순위, 🥇🥈🥉). 조 크게 보기 칩에도 `정답 n/Q`(정답률 색). 버튼 `[시작]` / `[종료]`(미완주 DNF 확정, phase ended) / `[다시]`(clearResponses, idle).
 - 자동 종료: 배정 학생 전원이 완주하면 3초 후 교사 클라이언트가 phase ended.
 
 ---
