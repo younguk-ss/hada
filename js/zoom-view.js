@@ -50,7 +50,9 @@ export function pageRectFor(src) {
   });
 }
 
-export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
+// include(v2.13, 선택): 맞춤 대상에 더할 영역(슬라이드 정규화) — 기록 크게 보기에서 학생 필기 범위를 넣어 내용 영역 밖에 쓴 답도 처음부터 보이게.
+//       종이 안으로 자른다(이동도 종이 안에서만이므로).
+export function createZoomView({ viewport, frame, canvas, ink, getImg, src, include = null }) {
   let VW = 0, VH = 0;
   let insets = { top: 0, right: 0, bottom: 0, left: 0 };
   let baseW = 1;                       // 확대 1배(16:10 전체가 보임)일 때 슬라이드 폭
@@ -161,6 +163,11 @@ export function createZoomView({ viewport, frame, canvas, ink, getImg, src }) {
     paper = paperFor(a);
     const b = a <= 1.25 ? focusCache.get(analyzeSrc || img.currentSrc || img.src) : null;
     focus = mapFocus(paper, b);
+    if (include) {
+      const u = { x0: Math.min(focus.x0, include.x0), y0: Math.min(focus.y0, include.y0), x1: Math.max(focus.x1, include.x1), y1: Math.max(focus.y1, include.y1) };
+      const c = { x0: Math.max(paper.x0, u.x0), y0: Math.max(paper.y0, u.y0), x1: Math.min(paper.x1, u.x1), y1: Math.min(paper.y1, u.y1) };
+      if (c.x1 > c.x0 && c.y1 > c.y0) focus = c;
+    }
   }
   function pageChanged() {
     updatePaper();

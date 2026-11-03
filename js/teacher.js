@@ -42,6 +42,7 @@ import { renderSlide } from "./lesson-view.js";
 import { openStudentPrint, openBlankPrint, printStudents, printRecordView, reviewUrl } from "./print.js";
 import { wsPages, wsForced, setWsForce, wsPageTitle, wsStats, makeWsSessionView, wsCss, wsRecord, wsLastTs } from "./worksheet.js";
 import { pageRectFor } from "./zoom-view.js";
+import { openInkViewer } from "./slides/ink.js";
 import { createPopupView, popOf, findPopSlide, setPop, freshHotspotIds, hotspotsOf, popSlideFor } from "./popup.js";
 
 const TABS = ["lessons", "records", "students", "code"];
@@ -98,6 +99,8 @@ const TEACHER_CSS = `
 .t-quick-editor { position:relative; min-height:220px; max-height:min(62vh, 560px); overflow:auto; margin:0 -4px; }
 .t-quick-editor > .slide-host { height:auto; }
 .person .pill { height:20px; padding:0 8px; font-size:11px; }
+.people-sep { display:flex; align-items:center; gap:8px; margin:8px 8px 2px; font-size:12px; font-weight:600; color:var(--muted); }
+.people-sep::after { content:""; flex:1; height:1px; background:var(--line); }
 .t-meta { display:flex; flex-wrap:wrap; align-items:center; gap:6px 14px; margin:-12px 0 20px; color:var(--muted); font-size:13px; }
 .t-detail-bar { margin-bottom:16px; }
 .t-review-row { display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:8px; padding-top:16px; border-top:1px solid var(--line); width:100%; }
@@ -133,6 +136,10 @@ const TEACHER_CSS = `
 .t-wsp.ready .t-wsp-in { visibility:visible; }
 .t-wsp-in > .slide-frame { width:100% !important; margin:0; border-radius:0; box-shadow:none; }
 @media print { .t-ws-grid { grid-template-columns:1fr 1fr; } .t-ws-card { break-inside:avoid; } .t-wsp { box-shadow:none; } }
+/* 누르면 크게 보기(v2.13) */
+.t-zoomable { cursor:zoom-in; border-radius:8px; }
+.t-zoomable:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+@media (hover:hover) { .t-wsp.t-zoomable:hover { border-color:var(--line-strong); box-shadow:var(--shadow-2); } .t-mini.t-zoomable:hover .slide-frame { box-shadow:0 0 0 1px var(--line-strong), var(--shadow-2); } }
 `;
 function ensureCss() { injectCss("teacher-views", TEACHER_CSS); }
 
@@ -1613,35 +1620,45 @@ function buildLive(sessionId, teacher) {
   function onlineSet() {
     try { return new Set(ch.online() || []); } catch (_) { return new Set(); }
   }
+  // 순서용 '접속 중'(방금 끊긴 학생도 10초는 그 자리 — realtime recent)
+  function recentSet() {
+    try { return new Set((ch.recent ? ch.recent() : ch.online()) || []); } catch (_) { return new Set(); }
+  }
   function syncOnline() { syncRail(); }
+  // 참여 목록(v2.13): 접속 중인 학생을 위에 번호순, 그 아래 접속하지 않은 학생 번호순(이름을 잘못 넣고 다시 들어온 옛 이름 등)
   function syncPeople() {
     const s = S();
     if (!s) return;
     const slide = curSlide(s);
     const def = slide ? getSlideType(slide.type) : null;
     const interact = !!def && def.category === "interact";
-    const online = onlineSet();
+    const online = onlineSet(), recent = recentSet();
     const ids = [...new Set([...(s.participants || []), ...online])];
     const responded = new Set(interact ? ((s.responses || {})[slide.id] || []).map(r => r.studentId) : []);
     const groupOf = new Map();
     (s.groups || []).forEach(g => (g.memberIds || []).forEach(m => groupOf.set(m, g.name || "모둠")));
-    const sig = JSON.stringify([ids, [...online], interact ? [...responded] : 0, [...groupOf], slide && slide.id,
+    const sig = JSON.stringify([ids, [...online].sort(), [...recent].sort(), interact ? [...responded] : 0, [...groupOf], slide && slide.id,
       ids.map(id => (findStudent(id) ? 1 : 0)).join("")]);
     if (sig === peopleSig) return;
     peopleSig = sig;
     const onCount = ids.filter(x => online.has(x)).length;
     peopleHead.textContent = `참여 ${ids.length} · 접속 ${onCount}`;
     if (!ids.length) { peopleList.replaceChildren(el("div", { class: "empty" }, "아직 아무도 없어요")); return; }
-    const rows = ids.map(id => ({ id, st: findStudent(id) })).sort((a, b) => cmpStudent(a.st, b.st));
-    peopleList.replaceChildren(...rows.map(({ id, st }) => {
+    const rows = ids.map(id => ({ id, st: findStudent(id), up: recent.has(id) }))
+      .sort((a, b) => (b.up - a.up) || cmpStudent(a.st, b.st));
+    const offAt = rows.findIndex(r => !r.up);
+    peopleList.replaceChildren(...rows.flatMap(({ id, st }, i) => {
       const on = online.has(id);
-      return el("div", { class: "person" + (on ? "" : " offline") }, [
-        el("span", { class: "dot" + (on ? " on" : "") }),
-        el("span", { class: "name" }, st ? studentLabel(st) : "학생"),
-        interact && !responded.has(id) ? el("span", { class: "pending" }, "미제출") : null,
-        groupOf.has(id) ? el("span", { class: "pill pill-muted" }, groupOf.get(id)) : null,
-      ]);
-    }));
+      return [
+        i === offAt && offAt > 0 ? el("div", { class: "people-sep" }, `접속 안 함 ${rows.length - offAt}`) : null,
+        el("div", { class: "person" + (on ? "" : " offline") }, [
+          el("span", { class: "dot" + (on ? " on" : "") }),
+          el("span", { class: "name" }, st ? studentLabel(st) : "학생"),
+          interact && !responded.has(id) ? el("span", { class: "pending" }, "미제출") : null,
+          groupOf.has(id) ? el("span", { class: "pill pill-muted" }, groupOf.get(id)) : null,
+        ]),
+      ];
+    }).filter(Boolean));
   }
 
   // ── 학습지 ──
@@ -2189,12 +2206,15 @@ export function sessionDetailView({ id } = {}) {
           myGroup: () => (s.groups || []).find(g => (g.memberIds || []).includes(picked)) || null,
         }));
       };
+      // 필기·학습지 칸을 누르면 크게 보기(v2.13) — 이 학생의 필기를 ◀ ▶로 넘겨 본다
+      const who = st ? studentLabel(st) : "학생";
+      const views = [];
       const sections = slides.flatMap((sl, i) => [
-        slideSection(sl, i, sl.type === "ink" ? inkFor(s, sl, picked) : mineOf(sl)),
+        slideSection(sl, i, sl.type === "ink" ? inkFor(s, sl, picked, { views, title: `${who} · ${i + 1}. ${slideLabel(sl)}` }) : mineOf(sl)),
         ...popsOf(sl).map(ps => slideSection(ps, i, mineOf(ps), "팝업")),
       ]);
-      const wsSections = ws.map((p, i) => slideSection(p, slides.length + i, inkFor(s, p, picked), "학습지"));
-      content.replaceChildren(chips, el("h2", { class: "t-print-only" }, st ? studentLabel(st) : "학생"), ...sections, ...wsSections);
+      const wsSections = ws.map((p, i) => slideSection(p, slides.length + i, inkFor(s, p, picked, { views, title: `${who} · ${p.title}` }), "학습지"));
+      content.replaceChildren(chips, el("h2", { class: "t-print-only" }, who), ...sections, ...wsSections);
     }
 
     // 학습지(v2.12): 학생을 골라 그 학생 학습지만 — 쪽마다 종이 부분을 잘라 크게. ←/→(또는 ◀ ▶)로 다음 학생
@@ -2222,12 +2242,24 @@ export function sessionDetailView({ id } = {}) {
         el("div", { class: "t-ws-who" }, [el("strong", {}, label(cur)), el("span", {}, n ? `학습지 ${ws.length}쪽 중 ${n}쪽 작성` : "아직 쓰지 않았어요")]),
         el("button", { class: "btn btn-icon btn-ghost no-print", type: "button", "aria-label": "다음 학생", title: "다음 학생 (→)", disabled: at >= parts.length - 1, onClick: () => wsNav(1) }, icon("chevron-right")),
       ]);
+      // 쪽을 누르면 크게 보기(v2.13) — 이 학생의 학습지를 ◀ ▶로 넘겨 본다
+      const views = ws.map(p => ({ slide: p, scope: "individual", scopeId: picked, title: `${label(cur)} · ${p.title}` }));
       const grid = el("div", { class: "t-ws-grid" }, ws.map((p, k) => el("figure", { class: "t-ws-card" }, [
-        wsPageView(s, p, picked),
+        zoomOnClick(wsPageView(s, p, picked), () => openInkViewer({ session: s, items: views, index: k, modal })),
         el("figcaption", {}, [el("span", { class: "t-sum-num" }, String(k + 1)), p.title,
           wsLastTs(wsRecord(s, picked, p.id), picked) ? null : el("span", { class: "muted" }, "· 빈 쪽")]),
       ])));
       content.replaceChildren(chips, head, grid);
+    }
+    // 기록 칸을 누르면(또는 Enter) 크게 보기
+    function zoomOnClick(node, open) {
+      node.classList.add("t-zoomable");
+      node.setAttribute("role", "button");
+      node.tabIndex = 0;
+      node.title = "크게 보기";
+      node.addEventListener("click", open);
+      node.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
+      return node;
     }
     function wsNav(d) {
       const s = findSession(id);
@@ -2273,8 +2305,8 @@ export function sessionDetailView({ id } = {}) {
     };
     document.addEventListener("keydown", onWsKey);
 
-    // 학생 한 명의 필기(읽기 전용)
-    function inkFor(s, slide, studentId) {
+    // 학생 한 명의 필기(읽기 전용). zoom = { views, title } 이면 누르면 크게 보기(views에 이 칸을 더함)
+    function inkFor(s, slide, studentId, zoom = null) {
       const R = s.records || {};
       const has = (rec) => !!rec && (((rec.strokes || []).length) || ((rec.texts || []).length));
       const g = (s.groups || []).find(x => (x.memberIds || []).includes(studentId));
@@ -2291,6 +2323,11 @@ export function sessionDetailView({ id } = {}) {
       } catch (e) {
         console.warn("[detail] 필기 표시 실패", e);
         frame.replaceChildren(el("div", { class: "muted" }, "이 슬라이드를 불러오지 못했어요"));
+        return frame;
+      }
+      if (zoom) {
+        const k = zoom.views.push({ slide, scope: pick.scope, scopeId: pick.scopeId, title: zoom.title }) - 1;
+        zoomOnClick(frame, () => openInkViewer({ session: s, items: zoom.views, index: k, modal }));
       }
       return frame;
     }

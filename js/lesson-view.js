@@ -214,7 +214,7 @@ export function imageLayer(slide, { lazy = false } = {}) {
   }));
 }
 
-export function renderSlide({ root, slide, session, scope, scopeId, readOnly, authorId, onChange, zoom = false }) {
+export function renderSlide({ root, slide, session, scope, scopeId, readOnly, authorId, onChange, zoom = false, zoomInclude = null }) {
   injectCss("lesson-view", BASE_CSS);
   const noScopeId = (scope === "individual" || scope === "group") && !scopeId;
   const writable = !readOnly && !noScopeId && scope !== "ppt" && scope !== "bg";
@@ -259,7 +259,7 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
     },
   });
 
-  const zv = zoom ? createZoomView({ viewport: root, frame, canvas, ink, getImg: () => img, src: slide.thumb || slide.bg }) : null;
+  const zv = zoom ? createZoomView({ viewport: root, frame, canvas, ink, getImg: () => img, src: slide.thumb || slide.bg, include: zoomInclude }) : null;
   let zvSrc = slide.bg || null;
 
   // 텍스트 상자 선택(v2.8) — 쓸 수 있는 화면에서만

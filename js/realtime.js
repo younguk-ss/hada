@@ -9,6 +9,8 @@
 //       'responses:del' 수신 → cloud.applyResponseDelete.
 // 가정: 교사 시계 — 'session:patch'의 sentAt(교사 Date.now())으로 표본 offset = sentAt - 로컬 now를 세션별 최근 8개 보관,
 //       추정 offset = max(표본)(지연이 가장 작은 표본). teacherNow(id) = Date.now() + offset (표본 없음·교사 본인이면 0).
+// 가정(v2.13): recent() = 접속 중 ∪ 끊긴 지 AWAY_MS 안 된 학생 — 교사 화면의 '접속 중 먼저' 순서용. 태블릿이 잠깐 잠들거나
+//       와이파이가 끊겼다 붙어도 목록이 아래·위로 출렁이지 않게. 점(접속 표시)은 online() 그대로. 유예가 끝나면 presence 알림을 한 번 더 보낸다.
 import { cloudEnabled, clientReady, supaClient, clientId, applySessionPatch, sessionHelloState, applyResponseDelete, ensureStudentsLoaded } from "./cloud.js";
 import { store } from "./store.js";
 
@@ -16,6 +18,7 @@ const cores = new Map(); // sessionId → core
 let current = null;      // 최근 join한 handle
 
 const BUDGET = 20;       // 송신 ≤ 20 msg/s
+const AWAY_MS = 10000;   // 끊긴 학생을 '접속 중' 순서에 남겨 두는 시간
 
 const clockSamples = new Map(); // sessionId → [offset, ...] (최근 8개)
 function addClockSample(sessionId, sentAt) {
@@ -40,6 +43,9 @@ function createCore(sessionId, me) {
     listeners: new Map(),      // event → Set<cb>
     presenceCbs: new Set(),
     online: new Set(),
+    recent: new Set(),         // online ∪ 방금 끊긴 학생(AWAY_MS 안)
+    away: new Map(),           // 끊긴 학생 id → 끊긴 시각
+    awayTimer: null,
     queue: [],                 // 구독 전/예산 초과 송신 대기
     sentAt: [],
     joined: false, tracked: false,
@@ -80,7 +86,19 @@ function createCore(sessionId, me) {
           if (m && m.role === "student") ids.add(m.id || key);
         }
       }
+      const now = Date.now();
+      for (const id of core.online) if (!ids.has(id)) core.away.set(id, now);
+      const recent = new Set(ids);
+      let wake = Infinity;
+      for (const [id, t] of core.away) {
+        if (ids.has(id) || now - t >= AWAY_MS) { core.away.delete(id); continue; }
+        recent.add(id);
+        wake = Math.min(wake, t + AWAY_MS - now);
+      }
       core.online = ids;
+      core.recent = recent;
+      clearTimeout(core.awayTimer);
+      core.awayTimer = wake < Infinity ? setTimeout(() => core.presenceChanged(), wake + 20) : null;
       // 교사: presence에만 있는(참여 행이 아직 안 보인) 학생도 이름이 보이게 1회 조회
       if (core.me.role === "teacher" && !core.local) { try { ensureStudentsLoaded(ids); } catch (_) {} }
       [...core.presenceCbs].forEach(cb => { try { cb(ids); } catch (e) { console.error("[realtime] presence 오류:", e); } });
@@ -201,7 +219,7 @@ function startLocal(core) {
 function destroyCore(core) {
   if (core.dead) return;
   core.dead = true;
-  clearTimeout(core.leaveTimer); clearTimeout(core.presTimer); clearTimeout(core.helloTimer); clearTimeout(core.pumpTimer);
+  clearTimeout(core.leaveTimer); clearTimeout(core.presTimer); clearTimeout(core.helloTimer); clearTimeout(core.pumpTimer); clearTimeout(core.awayTimer);
   core.timers.forEach(t => clearInterval(t));
   if (cores.get(core.sessionId) === core) cores.delete(core.sessionId);
   if (core.local) {
@@ -233,6 +251,7 @@ function makeHandle(core) {
       return () => { off(); offs.delete(off); };
     },
     online() { return core.online; },
+    recent() { return core.recent; },
     now() { return teacherNow(core.sessionId); },
     onPresence(cb) {
       if (left) return () => {};

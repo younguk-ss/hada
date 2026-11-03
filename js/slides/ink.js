@@ -186,6 +186,15 @@ const CSS = `
 .ink-tile-name .dot.on { background:var(--ok); }
 .ink-tile-name .ink-cnt { margin-left:auto; color:var(--muted); font-variant-numeric:tabular-nums; }
 .ink-zoom { display:flex; flex-direction:column; gap:10px; height:min(72dvh, 640px); min-height:280px; }
+/* 기록 크게 보기(v2.13): 세로 학습지가 크게 보이게 키 큰 창 */
+.ink-iv-modal { width:min(1100px, 100%); }
+.ink-iv { gap:8px; height:min(calc(100dvh - 150px), 1000px); min-height:280px; outline:none; }
+.ink-iv-view { position:relative; flex:1; min-height:0; display:flex; border-radius:var(--radius-sm); background:var(--surface-2); overflow:hidden; }
+.ink-iv-nav { flex:none; display:flex; align-items:center; justify-content:center; gap:6px; }
+.ink-iv-pos { min-width:64px; text-align:center; font-size:14px; font-weight:650; font-variant-numeric:tabular-nums; color:var(--ink-2); }
+/* 누르면 크게 보기(기록 칸) */
+.ink-tile.can-zoom { cursor:zoom-in; }
+.ink-mini.can-zoom { cursor:zoom-in; }
 .ink-insp-bg { position:relative; aspect-ratio:16/10; border:1px solid var(--line); border-radius:var(--radius-sm); background:#fff; overflow:hidden;
   display:grid; place-items:center; color:var(--muted); font-size:13px; }
 .ink-insp-bg img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
@@ -238,13 +247,25 @@ function studentName(id, ctx) {
   if (!s) return "학생";
   return s.num != null && s.num !== "" ? `${s.num}. ${s.name}` : s.name;
 }
+// 번호순(학년·반·번호·이름). 이름을 아직 모르는 학생은 뒤로
 function studentSort(ctx) {
   const map = ctx?.students?.() || new Map();
   return (a, b) => {
-    const x = map.get(a) || {}, y = map.get(b) || {};
+    const x = map.get(a), y = map.get(b);
+    if (!x || !y) return (x ? 0 : 1) - (y ? 0 : 1);
     return (+x.grade || 0) - (+y.grade || 0) || (+x.classNum || 0) - (+y.classNum || 0) || (+x.num || 0) - (+y.num || 0)
       || String(x.name || "").localeCompare(String(y.name || ""), "ko");
   };
+}
+// 교사 화면 학생 순서(v2.13): 접속 중(방금 끊긴 학생은 10초 유예 — realtime recent)을 위에, 그 안에서 번호순
+function recentIds(ctx) {
+  const ch = typeof realtime.currentChannel === "function" ? realtime.currentChannel() : null;
+  try { const r = ch?.recent?.(); if (r) return r; } catch (_) {}
+  return ctx?.online?.() || new Set();
+}
+function statusSort(ctx) {
+  const up = recentIds(ctx), by = studentSort(ctx);
+  return (a, b) => (up.has(b) ? 1 : 0) - (up.has(a) ? 1 : 0) || by(a, b);
 }
 
 // 스테이지에 16:10 프레임을 contain으로 맞춤
@@ -462,6 +483,83 @@ function openModal(ctx, { title, body, actions = [], onClose }) {
   const mo = new MutationObserver(check);
   mo.observe(document.body, { childList: true });
   return { close, isOpen: () => !closed };
+}
+
+function scopeRec(session, slide, scope, scopeId) {
+  const R = session?.records || {};
+  if (scope === "whole") return R.__whole?.[slide.id] || null;
+  if (scope === "group") return R.__groups?.[scopeId]?.[slide.id] || null;
+  return R[scopeId]?.[slide.id] || null;
+}
+// 기본 필기 + 레코드가 차지한 범위(슬라이드 정규화, 둘레 여유 포함). 없으면 null
+function inkExtent(slide, rec) {
+  const rm = new Set((rec && rec.removed) || []);
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const add = (x, y) => { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; };
+  [...(slide.strokes || []), ...((rec && rec.strokes) || [])].forEach((s, i) => {
+    if (!s || s.tool === "eraser" || rm.has(s.id || "#" + i)) return;
+    for (const p of s.points || []) add(p.x, p.y);
+  });
+  for (const t of [...(slide.texts || []), ...((rec && rec.texts) || [])]) {
+    if (!t || !String(t.value || "").trim() || (t.id && rm.has(t.id))) continue;
+    // 칸 크기(t.w·t.h)가 있으면 그 칸, 없으면 글자 수로 어림(writingRegion과 같은 계산)
+    const fw = t.w > 0 ? t.w : String(t.value).length * (t.size || 18) / 960 * 0.6;
+    const fh = Math.max(t.h > 0 ? t.h : 0, (t.size || 18) * 1.4 / 600);
+    add(t.x, t.y); add(t.x + fw, t.y + fh);
+  }
+  if (!(x1 >= x0 && y1 >= y0)) return null;
+  return { x0: x0 - 0.015, y0: y0 - 0.024, x1: x1 + 0.015, y1: y1 + 0.024 };
+}
+
+// ── 크게 보기(읽기 전용, v2.13): 수업 기록의 학습지·필기를 누르면 팝업으로 ──
+// items = [{ slide, scope, scopeId, title }] — 한 학생의 여러 쪽(학습지·학생별) 또는 한 슬라이드의 여러 학생(슬라이드별)
+// 확대 보기(zoom-view)라 세로 학습지는 내용이 화면에 꽉 차게 맞추고, 두 손가락·Ctrl+휠·[− 100% +]로 확대, 끌기·휠로 이동.
+// 여러 개면 ◀ n/N ▶·←/→로 앞뒤(같은 창에서 바꿔 그림 — 이전 보기는 정리).
+export function openInkViewer({ session, items, index = 0, modal = ui.modal } = {}) {
+  injectCss("ink", CSS);
+  const list = (items || []).filter(it => it && it.slide);
+  if (!list.length || typeof modal !== "function") return null;
+  let i = Math.max(0, Math.min(list.length - 1, index | 0));
+  let viewer = null, h3 = null, stage = el("div", { class: "ink-stage" });
+  const zp = zoomPill(() => viewer);
+  const pos = el("span", { class: "ink-iv-pos" });
+  const prev = el("button", { type: "button", class: "btn btn-icon btn-ghost", "aria-label": "이전", title: "이전 (←)", onClick: () => go(-1) }, [icon("chevron-left")]);
+  const next = el("button", { type: "button", class: "btn btn-icon btn-ghost", "aria-label": "다음", title: "다음 (→)", onClick: () => go(1) }, [icon("chevron-right")]);
+  const body = el("div", { class: "ink-wrap ink-iv", tabindex: "-1" }, [
+    el("div", { class: "ink-iv-view" }, [stage, zp]),
+    list.length > 1 ? el("div", { class: "ink-iv-nav" }, [prev, pos, next]) : null,
+  ]);
+  function show() {
+    const it = list[i];
+    viewer?.destroy(); viewer = null;
+    const st = el("div", { class: "ink-stage" });
+    stage.replaceWith(st); stage = st;
+    const include = inkExtent(it.slide, scopeRec(session, it.slide, it.scope, it.scopeId)); // 맞춤 = 학습지 내용 ∪ 필기(빈 칸에 쓴 답도 보이게)
+    try { viewer = renderSlide({ root: stage, slide: it.slide, session, scope: it.scope, scopeId: it.scopeId, readOnly: true, zoom: true, zoomInclude: include }); }
+    catch (e) { console.warn("[ink] 크게 보기 실패", e); stage.replaceChildren(el("div", { class: "empty" }, "불러오지 못했어요")); }
+    zp.bindZoom(viewer);
+    pos.textContent = `${i + 1} / ${list.length}`;
+    prev.disabled = i <= 0;
+    next.disabled = i >= list.length - 1;
+    if (h3) h3.textContent = it.title || "";
+  }
+  function go(d) {
+    const j = i + d;
+    if (j < 0 || j >= list.length) return;
+    i = j;
+    show();
+  }
+  // 창 안의 키만 받는다(ui.modal 레이어가 바깥 키를 막음) — 열 때 창에 포커스
+  body.addEventListener("keydown", (e) => {
+    if (e.altKey || e.ctrlKey || e.metaKey || e.isComposing) return;
+    if (e.key === "ArrowLeft") { e.preventDefault(); go(-1); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); go(1); }
+  });
+  const m = modal({ title: list[i].title || "크게 보기", body, wide: true, className: "ink-iv-modal", onClose: () => { viewer?.destroy(); viewer = null; } });
+  h3 = m?.root?.querySelector?.(".modal-head h3") || null;
+  show();
+  requestAnimationFrame(() => { try { body.focus({ preventScroll: true }); } catch (_) {} });
+  return m;
 }
 
 // 미니 프레임(배경 + 필기). 반환 el에 .paint(rec) 메서드
@@ -1026,7 +1124,7 @@ function TeacherLive({ slide, session, ctx }) {
           rec: ss?.records?.__groups?.[g.id]?.[slide.id] || null,
         }));
       }
-      return (ctx.participants() || []).slice().sort(studentSort(ctx)).map(id => ({
+      return (ctx.participants() || []).slice().sort(statusSort(ctx)).map(id => ({
         id, name: studentName(id, ctx), members: [id], rec: ss?.records?.[id]?.[slide.id] || null,
       }));
     }
@@ -1048,8 +1146,10 @@ function TeacherLive({ slide, session, ctx }) {
         root.replaceChildren(head, grid);
       }
     }
+    let lastOrder = "";
     function update() {
       const list = items();
+      lastOrder = list.map(it => it.id).join(",");
       showEmpty(list.length === 0);
       const online = ctx.online() || new Set();
       const seen = new Set();
@@ -1078,16 +1178,24 @@ function TeacherLive({ slide, session, ctx }) {
       countNote.textContent = kind === "group" ? `${list.length}모둠` : `${list.length}명`;
       schedule(); // 인원·보기가 바뀌었을 수 있음(같으면 layout이 바로 끝남)
     }
-    function updateDots() {
+    // 접속이 바뀌면: 순서가 달라졌을 때만 칸을 옮긴다(칸·그림·보이는 영역은 그대로 — 다시 그리지 않음). 그 밖에는 점만
+    function updatePresence() {
+      const list = items();
+      const order = list.map(it => it.id).join(",");
+      if (kind !== "group" && order !== lastOrder) {
+        if (list.length !== tiles.size || list.some(it => !tiles.has(it.id))) { update(); return; } // 사람이 바뀜 → 전체
+        lastOrder = order;
+        list.forEach((it, i) => { const n = tiles.get(it.id).node; if (grid.children[i] !== n) grid.insertBefore(n, grid.children[i] || null); });
+      }
       const online = ctx.online() || new Set();
-      for (const it of items()) {
+      for (const it of list) {
         const t = tiles.get(it.id);
         if (t) t.dot.classList.toggle("on", it.members.some(id => online.has(id)));
       }
     }
     update();
     return {
-      el: root, update, updateDots,
+      el: root, update, updatePresence,
       destroy() { ro.disconnect(); if (raf) cancelAnimationFrame(raf); emptyFit?.destroy(); emptyViewer?.destroy(); tiles.clear(); root.remove(); },
     };
   }
@@ -1180,7 +1288,7 @@ function TeacherLive({ slide, session, ctx }) {
         onClick: () => moveTo(gid),
       }, [
         el("div", { class: "ink-gb-title" }, [el("span", {}, title), el("span", {}, `${ids.length}명`)]),
-        el("div", { class: "ink-gb-chips" }, ids.slice().sort(studentSort(ctx)).map(id => chip(id, gid))),
+        el("div", { class: "ink-gb-chips" }, ids.slice().sort(statusSort(ctx)).map(id => chip(id, gid))),
       ]);
     }
     function render() {
@@ -1222,7 +1330,7 @@ function TeacherLive({ slide, session, ctx }) {
     try { presOff && presOff(); } catch (_) {}
     presCh = ch; presOff = null;
     if (ch && typeof ch.onPresence === "function") {
-      try { presOff = ch.onPresence(() => gal?.updateDots()); } catch (_) {}
+      try { presOff = ch.onPresence(() => gal?.updatePresence()); } catch (_) {}
     }
   }
 
@@ -1287,22 +1395,39 @@ function summary(slide, responses, session, ctx) {
     .filter(([, v]) => hasInk(v?.[slide.id]))
     .map(([k, v]) => ({ id: k, rec: v[slide.id] }));
 
+  // v2.13: 교사 기록에서는 칸을 누르면 크게 보기(이 슬라이드의 칸들을 ◀ ▶로 넘겨 봄)
+  const canZoom = !!ctx?.isTeacher && typeof ctx?.modal === "function";
+  const label = slide.title || "필기";
+  const views = [];
+  const zoomable = (node, item) => {
+    if (!canZoom) return node;
+    const k = views.push(item) - 1;
+    const open = () => openInkViewer({ session, items: views, index: k, modal: ctx.modal });
+    node.classList.add("can-zoom");
+    node.setAttribute("role", "button");
+    node.tabIndex = 0;
+    node.title = "크게 보기";
+    node.addEventListener("click", open);
+    node.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
+    return node;
+  };
   if (hasInk(whole) || (!indiv.length && !grp.length)) {
     const m = miniFrame(slide, { big: true });
     m.paint(whole || null);
-    wrap.appendChild(m);
+    wrap.appendChild(zoomable(m, { slide, scope: "whole", scopeId: session?.id, title: label }));
   }
-  const gallery = (title, list, nameOf) => {
+  const gallery = (title, list, nameOf, scope) => {
     if (!list.length) return;
     wrap.appendChild(el("div", { class: "ink-sum-head" }, title));
     wrap.appendChild(el("div", { class: "ink-tiles" }, list.map(it => {
       const m = miniFrame(slide);
       m.paint(it.rec);
-      return el("div", { class: "ink-tile static" }, [m, el("div", { class: "ink-tile-name" }, [el("span", {}, nameOf(it.id))])]);
+      return zoomable(el("div", { class: "ink-tile static" }, [m, el("div", { class: "ink-tile-name" }, [el("span", {}, nameOf(it.id))])]),
+        { slide, scope, scopeId: it.id, title: `${nameOf(it.id)} · ${label}` });
     })));
   };
-  gallery(`개별 필기 ${indiv.length}명`, indiv, (id) => studentName(id, ctx));
-  gallery(`모둠 필기 ${grp.length}개`, grp, (id) => groupNames.get(id) || "모둠");
+  gallery(`개별 필기 ${indiv.length}명`, indiv, (id) => studentName(id, ctx), "individual");
+  gallery(`모둠 필기 ${grp.length}개`, grp, (id) => groupNames.get(id) || "모둠", "group");
   return wrap;
 }
 
