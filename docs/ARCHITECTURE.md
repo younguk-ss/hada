@@ -51,7 +51,8 @@
 ```js
 teacher  = { id, name, passwordHash, joinCode }
 student  = { id, grade, classNum, num, name }
-lesson   = { id, teacherId, title, createdAt, updatedAt, slideCount, cover /*첫 슬라이드 썸네일 URL|null*/,
+subject  = { id, teacherId, name, position, color }   /* v2.15 교과. 교사마다, position 순서로 보임 */
+lesson   = { id, teacherId, title, createdAt, updatedAt, slideCount, cover /*첫 슬라이드 썸네일 URL|null*/, subjectId /*교과 id|null = 미분류(v2.15)*/,
              slides: Slide[] | null /* null = 아직 안 불러옴 */,
              worksheet: Slide[] | null /* 학습지 쪽(ink 모양, mode 'individual', §9.5). null = 아직 안 불러옴 → 저장 때 건드리지 않음 */ }
 Slide    = { id, type /*'ink'|'mcq'|…*/, title /*string|null*/, config /*object, 타입별*/,
@@ -91,7 +92,8 @@ ActivityState = { phase: 'idle'|'running'|'ended', startedAt?, endsAt?, reveal?:
 ```
 teachers(id text pk, name unique, password_hash, join_code unique, created_at)
 students(id text pk, grade, class_num, num, name, created_at, unique(grade,class_num,num,name))
-lessons(id pk, teacher_id fk, title, created_at, updated_at)
+lessons(id pk, teacher_id fk, title, created_at, updated_at, subject_id fk → subjects on delete set null /*006*/)
+subjects(id text pk, teacher_id fk cascade, name, position int, color, created_at)   -- 006: 교과. 없는 DB면 앱이 교과 기능만 끔(cloud.js subjState)
 slides(id pk, lesson_id fk cascade, position, type default 'ink', title, config jsonb, bg_url, bg_path, thumb_url, gs_embed, mode, base_strokes jsonb, base_texts jsonb,
        unique(lesson_id, position) DEFERRABLE INITIALLY DEFERRED)
 sessions(id pk, lesson_id fk, teacher_id fk, title, status, flow, current_slide, groups jsonb, activity jsonb, rev bigint default 0,
@@ -105,7 +107,7 @@ slide_records(id, session_id fk cascade, slide_id, scope, scope_id NOT NULL /* w
               last_writer, updated_at, unique(session_id, slide_id, scope, scope_id))
 responses(id bigserial, session_id fk cascade, slide_id, student_id, item_key default '', payload jsonb, score numeric, correct bool, time_ms int,
           last_writer, updated_at, unique(session_id, slide_id, student_id, item_key))
-view lesson_meta(id, teacher_id, title, created_at, updated_at, slide_count, cover)
+view lesson_meta(id, teacher_id, title, created_at, updated_at, slide_count, cover)   -- 006 이후에도 그대로(교과는 lessons.subject_id 를 따로 읽음)
 realtime publication: sessions, session_participants, slide_records, responses   (lessons/slides/teachers/students 제외)
 replica identity FULL: responses, session_participants (DELETE 이벤트에 old 전체)
 storage bucket 'slides' public, 5 MB, image/jpeg|png|webp, anon select/insert/update/delete
@@ -146,6 +148,7 @@ js/slides/wordcloud.js wall.js dragdrop.js    [E2]
 js/slides/link.js embed.js video.js videoquiz.js  [E3]
 js/slides/dino.js       [E4]
 js/slides/race.js       [E5]
+js/pptx.js              [B]  PowerPoint(.pptx) → 슬라이드 그림(캔버스, v2.15). storage.fileToSlides 가 동적 import
 js/teacher.js           [B]  교사 대시보드·편집기·수업 진행·기록·학생·코드
 js/student.js           [C]  학생 대기·수업 화면·내 기록
 js/app.js               [C]  라우트·부트·로그인
@@ -253,7 +256,7 @@ export function watchTeacherLive(teacherId, onLive /*(sessionMeta)*/) → stop  
 ```js
 export async function uploadSlideImage(lessonId, slideId, blobOrDataUrl) → { url, path, thumb }   // 본+썸네일 업로드. 로컬 모드: dataURL 그대로 반환
 export async function removeSlideImage(path)
-export async function fileToSlides(file, lessonId, onProgress) → Slide[]   // PDF(pdf.js 4.0.379, scale 1.6, jpeg 0.85)·이미지 → ink 슬라이드(업로드 완료된 URL)
+export async function fileToSlides(file, lessonId, onProgress) → Slide[]   // PDF(pdf.js 4.0.379, scale 1.6, jpeg 0.85)·PowerPoint(.pptx, js/pptx.js)·이미지 → ink 슬라이드(업로드 완료된 URL)
 export async function uploadPlacedImage(lessonId, slideId, blob) → { url, path, ar }   // 슬라이드 위 이미지(v2.10). 로컬 모드: dataURL
 export async function copySlideImage(path, lessonId, slideId, { tag, thumb }) → { url, path, thumb } | null   // 자료 복제용, 확장자 유지
 export function isDataUrl(s)
@@ -370,6 +373,9 @@ ctx = {
 - 교사 갤러리 보기 `[필기 부분 | 전체]`(기기에 기억, 기본 필기 부분): 필기 부분 = 칸마다 그 학생이 방금 쓰는 곳(최근 20초·최대 12개 획/글자, 교사 첨삭 제외)을 16:10 칸에 확대(최대 2배, 줄 시작부터 필기 끝이 학습지 폭 80% 안이면 왼쪽부터 보여 문제 글이 함께 보임). 가운데 15%·크기 20% 미만 변화는 무시(흔들림 방지), 옮길 때 살짝 페이드. 필기가 없으면 학습지 전체. 칸 필기는 칸 크기 × dpr 캔버스에 보이는 영역만(`paintStrokes({ region, lineK })`, 선 굵기는 칸 폭 기준 고정).
 - 교사 갤러리(개별·모둠): 칸 크기를 인원·화면에 맞춰 계산 — 모두 한 화면에 들어오는 배치 중 가장 큰 칸, 그 칸이 200px보다 작아지면 200px 이상으로 두고 스크롤. 칸은 학습지 내용 영역만 잘라 보여 주고(`pageRectFor`, 가로 슬라이드는 전체), 필기 캔버스는 칸 실제 크기 × dpr(최대 2400px).
 - 가져오기 해상도: PDF·이미지 긴 변 세로 3000px / 가로 2400px(PDF 배율 1.6~4). 이전에 올린 자료(배율 1.6)는 다시 올려야 선명해진다.
+- **PowerPoint(.pptx, v2.15)**: 서버 없이 `js/pptx.js`가 브라우저에서 그린다 — fflate 0.8.2(jsDelivr ESM)로 압축 풀기 + DOMParser. 숨긴 슬라이드 제외, 장마다 캔버스(가로 2400px · 세로 슬라이드는 높이 3000px) → PDF 쪽과 같은 인코딩·업로드(`pagesToSlides`, 동시 3개).
+  그리는 것: 배경(단색·그라데이션·그림·바둑판·두 색 효과), 그림(자르기·투명도·도형 모양 잘라내기), 도형(사각·둥근 사각·원·삼각형·마름모·평행사변형·사다리꼴·오각·셰브런·육각·팔각·십자·화살표·별·하트 + 자유형), 선·연결선(점선·화살촉), 글자(크기·굵게·기울임·밑줄·취소선·위·아래 첨자·대문자·색·글꼴, 정렬·들여쓰기·줄·문단 간격·글머리·번호, 자동 맞춤(넘치면 줄임)·세로 맞춤·여백·세로쓰기 회전), 표(파일의 표 스타일, 없으면 PowerPoint 기본처럼), 그룹(회전·뒤집기), SmartArt(파일에 저장된 그림 drawing*.xml, 글자는 거꾸로 서지 않게), 개체 틀 상속(레이아웃 → 마스터, idx 먼저 · 없으면 종류), 테마 색·글꼴·스타일 참조(fillRef·lnRef·fontRef), clrMap 덮어쓰기.
+  그리지 않는 것: 차트(옅은 '차트' 상자), 동영상(표지 그림만), 그림자·3D·애니메이션, EMF·WMF·TIFF 그림. 없는 글꼴은 Pretendard → 줄바꿈이 조금 다를 수 있다. 한글은 어절 단위로 줄바꿈(한 어절이 칸보다 길면 글자 단위). 옛 .ppt·.key 는 '.pptx나 PDF로 저장해서 올려 주세요' 안내.
 
 #### 펜·손바닥 (v2.6.1, js/pen-input.js · zoom-view · canvas · lesson-view)
 - **원인(이전)**: ① 손바닥(터치)이 펜보다 먼저 닿으면 InkCanvas가 그 터치를 '첫 포인터'로 잡아 선을 긋고 펜을 무시 ② 손바닥 접점 둘 = 두 손가락 확대·이동 → 화면이 끌리고 그동안 펜도 막힘 ③ 길게 누르기·S펜 옆 버튼·Chromebook 길게 누르기 = 오른쪽 클릭 메뉴, 펜으로 끌면 글자 선택·끌어 놓기(막는 처리 없음) ④ 텍스트 상자가 펜 도구일 때도 편집 가능 → iPad Scribble이 근처 필기를 가로챔.
@@ -401,8 +407,8 @@ ctx = {
 | embed | 임베드 | media | `{html:'', src:''}` |
 | video | 동영상 | media | `{url:''}` |
 | videoquiz | 동영상 퀴즈 | media | `{url:'', questions:[]}` |
-| dino | 공룡 점프 | game | `{questions:[{…, sec:20}], jumpsPerQuestion:3}` |
-| race | 레이싱 퀴즈 | game | `{questions:[{…, sec:20}], laps:2}` (옛 `quizSec` = sec 없는 문제의 기본값) |
+| dino | 공룡 점프 | game | `{questions:[{…, sec:20}], jumpsPerQuestion:3, passPct:80, holdWrong:true}` |
+| race | 레이싱 퀴즈 | game | `{questions:[{…, sec:20}], laps:2, passPct:80, holdWrong:true}` (옛 `quizSec` = sec 없는 문제의 기본값) |
 
 **ink** (`js/slides/ink.js`)
 - 모드: `none`(발표) 학생 readOnly — **교사 필기는 whole scope에 저장되어 학생에게 실시간 표시**; `whole` 모두 같은 캔버스(scope whole); `individual` 학생 각자(scope individual/studentId); `group` 모둠 공유(scope group/groupId), 미배정 학생은 `모둠을 기다리고 있어요` 한 줄 → 배정되면 자동 전환.
@@ -446,9 +452,12 @@ ctx = {
 - **오답 미끄러짐(v2.14)**: 재개 0.25초 뒤(지나온 선인장이 비켜난 뒤, 땅에 있을 때) 세상이 멈춘 채 공룡이 0.35초 동안 뒤로 64px 미끄러지고(흙먼지) 0.5초 어질어질(별, 점프 불가) → 1.1초에 걸쳐 제자리로. 충돌 판정·통과 판정도 미끄러진 자리 기준.
 - 충돌: 게임오버 아님. `hits += 1`, 0.8초 무적 + 깜빡임, 통과로 세지 않음.
 - 종료: 마지막 문제 답 제출 시. `timeMs = performance.now() - t0`. `submit({correct,total,timeMs,hits}, {itemKey:'result', score:correct, correct: correct===total, timeMs})`.
-- 순위: correct 내림차순 → timeMs 오름차순 → hits 오름차순. 학생 종료 화면: `3위 / 24명` · 정답 n/Q · 시간 · 충돌.
+- **목표 정답률·다시 풀기(v2.16)**: `passPct`(0·60·70·80·90·100, 기본 80) → 목표 정답 수 `need = ceil(Q × pct)`. Q문제를 다 푼 뒤 맞힌 문제 < need 면 계속 달리며 아직 못 맞힌 문제만 다시(선인장 jumpsPerQuestion 개마다, 화면 위 '정답 1/3 — 목표 3개! 틀린 2문제를 다시 풀어요'), 다시 푸는 중 목표에 닿으면 바로 끝. 안전장치 6회차. 다시 풀 문제가 있으면 틀려도 정답을 보여 주지 않는다.
+- **틀렸을 때(`holdWrong`, 기본 켬)**: 그 문제 제한 시간이 끝날 때까지 문제 창이 남는다('시간이 끝나면 다시 달려요 · 이 문제는 다시 나올 수 있어요, 지금 찾아 두세요'). 시간 초과는 이미 시간이 지났으니 그대로 진행.
+- **콤보**: 연속 정답 2·3·4개부터 달리기 속도 ×1.1·1.2·1.3(틀리면 끊김, 최대 기본의 2.2배). 선인장 간격은 거리 기준(빨라지면 다음 선인장·문제도 빨리 옴, 0.7초 아래로는 줄이지 않음). HUD `🔥 n콤보`, `정답 n/Q · 목표 m`.
+- 순위: correct(**처음에** 맞힌 문제 수) 내림차순 → timeMs 오름차순 → hits 오름차순. 학생 종료 화면: `3위 / 24명` · 처음 정답 n/Q · 다시 풀어 n/Q · 시간 · 충돌. 결과 payload `{correct, solved, total, timeMs, hits, run, attempts, rounds, log}`.
 - 리더보드 정답 칸(v2.14): 큰 `맞힌 수/Q` + 정답률 배지(푼 문제 중, 80% 이상 초록 · 50% 이상 주황 · 그 아래 빨강). 교사 화면(`is-big`)은 더 크게.
-- broadcast `dino:progress {sid, answered, correct, hits}` 문제 답할 때마다 → 교사 리더보드 실시간('진행 중' 행 포함).
+- broadcast `dino:progress {sid, answered(시도), tried, correct(처음 정답), solved, hits, round, last:[qi, opt, ok]}` 문제 답할 때마다 → 교사 리더보드 실시간('진행 중'·'다시 풀기 n회차' 행 포함). 다 못 풀고 끝나면 학생이 `submit({log, run, partial:true}, {itemKey:'log'})`.
 - 그래픽: 픽셀 느낌의 단색 공룡/선인장(크롬 공룡 오마주, 캔버스 도형으로 직접 그림 — 외부 이미지 금지), 땅 선, 구름 약간.
 
 **race (레이싱 퀴즈)** — `js/slides/race.js`
@@ -456,11 +465,15 @@ ctx = {
 - **조 편성**(교사 `[시작]` 시 1회): `ids = online ∩ participants`(없으면 participants), `groupStudents(ids, 4)` → `activity = { phase:'running', startedAt: Date.now()+3000 /*3초 카운트다운*/, groups:[{id:'g1', name:'1조', memberIds}] }`. n=0이면 toast('참여 학생이 없어요'). lane = memberIds 인덱스(0~3).
 - **주행**: 입력 없음. 자동 주행, 기본 속도 = `1랩/12초`. 트랙 = 캔버스 둥근 직사각형(스타디움형) 오벌, 연석(빨강/흰색 줄무늬), 체크 무늬 결승선, 4개 레인. 차는 위에서 본 카트(색 4종: 초록·빨강·파랑·노랑) + 이름표.
 - **퀴즈 체크포인트**: Q문항, k번째(1..Q) 문제는 진행도 `laps*k/(Q+1)`(랩 단위)에서 차가 정지하고 4지선다 오버레이(제한 = 문제마다 `q.sec` — v2.14. 편집기 문제 칸의 ⏱(10·15·20·30·45·60·90·120초, 기본 20초, 새 문제는 바로 앞 문제 값), 위 '문제 푸는 시간'을 누르면 모든 문제에 한 번에. sec 없는 옛 문제는 `config.quizSec`(v2.11) → 20초. 미응답=오답. 문제별 제한 배열을 시뮬레이션에 넘겨 모든 화면이 같은 값).
+- **목표 정답률·추가 바퀴(v2.16)**: `passPct`(기본 80) → `need = ceil(Q × pct)`. 처음 Q문제를 다 푼 뒤 결승선에서 맞힌 문제 < need 면 **한 바퀴 더** — 그 바퀴에 아직 못 맞힌 문제만 고르게(`laps + r - 1 + j/(n+1)`), 결승선마다 다시 확인, 다시 푸는 바퀴 중 목표에 닿으면 남은 문제는 건너뜀. 안전장치 6바퀴. 체크포인트 차례 k(다시 풀기 포함)는 답의 정오만으로 정해지므로 모든 화면이 같게 계산. 다시 풀 문제가 있으면 틀려도 정답을 보여 주지 않는다. HUD `정답 n/Q · 목표 m` · `추가 n바퀴`, 결승선을 넘을 때 '한 바퀴 더' 알림.
+- **틀렸을 때(`holdWrong`, 기본 켬)**: 그 문제 제한 시간이 끝날 때까지 체크포인트에 멈춤(mode `hold`, 차 위 빨간 ✕) → 그 뒤 미끄러짐. 멈춘 동안 학생 화면에 같은 문제(고른 답 표시, 정답 없음) + '지금 교과서·학습지에서 찾아 두세요'. 시뮬레이션 기준(2바퀴 5문제·목표 80%·제한 60초, 실제 simulate): 찍기(1.5초·25%) 839초, 대충(5초·50%) 310초, 고민(20~60초·90~95%) 138~292초 — 찾아보고 맞히는 쪽이 늘 빠르다(멈춤이 없으면 45~60초 고민이 찍기보다 느렸다).
+- **콤보**: 연속 정답 2·3·4개부터 부스터 ×2.8·3.1·3.4, 부스터 뒤 다음 체크포인트까지 순항 ×1.15·1.3·1.45(window kind 'cruise'). 틀리면 끊김. 이름표 `🔥n`, 불꽃 입자, 콤보 소리.
 - **정답** = 부스터: 3초 동안 속도 ×2.5(불꽃 효과). **오답** = 미끄러짐: 2.5초 동안 스핀하며 **뒤로 0.2랩 밀림**(점점 느려짐) → 멈춘 자리에서 4초 동안 ×0.5 (v2.14). 기준: 찍기(1.5초·정답 25%)가 성실하게 푸는 학생(6초·85%)보다 늦게 들어오게 — 2바퀴 5문제 평균 54초 vs 49초(v2.13 규칙에서는 39초 vs 48초로 찍기가 빨랐다). 랩 통과는 처음 넘은 한 번만 센다(뒤로 밀려 결승선 뒤로 갔다가 다시 넘어도 그대로).
 - **효과음(v2.11, `js/slides/game-sound.js`)**: Web Audio로 합성(소리 파일 없음), 모두 작게. 학생 — 달리는 동안 배경음악, 카운트다운 삑·GO, 정답 부스터 쉭, 오답 타이어 끼익, 결승 팡파르(이 화면에서 달리다가 결승했을 때만). 교사 — 경주 중 배경음악(전원 완주하면 끔), 카운트다운, 학생이 결승할 때마다 짧은 소리. 공룡 점프도 같은 모듈(배경음악·점프·충돌·정답·오답·완주). HUD·머리 줄의 🔊 버튼 = 기기마다 음소거(`localStorage hada:gameSound`). 브라우저 정책상 첫 탭 뒤부터 소리가 난다(게임 화면이 붙어 있는 동안 첫 누르기에서 깨움), 탭이 숨겨지면 배경음악 멈춤.
-- **결정적 시뮬레이션 + 이산 이벤트**(위치 스트림 금지): 각 클라이언트는 같은 규칙으로 모든 차를 시뮬레이션한다. 학생은 `race:answer {sid, gid, k, correct, at /* startedAt 기준 ms */}`(문항당 1회)와 `race:finish {sid, gid, lapMs:[…], totalMs, correct, total}`만 보낸다. 수신자는 상대 차가 체크포인트 k에 도달하면 해당 answer 이벤트가 올 때까지 정지 상태로 그린다.
+- **결정적 시뮬레이션 + 이산 이벤트**(위치 스트림 금지): 각 클라이언트는 같은 규칙으로 모든 차를 시뮬레이션한다. 학생은 `race:answer {sid, gid, k /*체크포인트 차례*/, qi /*문제 번호*/, opt /*고른 선택지, -1 = 시간 초과*/, correct, at /* startedAt 기준 ms */}`(차례당 1회)와 `race:finish {sid, gid, lapMs:[…], totalMs, correct, solved, extra, total}`만 보낸다. 결과 payload 에 `log:[[qi, opt, ok], …]`, 다 못 달리고 끝나면 `itemKey:'log'` 응답. 수신자는 상대 차가 체크포인트 k에 도달하면 해당 answer 이벤트가 올 때까지 정지 상태로 그린다.
 - **랩타임**: 랩 경계 통과 시 `lapMs.push(now - lapStart)`(문제 시간 포함). 결승(진행도 ≥ laps) → `submit({lapMs,totalMs,correct,total,gid}, {itemKey:'result', score:correct, timeMs:totalMs})` + `race:finish`.
 - **학생 화면**: 자기 조 트랙만(최대 4대, 이름표, 랩 `1/2`, 지난 랩타임). 미배정(늦게 입장) → `다음 경기에 참여해요`. 결승 후 조 내 순위·랩타임 카드, 다른 차 계속 표시.
+- **문제 리뷰(v2.16, 레이싱·공룡 공통 `common.gameReview`)**: 게임이 끝나면 교사 머리 줄 `[📝 문제 리뷰]` → 경기 화면·순위표 대신 한 문제씩 크게: 번호 칩(처음 정답률 색) · ◀ ▶ · 문제·그림 · 선택지별 '처음 고른 답' 막대(누르면 누가 골랐는지) · `처음에 맞힘 n/m · %`·`다시 풀어 맞힘`·`못 맞힘`·`시간 초과`. **정답은 기본으로 가려져 있고 문제마다 `[정답 보기]`를 눌러야** 정답 선택지에 ✓(나머지는 흐리게) — 문제별로 기억. ←/→ 키는 슬라이드 넘기기와 겹쳐 쓰지 않는다. 수업 기록(summary)에도 목록형 리뷰(같은 정답 보기). 답 기록 출처: 결과의 log → 'log' 응답 → 실시간 이벤트.
 - **교사 TeacherLive**: 모든 조의 미니 트랙 그리드(조당 1칸). panel: `[조별 | 정답순]`. 조별 표(순위, 이름, **정답**, 합계, 랩1, 랩2 — 정답 칸은 큰 `맞힌 수/Q` + 정답률 배지, 주행 중이면 지금까지 푼 문제 기준), 조별 우승자 = totalMs 최소(🏆), 미완주 DNF. 정답순 = 모든 조 학생을 정답 수 → 정답률 → 기록 순(정답 수가 같으면 같은 순위, 🥇🥈🥉). 조 크게 보기 칩에도 `정답 n/Q`(정답률 색). 버튼 `[시작]` / `[종료]`(미완주 DNF 확정, phase ended) / `[다시]`(clearResponses, idle).
 - 자동 종료: 배정 학생 전원이 완주하면 3초 후 교사 클라이언트가 phase ended.
 
@@ -538,7 +551,12 @@ v1의 `#2b2a4a` 등 구 토큰은 제거(랜딩 인트로 관련 클래스 `.int
 
 ### 9.1 교사
 - **로그인**: `cloudLoginTeacher` → whoTeacher → `cloudBootTeacher` → `/teacher`.
-- **수업 자료 카드**: 썸네일(cover) · 제목 · `n장 · 날짜` · `[시작]`(primary) · `⋯` 메뉴(편집, 복제(선택), 삭제). 카드 탭 = 편집기. 새 수업: `[+ 새 수업]` → 제목 promptDialog → 빈 ink 1장으로 생성 → 편집기. `[PDF·이미지로 만들기]` → 파일 선택 → `fileToSlides` 진행률 → 생성 → 편집기.
+- **수업 자료 카드**: 썸네일(cover) · 제목 · `n장 · 날짜` · `[시작]`(primary) · `⋯` 메뉴(편집, 교과 옮기기, 복제(선택), 삭제). 카드 탭 = 편집기. 새 수업: `[+ 새 수업]` → 제목 promptDialog → 빈 ink 1장으로 생성 → 편집기. `[파일로 만들기]`(PDF·PowerPoint·이미지) → 파일 선택 → `fileToSlides` 진행률 → 생성 → 편집기.
+- **교과(v2.15)**: 제목 아래 칩 막대 `[전체 n] [● 국어 n] … [○ 미분류 n] [+ 교과] [⚙ 관리]`. 전체 = 교과 순서대로 구역(교과 이름 누르면 그 교과만) + 마지막에 미분류, 교과 칩 = 그 교과 자료만. 고른 칩은 기기·교사마다 기억(`localStorage hada:subject:<교사 id>`), 수업 기록 탭과 함께 쓴다.
+  새 수업·파일로 만들기 = 지금 고른 교과에(전체·미분류면 미분류). 옮기기 = 카드 ⋯ `교과 옮기기`(교과 목록 · 미분류 · + 새 교과) 또는 카드를 칩으로 끌어다 놓기, 편집기 제목 옆 `[● 교과 ▾]`. 교과를 바꿔도 자료 updated_at 은 그대로(순서 유지).
+  `[⚙ 관리]` 창: 이름 바꾸기 · 색(누를 때마다 다음 색) · ▲▼ 순서 · 지우기(그 교과 자료는 미분류로, 자료·기록은 그대로). 같은 이름은 새로 만들지 않고 그 교과로. 교과가 하나도 없으면 막대 대신 안내 + `[+ 교과 만들기]`(기존 화면과 같음).
+  수업 기록 탭: 교과가 있으면 같은 칩 막대(기록 수), 행마다 `● 교과` 표시 — 기록은 그 수업 자료의 지금 교과를 따른다.
+  006 마이그레이션 전 DB(subjects 테이블·lessons.subject_id 없음): `subjectsReady()` false → 교과 UI 모두 숨김, 예전처럼 한 목록.
 - **편집기**: 열 때 `lesson.slides===null`이면 `cloudFetchLessonSlides`(진행률 pill). 레일: 썸네일(`def.thumb`), 탭=선택, 길게 누르기/`⋯`=복제·삭제·위/아래(드래그 정렬은 pointer 이벤트로, HTML5 DnD 금지). 레일 하단 `[+ 슬라이드]` → 모달 그리드(카테고리 섹션, 아이콘+라벨, 탭 즉시 현재 뒤에 삽입) · `[+ 파일]`(PDF/이미지 → ink 여러 장). 스테이지 = `mountSlideHost({role:'editor'})`. 인스펙터 = 제목 input + `def.Editor().inspector`(있으면) + validate 경고. 변경 → 300ms 디바운스 `cloudSaveLesson` + 상단 pill `저장됨/저장 중…/저장 실패 [다시]`.
 - **시작**: `수업 이름` 입력 창(기본값 = 같은 자료의 직전 수업 이름 또는 자료 제목, 예: '임진왜란 3학년 2반') → `cloudStartSession({lesson, teacher, title})` await → 성공 `/live/:id`, 실패 toast. flow 기본 teacher. 기록 화면에서 이름 바꾸기(patchSession title).
 - **상단 바 세 구역(v2.9)**: 왼쪽(`←` · 제목 · 저장 중 · 코드) | 가운데(`◀ n/N ▶`) | 오른쪽(모드 seg · 모둠 · 진행 방식 · 종료). 넓은 화면(>1100px)은 `grid 1fr auto 1fr`로 가운데가 늘 가운데 → 모드 seg가 생기고 없어져도 ◀ ▶ 자리가 그대로(연속 클릭이 빗나가지 않게). 좁은 화면은 모드·모둠 자리를 보이지 않게 비워 둔 채(`.is-off` = visibility hidden) 같은 효과. 진행 방식 이름은 ≤1280px에서 아이콘만.

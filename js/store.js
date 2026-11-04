@@ -9,7 +9,8 @@ const VERSION = 2;
 const initial = {
   teachers: [],      // {id, name, passwordHash, joinCode}
   students: [],      // {id, grade, classNum, num, name}
-  lessons: [],       // {id, teacherId, title, createdAt, updatedAt, slideCount, cover, slides: Slide[]|null}
+  lessons: [],       // {id, teacherId, title, createdAt, updatedAt, slideCount, cover, subjectId, slides: Slide[]|null}
+  subjects: [],      // {id, teacherId, name, position, color} — 교과(v2.15). 자료의 subjectId = null 이면 미분류
   sessions: [],      // §3.1 session
   whoTeacher: null,  // teacher id
   whoStudent: null,  // student id
@@ -45,6 +46,7 @@ function normalize(state, fromDisk) {
   state.teachers ||= [];
   state.students ||= [];
   state.lessons ||= [];
+  state.subjects ||= [];
   state.sessions ||= [];
   // v1 데이터(버전 없음)를 클라우드 모드에서 읽으면 낡은 lessons/sessions는 버림 → 부팅 조회가 다시 채운다
   if (fromDisk && cloudMode && state._v !== VERSION) {
@@ -58,6 +60,7 @@ function normalize(state, fromDisk) {
     l.slideCount ??= 0;
     l.cover ??= null;
     l.updatedAt ??= l.createdAt || 0;
+    l.subjectId ??= null;
   });
   state.sessions.forEach(s => {
     if (cloudMode && fromDisk) {
@@ -96,6 +99,7 @@ function slim(state) {
     teachers: state.teachers,
     students: state.students,
     lessons: (state.lessons || []).map(({ slides, worksheet, ...meta }) => meta),
+    subjects: state.subjects,
     sessions: (state.sessions || []).map(({ records, responses, slidesSnapshot, worksheet, _full, ...meta }) => meta),
   };
 }
@@ -205,6 +209,9 @@ export function findSession(id, state = store.state) {
 }
 export function findStudent(id, state = store.state) {
   return (state.students || []).find(s => s.id === id) || null;
+}
+export function findSubject(id, state = store.state) {
+  return id ? (state.subjects || []).find(s => s.id === id) || null : null;
 }
 export function findTeacher(id, state = store.state) {
   return (state.teachers || []).find(t => t.id === id) || null;

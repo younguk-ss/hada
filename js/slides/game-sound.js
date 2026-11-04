@@ -118,6 +118,12 @@ const FX = {
     hiss({ f: 2600, f2: 1100, q: 6, dur: 1.7, vol: 0.07, wobble: 22 });
     tone({ f: 520, f2: 110, dur: 1.4, type: "triangle", vol: 0.06 });
   },
+  // 콤보(연속 정답): 부스터 + 올라가는 세 음
+  combo() {
+    hiss({ f: 600, f2: 3600, q: 1.4, dur: 0.6, vol: 0.12 });
+    [784, 988, 1319].forEach((f, i) => tone({ f, at: i * 0.07, dur: 0.14, type: "square", vol: 0.04 }));
+    tone({ f: 330, f2: 990, dur: 0.45, type: "sawtooth", vol: 0.03 });
+  },
   // 결승: 짧은 팡파르
   finish() {
     [523, 659, 784].forEach((f, i) => tone({ f, at: i * 0.11, dur: 0.16, type: "square", vol: 0.045 }));

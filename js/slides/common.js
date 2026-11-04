@@ -2,6 +2,7 @@
 // activityBar · choiceBars · columnChart · whoSheet · OPTION_COLORS/optionColor · countdownPill · phasePill
 // questionEditor · loadYouTubeApi · normalizeAnswer · optionLetter
 // resultsOpen · resultsVeil(v2.9 결과 가리기) · imageField · questionImage(v2.9 문제 그림)
+// gameReview · reviewStats(v2.16 게임 끝난 뒤 문제 리뷰 — 레이싱·공룡)
 // 가정: 스타일은 styles.css(.btn/.pill/.bars/.bar-row/.bar-fill/.field)가 기본. 여기서는 구조용 보조 CSS만
 //       :where() 로 주입해 styles.css 규칙이 항상 이기도록 한다.
 // 가정(v2.9): 정답이 있는 활동(객관식·빈칸·분류·주관식·동영상 퀴즈)의 교사 화면은 칠판에 띄워지므로, 학생이 답하는 동안에는
@@ -89,6 +90,28 @@ injectCss("slides-common", `
 .qi-field .qi-thumb{width:96px;height:64px;border-radius:8px;object-fit:cover;background:var(--surface-2);box-shadow:inset 0 0 0 1px var(--line);flex:none}
 .qi-field .btn svg{width:16px;height:16px}
 .qi-field .qi-busy{font-size:13px;color:var(--muted)}
+/* 게임 문제 리뷰(v2.16) */
+.gr{display:flex;flex-direction:column;gap:14px;min-width:0}
+.gr-nav{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.gr-nav .gr-sp{flex:1}
+.gr-chip{position:relative;min-width:40px;height:36px;padding:0 10px;border-radius:999px;border:1.5px solid var(--line);background:var(--surface);color:var(--ink);font-weight:700;font-size:14px;font-variant-numeric:tabular-nums;cursor:pointer}
+.gr-chip::after{content:"";position:absolute;left:50%;bottom:4px;width:16px;height:3px;margin-left:-8px;border-radius:2px;background:var(--gr-c,transparent)}
+.gr-chip.on{background:var(--ink);border-color:var(--ink);color:#fff}
+.gr-card{display:flex;flex-direction:column;gap:14px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-lg);padding:20px 22px;min-width:0}
+.gr-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.gr-qn{font-size:14px;color:var(--muted);font-weight:700}
+.gr-q{margin:0;font-size:clamp(20px,2.3vw,30px);font-weight:700;line-height:1.4;white-space:pre-wrap;word-break:keep-all;overflow-wrap:anywhere}
+.gr-sum{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.gr-sum .pill{height:28px;font-size:13px}
+.gr-sum .pill b{font-size:15px;margin-left:2px}
+.gr-reveal{align-self:flex-start}
+.gr-list{display:flex;flex-direction:column;gap:10px}
+.gr-list .gr-card{padding:14px 16px;gap:10px}
+.gr-list .gr-q{font-size:16px}
+.gr-list .bars .bar-label{display:flex;gap:6px;align-items:center}
+.gr-key{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:50%;background:var(--surface-2);font-size:11px;font-weight:800;flex:none}
+.gr-ok{display:inline-flex;align-items:center;gap:4px;color:var(--ok);font-weight:700}
+.gr-empty{color:var(--muted);font-size:14px}
 `);
 
 // ── 선지 색상 (미니멀 톤의 4~6색, 객관식·동영상 퀴즈 교사 화면 공용) ──
@@ -566,5 +589,125 @@ export function questionEditor({
     el("div", {}, [addBtn]),
   ]);
   root.value = () => ({ question: q, options: opts.map(o => ({ ...o })), answerIds: answers.slice(), image: img });
+  return root;
+}
+
+// ── 게임 문제 리뷰(v2.16): 레이싱·공룡이 끝난 뒤 교사 화면(크게)과 수업 기록(목록) ──
+// questions: [{ id, question, image, options:[{id,text}], answerId }]
+// logs: Map(학생 id → [[문제 번호(0부터), 고른 선택지 번호(-1 = 시간 초과), 맞음 1|0], …]) — 답한 차례대로(다시 풀기 포함)
+// 가정: 막대 = 학생마다 그 문제에서 '처음 고른 답'. 다시 풀어 맞힌 학생은 따로 센다.
+// 가정: 정답은 기본으로 가려 두고, 문제마다 [정답 보기]를 눌러야 보인다(문제별로 기억, 이 화면 안에서만).
+export function reviewStats(questions, logs) {
+  const st = questions.map(q => ({
+    n: 0, first: q.options.map(() => 0), firstBy: q.options.map(() => []), timeout: 0, timeoutBy: [],
+    firstOk: 0, laterOk: 0, laterOkBy: [], never: 0, neverBy: [],
+  }));
+  for (const [sid, log] of logs || []) {
+    const per = new Map(); // 문제 번호 → [[선택지, 맞음], …]
+    for (const a of log || []) {
+      const qi = Number(a?.[0]);
+      if (!st[qi]) continue;
+      if (!per.has(qi)) per.set(qi, []);
+      per.get(qi).push([Number(a[1]), !!a[2]]);
+    }
+    for (const [qi, tries] of per) {
+      const s = st[qi], [oi, ok] = tries[0];
+      s.n++;
+      if (oi >= 0 && oi < s.first.length) { s.first[oi]++; s.firstBy[oi].push(sid); } else { s.timeout++; s.timeoutBy.push(sid); }
+      if (ok) s.firstOk++;
+      else if (tries.some(t => t[1])) { s.laterOk++; s.laterOkBy.push(sid); }
+      else { s.never++; s.neverBy.push(sid); }
+    }
+  }
+  return st;
+}
+const reviewPct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
+const reviewCls = p => (p >= 80 ? "pill-ok" : p >= 50 ? "pill-warn" : "pill-danger");
+const reviewColor = p => (p >= 80 ? "var(--ok)" : p >= 50 ? "var(--warn)" : "var(--danger)");
+
+// big: true = 한 문제씩 크게(교사 화면·칠판), false = 모든 문제 목록(기록). ctx 가 있으면 막대를 눌러 누가 골랐는지 본다
+export function gameReview({ questions = [], logs = new Map(), ctx = null, big = true } = {}) {
+  const stats = reviewStats(questions, logs);
+  const shown = new Set(); // 정답을 연 문제 id
+  const root = el("div", { class: big ? "gr" : "gr gr-list" });
+  if (!questions.length) { root.appendChild(el("div", { class: "gr-empty" }, "문제가 없어요")); return root; }
+  const showWho = (title, ids) => { if (ctx) whoSheet(ctx, { title, groups: [{ label: title, studentIds: ids }] }); };
+  const summaryPills = (s) => [
+    el("span", { class: `pill ${s.n ? reviewCls(reviewPct(s.firstOk, s.n)) : "pill-muted"}` }, ["처음에 맞힘 ", el("b", {}, `${s.firstOk}/${s.n}`), s.n ? ` · ${reviewPct(s.firstOk, s.n)}%` : ""]),
+    s.laterOk ? el("button", { class: "pill", type: "button", onClick: () => showWho("다시 풀어 맞힌 학생", s.laterOkBy) }, ["다시 풀어 맞힘 ", el("b", {}, String(s.laterOk))]) : null,
+    s.never ? el("button", { class: "pill pill-danger", type: "button", onClick: () => showWho("끝내 못 맞힌 학생", s.neverBy) }, ["못 맞힘 ", el("b", {}, String(s.never))]) : null,
+    s.timeout ? el("button", { class: "pill pill-muted", type: "button", onClick: () => showWho("처음에 시간 초과", s.timeoutBy) }, ["시간 초과 ", el("b", {}, String(s.timeout))]) : null,
+  ];
+  // 문제 하나(카드): 그림 · 처음 고른 답 막대 · 요약 · [정답 보기]
+  function card(qi) {
+    const q = questions[qi], s = stats[qi];
+    const ai = q.options.findIndex(o => o.id === q.answerId);
+    const btn = el("button", { class: "btn btn-sm gr-reveal", type: "button" });
+    let chart;
+    if (big) {
+      chart = columnChart(q.options.map((o, i) => ({ id: o.id, label: o.text || optionLetter(i) })), {
+        onBarClick: ctx ? (oid) => { const i = q.options.findIndex(o => o.id === oid); showWho(`${optionLetter(i)}를 처음에 고른 학생`, s.firstBy[i] || []); } : null,
+      });
+    } else {
+      chart = choiceBars([], s.n);
+    }
+    const ansNote = el("span", { class: "gr-ok", hidden: true });
+    const paint = () => {
+      const on = shown.has(q.id);
+      btn.className = `btn btn-sm gr-reveal ${on ? "btn-ghost" : "btn-primary"}`;
+      btn.textContent = on ? "정답 숨기기" : "정답 보기";
+      ansNote.hidden = !on;
+      ansNote.textContent = on && ai >= 0 ? `정답 ${optionLetter(ai)}` : "";
+      if (big) {
+        const counts = {};
+        q.options.forEach((o, i) => { counts[o.id] = s.first[i] || 0; });
+        chart.update({ counts, correctIds: on && q.answerId ? [q.answerId] : [], revealed: on });
+      } else {
+        chart.update(q.options.map((o, i) => ({
+          label: el("span", {}, [el("span", { class: "gr-key" }, optionLetter(i)), el("span", {}, o.text || " ")]),
+          count: s.first[i] || 0, highlight: i === ai,
+        })), s.n, { revealed: on });
+      }
+    };
+    btn.addEventListener("click", () => { if (shown.has(q.id)) shown.delete(q.id); else shown.add(q.id); paint(); paintNav?.(); });
+    paint();
+    return el("div", { class: "gr-card" }, [
+      el("div", { class: "gr-top" }, [el("span", { class: "gr-qn" }, `문제 ${qi + 1} / ${questions.length}`), ansNote]),
+      el("h3", { class: "gr-q" }, q.question || " "),
+      questionImage(q.image, { small: !big }),
+      chart,
+      el("div", { class: "gr-sum" }, summaryPills(s)),
+      btn,
+    ]);
+  }
+  let paintNav = null;
+  if (!big) {
+    root.replaceChildren(...questions.map((_, i) => card(i)));
+    return root;
+  }
+  // 크게: 번호 칩(처음 정답률 색) + ◀ ▶ + 카드 하나. ←/→ 키는 쓰지 않는다(수업 화면의 슬라이드 넘기기와 겹침)
+  let cur = 0;
+  const chips = questions.map((q, i) => {
+    const s = stats[i];
+    const b = el("button", {
+      class: "gr-chip", type: "button", title: s.n ? `처음 정답률 ${reviewPct(s.firstOk, s.n)}%` : "푼 학생 없음", "aria-label": `문제 ${i + 1}`,
+      style: { "--gr-c": s.n ? reviewColor(reviewPct(s.firstOk, s.n)) : "transparent" },
+      onClick: () => go(i),
+    }, String(i + 1));
+    return b;
+  });
+  const prev = el("button", { class: "btn btn-sm btn-icon", type: "button", "aria-label": "이전 문제", onClick: () => go(cur - 1) }, "◀");
+  const next = el("button", { class: "btn btn-sm btn-icon", type: "button", "aria-label": "다음 문제", onClick: () => go(cur + 1) }, "▶");
+  const box = el("div", {});
+  paintNav = () => chips.forEach((c, i) => { c.classList.toggle("on", i === cur); c.setAttribute("aria-current", i === cur ? "true" : "false"); });
+  function go(i) {
+    cur = Math.max(0, Math.min(questions.length - 1, i));
+    box.replaceChildren(card(cur));
+    paintNav();
+    prev.disabled = cur === 0;
+    next.disabled = cur === questions.length - 1;
+  }
+  root.replaceChildren(el("div", { class: "gr-nav" }, [...chips, el("span", { class: "gr-sp" }), prev, next]), box);
+  go(0);
   return root;
 }

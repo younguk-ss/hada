@@ -10,6 +10,13 @@
 //       찍어서 빨리 답하는 쪽(25% 정답)이 제대로 푸는 쪽보다 확실히 늦게 들어오도록 맞춘 값(v2.13까지는 찍기가 더 빨랐다).
 //       랩 통과는 처음 넘은 한 번만 센다(뒤로 밀려 결승선 뒤로 갔다가 다시 넘어도 랩이 늘지 않음).
 //       효과음(js/slides/game-sound.js): 배경음악·부스터·미끄러짐·결승·카운트다운, 🔊 음소거.
+// 가정(v2.16): 목표 정답률(config.passPct, 기본 80%, 0 = 없음). 처음 Q문제를 다 푼 뒤 결승선에서 맞힌 문제가 목표(올림)보다 적으면
+//       한 바퀴 더 — 그 바퀴에 아직 못 맞힌 문제만 고르게 다시 나온다. 목표에 닿을 때까지 되풀이(안전장치 MAX_EXTRA 바퀴).
+//       다시 풀 문제가 남아 있으면 틀렸을 때 정답을 보여 주지 않는다(교사가 끝난 뒤 리뷰에서 공개).
+//       틀렸을 때(config.holdWrong, 기본 켬): 그 문제 제한 시간이 끝날 때까지 체크포인트에서 멈춘 뒤 미끄러진다(mode 'hold') —
+//       빨리 찍어 틀리면 시간만 더 들게. 멈춘 동안 학생 화면에 문제를 다시 보여 주며 '다시 나올 때를 위해 찾아 두세요'.
+//       콤보: 연속 정답 2·3·4개부터 부스터 ×2.8·3.1·3.4, 다음 체크포인트까지 순항 ×1.15·1.3·1.45. 틀리면 콤보 끊김.
+//       이벤트·결과에 문제 번호(qi)·고른 선택지(opt)를 싣고, 결과·끝난 뒤 'log' 응답에 답 기록을 남겨 교사 리뷰(common.gameReview)에 쓴다.
 // 가정: 시간 기준은 교사 시계의 activity.startedAt. 학생 기기는 교사 시계를 추정해 쓴다:
 //       race 자체 표본(학생 race:ping → 교사 race:clock {sentAt}, 표본 = sentAt - 수신 시각, 최근 8개 최댓값 + 30ms)이 있으면 그것,
 //       없으면 코어 ctx.now()(있다면), 그것도 없으면 Date.now(). 교사 화면은 자기 시계(Date.now()) 그대로.
@@ -30,7 +37,7 @@
 import { el, icon } from "../ui.js";
 import { findStudent } from "../store.js";
 import { registerSlideType, newId, injectCss, groupStudents } from "./registry.js";
-import { questionEditor, optionLetter, questionImage } from "./common.js";
+import { questionEditor, optionLetter, questionImage, gameReview } from "./common.js";
 import * as sound from "./game-sound.js";
 
 // ── 규칙 상수 ──
@@ -41,6 +48,9 @@ const SPIN_MS = 2500;            // 오답: 스핀하며 뒤로 미끄러짐(그
 const SLIP_LAP = 0.2;            // 오답 때 뒤로 밀리는 거리(랩) = 기본 속도로 2.4초 달린 만큼
 const SLOW_MS = 4000, SLOW_MUL = 0.5;
 const GUESS_EXTRA = 2000;        // 상대 답 미수신 시 '제한 + 이만큼' 뒤 오답 가정
+const PASS_PCTS = [0, 60, 70, 80, 90, 100], PASS_PCT = 80; // 목표 정답률(%) — 못 미치면 틀린 문제를 다시 풀며 한 바퀴 더
+const MAX_EXTRA = 6;             // 추가 바퀴 안전장치(자리를 비운 학생이 끝없이 돌지 않게)
+const COMBO_MAX = 3, COMBO_BOOST = 0.3, COMBO_CRUISE = 0.15; // 연속 정답 2개부터 단계마다 부스터 +0.3배 · 순항 +15% (3단계까지)
 const COUNT_MS = 3000;
 const END_DELAY = 3000;
 
@@ -75,8 +85,16 @@ function cfgOf(slide) {
       sec: secOf(q.sec, def),
     };
   });
-  return { laps, questions, lims: questions.map(q => q.sec * 1000) };
+  const passPct = PASS_PCTS.includes(Number(c.passPct)) ? Number(c.passPct) : PASS_PCT;
+  const holdWrong = c.holdWrong !== false;
+  const Q = questions.length;
+  // plan = 시뮬레이션 입력(모든 화면이 같은 값). need = 목표 정답 수(올림), hold = 틀리면 제한 시간까지 멈춤
+  const plan = { Q, laps, lims: questions.map(q => q.sec * 1000), need: passPct ? Math.min(Q, Math.ceil((Q * passPct) / 100 - 1e-9)) : 0, hold: holdWrong };
+  return { laps, questions, lims: plan.lims, passPct, holdWrong, plan };
 }
+const comboLevel = s => Math.min(COMBO_MAX, Math.max(0, s - 1));
+const comboBoost = s => BOOST_MUL + COMBO_BOOST * comboLevel(s);
+const comboCruise = s => 1 + COMBO_CRUISE * comboLevel(s);
 const limOf = (lims, k) => lims[k - 1] || QUIZ_SEC * 1000;
 // '문제마다 20초' · 문제마다 다르면 '문제마다 10~30초'
 function secText(questions) {
@@ -133,50 +151,85 @@ function distBetween(t0, wins, t) {
 function modeAt(wins, t) {
   for (const w of wins) {
     if (t >= w.from && t < w.to) {
-      if (w.mul === 0) return { mode: "spin", spinF: (t - w.from) / (w.to - w.from) };
+      if (w.kind === "cruise") return { mode: "drive", spinF: 0 };
       return { mode: w.mul > 1 ? "boost" : "slow", spinF: 0 };
     }
   }
   return { mode: "drive", spinF: 0 };
 }
 
-// t: startedAt 기준 ms. ansOf(k) → {correct, at}|null. guess: 상대 차 답이 안 오면 (제한 + GUESS_EXTRA) 뒤 '제한 시점 오답'으로 가정.
-// lims: 문제별 제한(ms) 배열
-// → { p(랩), mode: grid|drive|boost|slow|spin|quiz|done, spinF, k, arriveAt, cross[], finishAt, correct, answered }
-function simulate(t, Q, laps, ansOf, guess = false, lims = []) {
-  const res = { p: -0.006, mode: "grid", spinF: 0, k: 0, arriveAt: 0, cross: [], finishAt: null, correct: 0, answered: 0 };
+// t: startedAt 기준 ms. P = cfg.plan { Q, laps, lims, need }. ansOf(k) → {correct, at}|null (k = 체크포인트 차례, 다시 풀기 포함 1, 2, 3 …)
+// guess: 상대 차 답이 안 오면 (제한 + GUESS_EXTRA) 뒤 '제한 시점 오답'으로 가정.
+// 체크포인트 차례: 처음 Q개(laps*k/(Q+1)) → 결승선에서 맞힌 문제 < need 면 한 바퀴 더, 그 바퀴에 못 맞힌 문제를 고르게 → 되풀이.
+// 다시 풀기 바퀴 중에 목표에 닿으면 그 바퀴의 남은 문제는 건너뛴다.
+// → { p(랩), mode: grid|drive|boost|slow|spin|quiz|hold|done, spinF, k, qi(지금 문제), round(추가 바퀴 차례, 0 = 처음),
+//     arriveAt, holdUntil(틀려서 멈춘 동안), cross[], finishAt, correct(처음에 맞힌 문제), tried(한 번이라도 푼 문제), solved(맞힌 문제), attempts, streak, end(결승 랩) }
+function simulate(t, P, ansOf, guess = false) {
+  const { Q, laps, lims } = P;
+  const need = P.need || 0;
+  const res = { p: -0.006, mode: "grid", spinF: 0, k: 0, qi: -1, round: 0, arriveAt: 0, holdUntil: 0, cross: [], finishAt: null,
+    correct: 0, tried: 0, solved: 0, attempts: 0, streak: 0, end: laps };
   if (!(t >= 0)) return res;
-  let t0 = 0, p0 = 0, wins = [], nextLap = 1;
-  for (let k = 1; k <= Q + 1; k++) {
-    const target = k <= Q ? (laps * k) / (Q + 1) : laps;
-    for (; nextLap <= laps && nextLap <= target + 1e-9; nextLap++) {
+  let t0 = 0, p0 = 0, wins = [], nextLap = 1, streak = 0, end = laps, round = 0, k = 0;
+  const solved = new Set(), tried = new Set();
+  let queue = Array.from({ length: Q }, (_, i) => ({ pos: (laps * (i + 1)) / (Q + 1), qi: i }));
+  for (let guard = 0; guard < 2000; guard++) {
+    let cp = null, target;
+    if (round && solved.size >= need) queue = []; // 다시 풀기 바퀴에서 목표에 닿으면 남은 문제는 건너뛰고 결승으로
+    if (queue.length) { cp = queue.shift(); target = cp.pos; }
+    else if (solved.size >= need || round >= MAX_EXTRA) target = end;
+    else {
+      // 목표 미달: 결승선을 지나 한 바퀴 더 — 아직 못 맞힌 문제를 그 바퀴에 고르게
+      const left = [];
+      for (let i = 0; i < Q; i++) if (!solved.has(i)) left.push(i);
+      round++;
+      queue = left.map((qi, j) => ({ pos: end + (j + 1) / (left.length + 1), qi }));
+      end += 1;
+      res.end = end;
+      continue;
+    }
+    for (; nextLap <= end && nextLap <= target + 1e-9; nextLap++) {
       const tc = reachTime(t0, wins, nextLap - p0);
       if (tc > t) break;
       res.cross.push(tc);
     }
+    res.round = round;
     const tArr = reachTime(t0, wins, target - p0);
     if (t < tArr) {
       res.p = p0 + distBetween(t0, wins, t);
       Object.assign(res, modeAt(wins, t));
       return res;
     }
-    if (k > Q) { res.p = laps; res.mode = "done"; res.finishAt = tArr; return res; }
-    const lim = limOf(lims, k);
+    if (!cp) { res.p = end; res.mode = "done"; res.finishAt = tArr; return res; }
+    k++;
+    const lim = limOf(lims, cp.qi + 1);
     const a = ansOf(k);
     let at, ok;
     if (a) { at = Math.max(Number(a.at) || 0, tArr); ok = !!a.correct; }
     else if (guess && t >= tArr + lim + GUESS_EXTRA) { at = tArr + lim; ok = false; }
     if (at == null || t < at) {
-      res.p = target; res.mode = "quiz"; res.k = k; res.arriveAt = tArr;
+      res.p = target; res.mode = "quiz"; res.k = k; res.qi = cp.qi; res.arriveAt = tArr;
       return res;
     }
-    res.answered++;
+    res.attempts++;
+    if (!tried.has(cp.qi)) { tried.add(cp.qi); if (ok) res.correct++; }
+    res.tried = tried.size;
+    // 틀리면(시간 초과 말고) 제한 시간이 끝날 때까지 멈춤 → 그 뒤 미끄러짐
+    if (!ok && P.hold && a && at < tArr + lim) {
+      res.streak = streak = 0;
+      if (t < tArr + lim) { res.p = target; res.mode = "hold"; res.k = k; res.qi = cp.qi; res.arriveAt = tArr; res.holdUntil = tArr + lim; return res; }
+      at = tArr + lim;
+    }
     if (ok) {
-      res.correct++;
-      wins = [{ from: at, to: at + BOOST_MS, mul: BOOST_MUL }];
+      solved.add(cp.qi);
+      res.solved = solved.size;
+      res.streak = ++streak;
+      // 부스터 뒤에도 콤보 순항 속도는 다음 체크포인트까지 이어진다
+      wins = [{ from: at, to: at + BOOST_MS, mul: comboBoost(streak), kind: "boost" }, { from: at + BOOST_MS, to: Infinity, mul: comboCruise(streak), kind: "cruise" }];
       t0 = at; p0 = target;
       continue;
     }
+    res.streak = streak = 0;
     // 오답: SPIN_MS 동안 스핀하며 SLIP_LAP 만큼 뒤로 미끄러짐(점점 느려짐) → 멈춘 자리에서 감속 출발
     if (t < at + SPIN_MS) {
       const f = (t - at) / SPIN_MS;
@@ -184,7 +237,7 @@ function simulate(t, Q, laps, ansOf, guess = false, lims = []) {
       return res;
     }
     t0 = at + SPIN_MS; p0 = target - SLIP_LAP;
-    wins = [{ from: t0, to: t0 + SLOW_MS, mul: SLOW_MUL }];
+    wins = [{ from: t0, to: t0 + SLOW_MS, mul: SLOW_MUL, kind: "slow" }];
   }
   return res;
 }
@@ -225,6 +278,8 @@ function raceStore(key) {
   if (!r) { r = { answers: new Map(), finishes: new Map() }; RACES.set(key, r); }
   return r;
 }
+// race:answer 이벤트 → 저장 값
+const answerOf = p => ({ correct: !!p.correct, at: Number(p.at) || 0, qi: Number.isInteger(p.qi) ? p.qi : null, opt: Number.isInteger(p.opt) ? p.opt : -1 });
 function putAnswer(rs, sid, k, v) {
   let m = rs.answers.get(sid);
   if (!m) { m = new Map(); rs.answers.set(sid, m); }
@@ -247,14 +302,36 @@ function saveMine(key, sid, answers, fin) {
 }
 
 // ── 결과 ──
+// correct = 처음에 맞힌 문제(v2.15 까지는 맞힌 문제 전부 — 다시 풀기가 없었으니 같은 값), solved = 다시 풀기까지 맞힌 문제
 function normRes(p) {
+  const correct = Number(p?.correct) || 0;
   return {
     lapMs: Array.isArray(p?.lapMs) ? p.lapMs.map(Number) : [],
     totalMs: Number(p?.totalMs) || null,
-    correct: Number(p?.correct) || 0,
+    correct,
+    solved: p?.solved != null ? Number(p.solved) || 0 : correct,
     total: Number(p?.total) || 0,
+    extra: Number(p?.extra) || 0,
     gid: p?.gid ?? null,
   };
+}
+// 리뷰용 답 기록: 학생 id → [[qi, opt, ok], …]. 결과 응답의 log → 끝난 뒤 'log' 응답 → (교사 화면) 실시간 이벤트 순
+function raceLogs(list, startedAt, rs) {
+  const m = new Map();
+  for (const key of ["result", "log"]) {
+    for (const r of list || []) {
+      if ((r.itemKey || "") !== key || m.has(r.studentId)) continue;
+      const sa = Number(r.payload?.startedAt) || 0;
+      if (startedAt && sa && sa !== startedAt) continue;
+      if (Array.isArray(r.payload?.log)) m.set(r.studentId, r.payload.log);
+    }
+  }
+  if (rs) for (const [sid, ans] of rs.answers) {
+    if (m.has(sid)) continue;
+    const log = [...ans.entries()].sort((a, b) => a[0] - b[0]).filter(([, v]) => v.qi != null).map(([, v]) => [v.qi, v.opt ?? -1, v.correct ? 1 : 0]);
+    if (log.length) m.set(sid, log);
+  }
+  return m;
 }
 // sid → 결과 (응답 itemKey 'result' 우선, 그다음 race:finish 이벤트)
 function resultsMap(list, startedAt, rs) {
@@ -292,18 +369,19 @@ const frac = p => ((p % 1) + 1) % 1;
 const laneR = lane => R + (lane - 1.5) * LANE_W;
 
 // 조의 차 목록 계산 (학생·교사 공용)
-function groupCars(group, t, { Q, laps, lims, rs, results, meId = null, mineSim = null, nameFn }) {
+function groupCars(group, t, { plan, rs, results, meId = null, mineSim = null, nameFn }) {
   return (group.memberIds || []).slice(0, 4).map((sid, lane) => {
     let sim;
     if (sid === meId && mineSim) sim = mineSim;
     else {
       const m = rs.answers.get(sid);
-      sim = simulate(t, Q, laps, k => m?.get(k) || null, true, lims);
+      sim = simulate(t, plan, k => m?.get(k) || null, true);
     }
     const done = results.has(sid) || sim.mode === "done";
     return {
       sid, lane, sim, done, me: sid === meId, name: nameFn(sid),
-      p: done ? laps + 0.015 : sim.p, mode: done ? "done" : sim.mode, spinF: sim.spinF,
+      p: done ? Math.round(sim.mode === "done" ? sim.p : plan.laps) + 0.015 : sim.p, mode: done ? "done" : sim.mode, spinF: sim.spinF,
+      streak: done ? 0 : sim.streak,
     };
   });
 }
@@ -588,21 +666,22 @@ function drawCar(g, pt, c) {
   g.fillStyle = "#fff"; g.beginPath(); g.arc(-1.5, 0, 3.8, 0, Math.PI * 2); g.fill(); // 헬멧
   g.fillStyle = col.dark; g.beginPath(); g.arc(-0.6, 0, 2.3, -Math.PI / 2, Math.PI / 2); g.fill();
   g.restore();
-  if (c.mode === "quiz") {
+  if (c.mode === "quiz" || c.mode === "hold") {
+    const hold = c.mode === "hold"; // 틀려서 멈춘 동안: 빨간 ✕
     g.beginPath(); g.arc(pt.x, pt.y - 19, 8, 0, Math.PI * 2);
-    g.fillStyle = "#ffd43b"; g.fill(); g.strokeStyle = "#8a6400"; g.lineWidth = 1.2; g.stroke();
-    g.fillStyle = "#5c4300"; g.font = "800 11px Pretendard, system-ui, sans-serif";
-    g.textAlign = "center"; g.textBaseline = "middle"; g.fillText("?", pt.x, pt.y - 18.5);
+    g.fillStyle = hold ? "#e03131" : "#ffd43b"; g.fill(); g.strokeStyle = hold ? "#8f1c1c" : "#8a6400"; g.lineWidth = 1.2; g.stroke();
+    g.fillStyle = hold ? "#fff" : "#5c4300"; g.font = "800 11px Pretendard, system-ui, sans-serif";
+    g.textAlign = "center"; g.textBaseline = "middle"; g.fillText(hold ? "✕" : "?", pt.x, pt.y - 18.5);
   }
 }
 function drawTag(g, pt, c, cssScale) {
   if (!c.name) return;
   const col = COLORS[c.lane % 4];
   const fs = Math.min(24, Math.max(10, 11 / (cssScale || 1)));
-  const text = c.name.length > 6 ? `${c.name.slice(0, 6)}…` : c.name;
+  const text = (c.name.length > 6 ? `${c.name.slice(0, 6)}…` : c.name) + (c.streak >= 2 ? ` 🔥${c.streak}` : ""); // 콤보 중이면 불꽃
   g.font = `700 ${fs}px Pretendard, system-ui, sans-serif`;
   const w = g.measureText(text).width + fs * 0.9, h = fs * 1.5;
-  const x = pt.x - w / 2, y = pt.y - 14 - h - (c.mode === "quiz" ? 14 : 0);
+  const x = pt.x - w / 2, y = pt.y - 14 - h - (c.mode === "quiz" || c.mode === "hold" ? 14 : 0);
   g.fillStyle = c.me ? col.body : "rgba(255,255,255,.92)";
   rr(g, x, y, w, h, h / 2); g.fill();
   if (!c.me) { g.strokeStyle = col.body; g.lineWidth = Math.max(1.2, fs * 0.12); g.stroke(); }
@@ -658,7 +737,8 @@ class TrackView {
   }
   emit(c, pt, dt) {
     let rate = 0, kind = null;
-    if (c.mode === "boost") { rate = 70; kind = "fire"; }
+    if (c.mode === "boost") { rate = 70 + 25 * comboLevel(c.streak || 0); kind = "fire"; }
+    else if (c.mode === "drive" && c.streak >= 2) { rate = 10 * comboLevel(c.streak); kind = "fire"; } // 콤보 순항: 작은 불꽃
     else if (c.mode === "spin") { rate = 40; kind = "dust"; }
     else if (c.mode === "slow") { rate = 14; kind = "dust"; }
     if (!rate) return;
@@ -849,6 +929,13 @@ const CSS = `
 .race-panel > .seg { justify-self: start; }
 .race-chip .ac { height: 20px; padding: 0 7px; font-size: 12px; font-weight: 800; }
 .race-qsec { width: auto; flex: none; }
+.race-score { display: inline-flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+.race-retry { font-size: 12px; font-weight: 700; color: var(--accent-ink); white-space: nowrap; }
+.race-hud .rh-goal.ok { background: rgba(21,128,61,.86); }
+.race-hud .rh-combo { background: rgba(214,72,18,.9); }
+.race-review { display: flex; flex-direction: column; gap: 12px; }
+.race-quiz-card.is-hold { border: 2px solid var(--danger); }
+.race-hold-msg { font-size: 14px; font-weight: 600; color: var(--danger); background: var(--danger-soft); border-radius: 10px; padding: 8px 12px; }
 .race-sum { display: grid; gap: 14px; }
 .race-sum-meta { display: flex; gap: 6px; flex-wrap: wrap; }
 .race-edit { padding: 20px; display: grid; grid-auto-rows: max-content; gap: 14px; max-width: 760px; margin: 0 auto; width: 100%; box-sizing: border-box; overflow: auto; height: 100%; align-content: start; }
@@ -877,6 +964,8 @@ function Editor({ slide, lesson, update, ctx }) {
     config: {
       ...(slide.config || {}),
       laps: cfg.laps,
+      passPct: cfg.passPct,
+      holdWrong: cfg.holdWrong,
       questions: cfg.questions.map(q => ({ id: q.id, question: q.question, options: q.options.map(o => ({ ...o })), answerId: q.answerId, image: q.image || null, sec: q.sec })),
     },
   });
@@ -890,6 +979,8 @@ function Editor({ slide, lesson, update, ctx }) {
   requestAnimationFrame(drawPreview);
 
   const lapsSeg = seg([1, 2, 3].map(v => ({ value: v, label: `${v}바퀴` })), cfg.laps, v => { cfg.laps = v; emit(); drawPreview(); });
+  const passSeg = seg(PASS_PCTS.map(v => ({ value: v, label: v ? `${v}%` : "없음" })), cfg.passPct, v => { cfg.passPct = v; emit(); });
+  const holdSeg = seg([{ value: true, label: "남은 시간 멈춤" }, { value: false, label: "바로 출발" }], cfg.holdWrong, v => { cfg.holdWrong = v; emit(); });
   // 문제 푸는 시간: 위 칸 = 모든 문제에 한 번에(모두 같을 때만 켜짐), 문제 칸마다 따로
   const sameSec = () => (cfg.questions.length && cfg.questions.every(q => q.sec === cfg.questions[0].sec) ? cfg.questions[0].sec : null);
   const secSels = new Map(); // q.id → select
@@ -947,6 +1038,14 @@ function Editor({ slide, lesson, update, ctx }) {
       prevWrap,
       el("div", { class: "field" }, [el("label", {}, "바퀴 수"), lapsSeg]),
       el("div", { class: "field" }, [
+        el("label", {}, "목표 정답률"), passSeg,
+        el("div", { class: "hint" }, "문제를 다 푼 뒤 이만큼 맞히지 못하면, 틀린 문제를 다시 풀며 한 바퀴 더 달려요(목표에 닿을 때까지)"),
+      ]),
+      el("div", { class: "field" }, [
+        el("label", {}, "틀렸을 때"), holdSeg,
+        el("div", { class: "hint" }, "남은 시간 멈춤 = 그 문제 시간이 끝날 때까지 서 있다가 미끄러져요. 빨리 찍어서 틀리면 손해라, 찾아보고 맞히는 쪽이 빨라요"),
+      ]),
+      el("div", { class: "field" }, [
         el("label", {}, "문제 푸는 시간"), timeSeg,
         el("div", { class: "hint" }, "여기서 고르면 모든 문제에 적용돼요 · 문제마다 ⏱에서 따로 바꿀 수 있어요"),
       ]),
@@ -961,8 +1060,9 @@ function Editor({ slide, lesson, update, ctx }) {
 function Student({ slide, me, ctx }) {
   ensureCss(ctx);
   const cfg = cfgOf(slide);
-  const Q = cfg.questions.length, laps = cfg.laps, LIMS = cfg.lims;
-  const lim = k => limOf(LIMS, k);
+  const Q = cfg.questions.length, laps = cfg.laps, PLAN = cfg.plan;
+  const retry = PLAN.need > 0; // 목표 정답률이 있으면 틀린 문제를 다시 푼다 → 틀려도 정답을 보여 주지 않음
+  const limQ = qi => limOf(cfg.lims, qi + 1);
   const meId = me?.id || null;
   if (me?.id && me?.name) NAMES.set(me.id, me.name);
   sound.attach();
@@ -974,7 +1074,8 @@ function Student({ slide, me, ctx }) {
 
   const track = new TrackView(() => ({ laps, Q }));
   const hudLap = el("span", { class: "rh" }), hudTime = el("span", { class: "rh" }), hudLast = el("span", { class: "rh rh-sub" });
-  const hud = el("div", { class: "race-hud" }, [hudLap, hudTime, hudLast, sndBtn]);
+  const hudGoal = el("span", { class: "rh rh-goal" }), hudCombo = el("span", { class: "rh rh-combo" });
+  const hud = el("div", { class: "race-hud" }, [hudLap, hudTime, hudGoal, hudCombo, hudLast, sndBtn]);
   const countEl = el("div", { class: "race-count" });
   const flashEl = el("div", { class: "race-flash" });
   const stage = el("div", { class: "race-stage" }, [track.canvas, hud, countEl, flashEl]);
@@ -999,7 +1100,9 @@ function Student({ slide, me, ctx }) {
     pings++; lastPing = t;
     ctx.send("race:ping", { slideId: slide.id });
   }
-  const mySim = t => simulate(t, Q, laps, k => race.mine.get(k) || null, false, LIMS);
+  const mySim = t => simulate(t, PLAN, k => race.mine.get(k) || null, false);
+  // 리뷰용 내 답 기록 [[qi, opt, ok], …] (체크포인트 차례대로)
+  const myLog = () => [...race.mine.entries()].sort((a, b) => a[0] - b[0]).filter(([, v]) => v.qi != null).map(([, v]) => [v.qi, v.opt ?? -1, v.correct ? 1 : 0]);
 
   function makeRace(key, sa) {
     const rs = raceStore(key);
@@ -1007,7 +1110,7 @@ function Student({ slide, me, ctx }) {
     const mine = saved.answers;
     for (const [k, v] of rs.answers.get(meId) || []) if (!mine.has(k)) mine.set(k, v);
     for (const [k, v] of mine) putAnswer(rs, meId, k, v);
-    return { key, startedAt: sa, rs, mine, group: null, sentFin: saved.fin, submitted: false, submitting: false, retryAt: 0, quizK: 0, quizArrive: 0, quizBar: null, quizLeft: null, cardSig: "", endSeen: null };
+    return { key, startedAt: sa, rs, mine, group: null, sentFin: saved.fin, submitted: false, submitting: false, retryAt: 0, quizK: 0, quizQi: -1, quizArrive: 0, holdK: 0, holdUntil: 0, holdFrom: 0, quizBar: null, quizLeft: null, cardSig: "", endSeen: null, roundSeen: 0, logSent: false };
   }
 
   function sync() {
@@ -1063,58 +1166,104 @@ function Student({ slide, me, ctx }) {
     const running = act.phase === "running";
     let sim = mySim(t);
     let guard = 0;
-    while (running && !race.submitted && sim.mode === "quiz" && t >= sim.arriveAt + lim(sim.k) && guard++ < 50) {
-      answer(sim.k, null, sim.arriveAt + lim(sim.k));
+    while (running && !race.submitted && sim.mode === "quiz" && t >= sim.arriveAt + limQ(sim.qi) && guard++ < 50) {
+      answer(sim.k, sim.qi, null, sim.arriveAt + limQ(sim.qi));
       sim = mySim(t);
     }
-    if (running && !race.submitted && sim.mode === "quiz") showQuiz(sim); else hideQuiz();
+    if (running && !race.submitted && sim.mode === "quiz") showQuiz(sim);
+    else if (running && !race.submitted && sim.mode === "hold") showHold(sim);
+    else hideQuiz();
     if (sim.mode === "done" && !race.submitted) finish(sim);
+    // 다 달리지 못하고 끝나도 답 기록은 남긴다(교사 리뷰용)
+    if (act.phase === "ended" && sim.mode !== "done" && !race.submitted && !race.logSent && race.mine.size) submitLog();
     lastSim = sim;
     return sim;
   }
 
-  function answer(k, optId, atOverride) {
+  function submitLog() {
+    const r = race;
+    r.logSent = true;
+    Promise.resolve()
+      .then(() => ctx.submit({ log: myLog(), startedAt: r.startedAt, partial: true }, { itemKey: "log" }))
+      .catch(() => { r.logSent = false; });
+  }
+
+  function answer(k, qi, optId, atOverride) {
     if (!race || race.mine.has(k)) return;
-    const q = cfg.questions[k - 1];
+    const q = cfg.questions[qi];
     const correct = !!optId && optId === q?.answerId;
+    const opt = q && optId ? q.options.findIndex(o => o.id === optId) : -1;
     const arrive = race.quizK === k ? race.quizArrive : (lastSim?.k === k ? lastSim.arriveAt : 0);
-    const at = Math.round(atOverride ?? Math.min(arrive + lim(k), Math.max(arrive, now() - race.startedAt)));
-    const v = { correct, at };
+    const at = Math.round(atOverride ?? Math.min(arrive + limQ(qi), Math.max(arrive, now() - race.startedAt)));
+    const v = { correct, at, qi, opt };
     race.mine.set(k, v);
     putAnswer(race.rs, meId, k, v);
     saveMine(race.key, meId, race.mine, race.sentFin);
-    ctx.send("race:answer", { sid: meId, gid: race.group?.id || null, k, correct, at, slideId: slide.id, startedAt: race.startedAt, name: me?.name || "" });
-    const ai = q ? q.options.findIndex(o => o.id === q.answerId) : -1;
-    if (correct) flash("정답! 부스터", true);
-    else flash(`${optId ? "아쉬워요" : "시간 초과"}${ai >= 0 ? ` · 정답 ${optionLetter(ai)}` : ""}`, false);
-    sound.play(correct ? "boost" : "slip");
+    ctx.send("race:answer", { sid: meId, gid: race.group?.id || null, k, qi, opt, correct, at, slideId: slide.id, startedAt: race.startedAt, name: me?.name || "" });
+    const streak = mySim(at + 1).streak;
+    if (correct && streak >= 2) { flash(`🔥 ${streak}연속 정답! 속도 ×${comboCruise(streak).toFixed(2).replace(/0$/, "")}`, true); sound.play("combo"); }
+    else if (correct) { flash("정답! 부스터", true); sound.play("boost"); }
+    else {
+      // 다시 풀기가 있으면 정답을 알려 주지 않는다(스스로 찾아 다시 풀게)
+      const ai = q ? q.options.findIndex(o => o.id === q.answerId) : -1;
+      flash(`${optId ? "아쉬워요" : "시간 초과"}${!retry && ai >= 0 ? ` · 정답 ${optionLetter(ai)}` : ""}`, false);
+      sound.play("slip");
+    }
     hideQuiz();
   }
 
-  function flash(text, ok) {
+  function flash(text, ok, ms = 1300) {
     flashEl.textContent = text;
     flashEl.className = `race-flash show${ok ? "" : " bad"}`;
     tk.cancel(flashTm);
-    flashTm = tk.later(() => { flashEl.classList.remove("show"); flashTm = null; }, 1300);
+    flashTm = tk.later(() => { flashEl.classList.remove("show"); flashTm = null; }, ms);
   }
 
+  // 틀려서 멈춘 동안: 같은 문제를 다시 보여 준다(정답 없이) — 다시 나올 때를 위해 찾아 두게
+  function showHold(sim) {
+    if (race.holdK === sim.k) return;
+    const q = cfg.questions[sim.qi];
+    if (!q) return;
+    race.quizK = 0; race.holdK = sim.k; race.holdUntil = sim.holdUntil; race.holdFrom = sim.arriveAt;
+    const bar = el("i"), barWrap = el("div", { class: "race-qbar urgent" }, [bar]), left = el("span", { class: "pill pill-danger" });
+    const mine = race.mine.get(sim.k);
+    quizEl.replaceChildren(el("div", { class: "race-quiz-card is-hold" }, [
+      el("div", { class: "race-quiz-top" }, [el("span", { class: "pill pill-danger" }, `틀렸어요 · ${sim.qi + 1}번 문제`), left]),
+      barWrap,
+      el("div", { class: "race-hold-msg" }, retry
+        ? "시간이 끝나면 다시 달려요. 이 문제는 다시 나올 수 있어요 — 지금 교과서·학습지에서 찾아 두세요"
+        : "시간이 끝나면 다시 달려요"),
+      el("h2", { class: "race-q" }, q.question || ""),
+      questionImage(q.image),
+      el("div", { class: "race-choices" }, q.options.map((o, i) => el("button", {
+        class: `choice${mine && mine.opt === i ? " selected wrong" : ""}`, type: "button", disabled: true,
+      }, [el("span", { class: "choice-key" }, optionLetter(i)), el("span", { class: "choice-text" }, o.text || " ")]))),
+    ]));
+    quizEl.hidden = false;
+    race.quizBar = { bar, barWrap, left, hold: true };
+    quizTimer();
+  }
   function showQuiz(sim) {
     if (race.quizK === sim.k) return;
-    const q = cfg.questions[sim.k - 1];
+    race.holdK = 0;
+    const q = cfg.questions[sim.qi];
     if (!q) return;
-    race.quizK = sim.k; race.quizArrive = sim.arriveAt;
-    const k = sim.k;
+    race.quizK = sim.k; race.quizQi = sim.qi; race.quizArrive = sim.arriveAt;
+    const k = sim.k, qi = sim.qi;
     const bar = el("i");
     const barWrap = el("div", { class: "race-qbar" }, [bar]);
     const left = el("span", { class: "pill" });
     quizEl.replaceChildren(el("div", { class: "race-quiz-card" }, [
-      el("div", { class: "race-quiz-top" }, [el("span", { class: "pill pill-muted" }, `문제 ${k}/${Q}`), left]),
+      el("div", { class: "race-quiz-top" }, [
+        sim.round ? el("span", { class: "pill pill-warn" }, `다시 풀기 · ${qi + 1}번 문제`) : el("span", { class: "pill pill-muted" }, `문제 ${qi + 1}/${Q}`),
+        left,
+      ]),
       barWrap,
       el("h2", { class: "race-q" }, q.question || ""),
       questionImage(q.image),
       el("div", { class: "race-choices" }, q.options.map((o, i) => el("button", {
         class: "choice", type: "button",
-        onClick: () => { if (race && race.quizK === k) answer(k, o.id, null); },
+        onClick: () => { if (race && race.quizK === k) answer(k, qi, o.id, null); },
       }, [el("span", { class: "choice-key" }, optionLetter(i)), el("span", { class: "choice-text" }, o.text || " ")]))),
     ]));
     quizEl.hidden = false;
@@ -1122,17 +1271,18 @@ function Student({ slide, me, ctx }) {
     quizTimer();
   }
   function quizTimer() {
-    if (!race?.quizK || !race.quizBar) return;
-    const ms = lim(race.quizK);
-    const rem = Math.max(0, race.quizArrive + ms - (now() - race.startedAt));
-    const { bar, barWrap, left } = race.quizBar;
+    if (!race?.quizBar || !(race.quizK || race.holdK)) return;
+    const { bar, barWrap, left, hold } = race.quizBar;
+    const t = now() - race.startedAt;
+    const ms = hold ? Math.max(1, race.holdUntil - race.holdFrom) : limQ(race.quizQi);
+    const rem = Math.max(0, hold ? race.holdUntil - t : race.quizArrive + ms - t);
     bar.style.width = `${(rem / ms) * 100}%`;
     barWrap.classList.toggle("urgent", rem <= 5000);
     const s = `${Math.ceil(rem / 1000)}초`;
     if (left.textContent !== s) left.textContent = s;
   }
   function hideQuiz() {
-    if (race) { race.quizK = 0; race.quizBar = null; }
+    if (race) { race.quizK = 0; race.holdK = 0; race.quizBar = null; }
     if (!quizEl.hidden) { quizEl.hidden = true; quizEl.replaceChildren(); }
   }
 
@@ -1145,17 +1295,20 @@ function Student({ slide, me, ctx }) {
     }
     const lapMs = lapsOf(sim.cross);
     const totalMs = Math.round(sim.finishAt);
-    const payload = { lapMs, totalMs, correct: sim.correct, total: Q, gid: race.group?.id || null, startedAt: race.startedAt };
+    const payload = {
+      lapMs, totalMs, correct: sim.correct, solved: sim.solved, total: Q, attempts: sim.attempts, extra: sim.round,
+      gid: race.group?.id || null, startedAt: race.startedAt, log: myLog(),
+    };
     if (!race.rs.finishes.has(meId)) race.rs.finishes.set(meId, payload);
     if (!race.sentFin) {
       race.sentFin = true;
       saveMine(race.key, meId, race.mine, true);
-      ctx.send("race:finish", { sid: meId, gid: payload.gid, lapMs, totalMs, correct: sim.correct, total: Q, slideId: slide.id, startedAt: race.startedAt, name: me?.name || "" });
+      ctx.send("race:finish", { sid: meId, gid: payload.gid, lapMs, totalMs, correct: sim.correct, solved: sim.solved, extra: sim.round, total: Q, slideId: slide.id, startedAt: race.startedAt, name: me?.name || "" });
     }
     const r = race;
     r.submitting = true;
     Promise.resolve()
-      .then(() => ctx.submit(payload, { itemKey: "result", score: sim.correct, timeMs: totalMs }))
+      .then(() => ctx.submit(payload, { itemKey: "result", score: sim.solved, timeMs: totalMs }))
       .then(() => { r.submitted = true; })
       .catch(() => { r.fails = (r.fails || 0) + 1; r.retryAt = Date.now() + Math.min(30000, 5000 * 2 ** (r.fails - 1)); })
       .finally(() => { r.submitting = false; needDraw = true; loop.kick(); });
@@ -1168,9 +1321,11 @@ function Student({ slide, me, ctx }) {
     const head = my
       ? el("div", { class: "race-rank" }, [el("b", {}, mine.rank ? `${mine.rank}위` : "완주"), mine.rank ? ` / ${n}명` : ""])
       : el("div", { class: "race-rank" }, [el("b", {}, "DNF"), " 완주하지 못했어요"]);
+    const tot = my?.total || Q;
     const lapsRow = my ? el("div", { class: "race-laps" }, [
-      ...my.lapMs.map((ms, i) => el("span", { class: "pill" }, `LAP ${i + 1} ${fmtClock(ms)}`)),
-      el("span", { class: "pill pill-ok" }, `정답 ${my.correct}/${my.total || Q}`),
+      ...my.lapMs.map((ms, i) => el("span", { class: "pill" }, `${i < laps ? `LAP ${i + 1}` : `추가 ${i - laps + 1}`} ${fmtClock(ms)}`)),
+      el("span", { class: "pill pill-ok" }, `처음 정답 ${my.correct}/${tot}`),
+      my.solved > my.correct ? el("span", { class: "pill pill-accent" }, `다시 풀어 ${my.solved}/${tot}`) : null,
     ]) : null;
     const list = el("div", { class: "race-standings" }, rows.map(r => el("div", { class: `race-srow${r.sid === meId ? " me" : ""}` }, [
       el("span", {}, r.res ? String(r.rank) : "—"),
@@ -1190,7 +1345,7 @@ function Student({ slide, me, ctx }) {
     const t = tNow();
     const live = act.phase === "running";
     const results = resultsMap(ctx.responses(), race.startedAt, race.rs);
-    const cars = groupCars(race.group, t, { Q, laps, lims: LIMS, rs: race.rs, results, meId, mineSim: sim, nameFn });
+    const cars = groupCars(race.group, t, { plan: PLAN, rs: race.rs, results, meId, mineSim: sim, nameFn });
     if (track.draw(cars, dt, live)) needDraw = false;
 
     // HUD
@@ -1198,7 +1353,18 @@ function Student({ slide, me, ctx }) {
     const myRes = results.get(meId);
     const done = !!myRes || meCar?.done;
     const cross = sim.cross;
-    hudLap.textContent = done ? "완주" : `LAP ${Math.min(laps, cross.length + 1)}/${laps}`;
+    hudLap.textContent = done ? "완주" : cross.length < laps ? `LAP ${cross.length + 1}/${laps}` : `추가 ${Math.max(1, sim.round)}바퀴`;
+    const goal = !retry ? "" : sim.solved >= PLAN.need ? `목표 달성 ✓ ${sim.solved}/${Q}` : `정답 ${sim.solved}/${Q} · 목표 ${PLAN.need}`;
+    if (hudGoal.textContent !== goal) hudGoal.textContent = goal;
+    hudGoal.classList.toggle("ok", retry && sim.solved >= PLAN.need);
+    const combo = !done && sim.streak >= 2 ? `🔥 ${sim.streak}콤보` : "";
+    if (hudCombo.textContent !== combo) hudCombo.textContent = combo;
+    // 결승선을 넘으며 목표 미달 → 추가 바퀴 안내(한 번씩)
+    if (live && sim.round > race.roundSeen && sim.cross.length >= laps + sim.round - 1) {
+      race.roundSeen = sim.round;
+      flash(`정답 ${sim.solved}/${Q} — 목표 ${PLAN.need}개! 틀린 문제를 다시 풀며 한 바퀴 더`, false, 3200);
+      sound.play("count");
+    }
     hudTime.textContent = fmtClock(done ? (myRes?.totalMs ?? sim.finishAt) : Math.max(0, t));
     const lapList = myRes?.lapMs?.length ? myRes.lapMs : lapsOf(cross);
     hudLast.textContent = lapList.length ? `지난 랩 ${fmtClock(lapList[lapList.length - 1])}` : "";
@@ -1249,7 +1415,7 @@ function Student({ slide, me, ctx }) {
     const sa = Number(p.startedAt) || race?.startedAt;
     if (!sa) return;
     if (p.name) NAMES.set(p.sid, p.name);
-    putAnswer(raceStore(`${slide.id}|${sa}`), p.sid, Number(p.k), { correct: !!p.correct, at: Number(p.at) || 0 });
+    putAnswer(raceStore(`${slide.id}|${sa}`), p.sid, Number(p.k), answerOf(p));
     loop.kick();
   }
   function onFinishEvt(p) {
@@ -1294,65 +1460,76 @@ function Student({ slide, me, ctx }) {
 
 // ── 교사 ──
 // 한 학생의 정답 현황: 완주했으면 결과, 아니면 지금까지 시뮬레이션(live). 둘 다 없으면(기록의 미완주) null
+// correct = 처음에 맞힌 문제, tried = 한 번이라도 푼 문제, solved = 다시 풀기까지 맞힌 문제, extra = 추가 바퀴
 function scoreOf(res, live, Q) {
-  if (res) return { correct: res.correct, answered: res.total || Q };
-  if (live) return { correct: live.correct || 0, answered: live.answered || 0 };
+  if (res) return { correct: res.correct, tried: res.total || Q, solved: res.solved, extra: res.extra };
+  if (live) return { correct: live.correct || 0, tried: live.tried || 0, solved: live.solved || 0, extra: live.round || 0 };
   return null;
 }
-// 조별 표: 순위 · 이름 · 정답(크게, 정답률) · 합계 · 랩
+// 정답 칸 = 처음 정답(크게, 정답률) + 다시 풀었으면 '↻ 맞힌 수 · +n바퀴'
+function scoreCell(sc, Q) {
+  if (!sc) return "";
+  return el("span", { class: "race-score" }, [
+    accBadge(sc.correct, sc.tried, Q),
+    sc.solved > sc.correct || sc.extra ? el("span", { class: "race-retry", title: "틀린 문제를 다시 풀어 맞힌 수 · 추가 바퀴" }, `↻ ${sc.solved}/${Q}${sc.extra ? ` · +${sc.extra}바퀴` : ""}`) : null,
+  ]);
+}
+// 조별 표: 순위 · 이름 · 정답(처음 정답 크게, 정답률 · 다시 풀기) · 합계 · 랩
 function standingsTable(rows, { laps, Q, ended, nameFn, liveOf }) {
+  const nLap = Math.max(laps, ...rows.map(r => r.res?.lapMs?.length || 0));
   const head = el("tr", {}, [
-    el("th", {}, "순위"), el("th", {}, "이름"), el("th", { class: "acc" }, "정답"), el("th", {}, "합계"),
-    ...Array.from({ length: laps }, (_, i) => el("th", {}, `LAP${i + 1}`)),
+    el("th", {}, "순위"), el("th", {}, "이름"), el("th", { class: "acc", title: "처음 맞힌 문제 · 처음 정답률" }, "정답"), el("th", {}, "합계"),
+    ...Array.from({ length: nLap }, (_, i) => el("th", {}, i < laps ? `LAP${i + 1}` : `+${i - laps + 1}`)),
   ]);
   const body = rows.map(r => {
     const res = r.res;
     const live = !res && liveOf ? liveOf(r.sid) : null;
-    const lapCells = Array.from({ length: laps }, (_, i) => {
-      if (res) return el("td", {}, fmtClock(res.lapMs[i]));
+    const lapCells = Array.from({ length: nLap }, (_, i) => {
+      if (res) return el("td", {}, res.lapMs[i] != null ? fmtClock(res.lapMs[i]) : "");
       const ms = live?.lapMs?.[i];
       return el("td", { class: "run" }, ms != null ? fmtClock(ms) : "");
     });
     const total = res ? el("td", {}, fmtClock(res.totalMs))
       : ended ? el("td", { class: "dnf" }, "DNF")
       : el("td", { class: "run" }, live ? live.label : "주행 중");
-    const sc = scoreOf(res, live, Q);
     return el("tr", { class: r.rank === 1 && res ? "win" : "" }, [
       el("td", {}, res ? (r.rank === 1 ? "🏆" : String(r.rank)) : "—"),
-      el("td", {}, [el("span", { class: "race-dot", style: { background: COLORS[r.lane % 4].body, marginRight: "6px" } }), nameFn(r.sid)]),
-      el("td", { class: "acc" }, sc ? [accBadge(sc.correct, sc.answered, Q)] : ""),
+      el("td", {}, [el("span", { class: "race-dot", style: { background: COLORS[r.lane % 4].body, marginRight: "6px" } }), nameFn(r.sid), live?.streak >= 2 ? ` 🔥${live.streak}` : ""]),
+      el("td", { class: "acc" }, [scoreCell(scoreOf(res, live, Q), Q)]),
       total,
       ...lapCells,
     ]);
   });
   return el("div", { class: "race-tbl-wrap" }, [el("table", { class: "race-table" }, [el("thead", {}, [head]), el("tbody", {}, body)])]);
 }
-// 정답순 표(모든 조): 정답 수 → 정답률 → 완주 기록 순. 정답 수가 같으면 같은 순위
+// 정답순 표(모든 조): 처음 맞힌 수 → 처음 정답률 → 다시 풀어 맞힌 수 → 완주 기록. 처음 맞힌 수가 같으면 같은 순위
 function accuracyTable(groups, results, { Q, nameFn, liveOf }) {
   const rows = groups.flatMap(g => (g.memberIds || []).slice(0, 4).map((sid, lane) => {
     const res = results.get(sid) || null;
-    const sc = scoreOf(res, res ? null : liveOf?.(sid), Q) || { correct: 0, answered: 0 };
-    return { sid, lane, g, ...sc, pct: sc.answered ? sc.correct / sc.answered : -1, ms: res?.totalMs ?? Infinity };
+    const sc = scoreOf(res, res ? null : liveOf?.(sid), Q) || { correct: 0, tried: 0, solved: 0, extra: 0 };
+    return { sid, lane, g, sc, pct: sc.tried ? sc.correct / sc.tried : -1, ms: res?.totalMs ?? Infinity };
   }));
-  rows.sort((a, b) => (b.correct - a.correct) || (b.pct - a.pct) || (a.ms - b.ms));
+  rows.sort((a, b) => (b.sc.correct - a.sc.correct) || (b.pct - a.pct) || (b.sc.solved - a.sc.solved) || (a.ms - b.ms));
   let rank = 0;
   const head = el("tr", {}, [el("th", {}, "순위"), el("th", {}, "이름"), el("th", { class: "acc" }, "정답"), el("th", {}, "조")]);
   const body = rows.map((r, i) => {
-    if (!i || r.correct !== rows[i - 1].correct) rank = i + 1;
-    return el("tr", { class: rank === 1 && r.correct > 0 ? "win" : "" }, [
-      el("td", {}, r.correct > 0 && rank <= 3 ? ["🥇", "🥈", "🥉"][rank - 1] : String(rank)),
+    if (!i || r.sc.correct !== rows[i - 1].sc.correct) rank = i + 1;
+    return el("tr", { class: rank === 1 && r.sc.correct > 0 ? "win" : "" }, [
+      el("td", {}, r.sc.correct > 0 && rank <= 3 ? ["🥇", "🥈", "🥉"][rank - 1] : String(rank)),
       el("td", {}, [el("span", { class: "race-dot", style: { background: COLORS[r.lane % 4].body, marginRight: "6px" } }), nameFn(r.sid)]),
-      el("td", { class: "acc" }, [accBadge(r.correct, r.answered, Q)]),
+      el("td", { class: "acc" }, [scoreCell(r.sc, Q)]),
       el("td", { class: "run" }, r.g.name || r.g.id),
     ]);
   });
   return el("div", { class: "race-tbl-wrap" }, [el("table", { class: "race-table is-acc" }, [el("thead", {}, [head]), el("tbody", {}, body)])]);
 }
+// 리뷰에 넘길 문제 모양
+const reviewQs = cfg => cfg.questions.map(q => ({ id: q.id, question: q.question, image: q.image, options: q.options, answerId: q.answerId }));
 
 function TeacherLive({ slide, ctx }) {
   ensureCss(ctx);
   const cfg = cfgOf(slide);
-  const Q = cfg.questions.length, laps = cfg.laps, LIMS = cfg.lims;
+  const Q = cfg.questions.length, laps = cfg.laps, PLAN = cfg.plan;
   sound.attach();
   const sndBtn = sound.soundToggle();
   let act = ctx.activity() || { phase: "idle" };
@@ -1379,8 +1556,10 @@ function TeacherLive({ slide, ctx }) {
   const ctl1 = makeControls(), ctl2 = makeControls();
   const statePill = el("span", { class: "pill" });
   const countPill = el("span", { class: "pill pill-muted" });
+  // 끝난 뒤 문제 리뷰(v2.16): 경기 화면 대신 한 문제씩 크게, 정답은 문제마다 눌러야 보인다
+  const bReview = el("button", { class: "btn btn-sm btn-primary", type: "button", hidden: true, onClick: () => setReview(reviewBox.hidden) }, "📝 문제 리뷰");
   const head = el("div", { class: "race-head" }, [
-    el("span", { class: "race-title" }, slide.title || "레이싱 퀴즈"), statePill, countPill, el("span", { class: "race-sp" }), sndBtn, ctl1.el,
+    el("span", { class: "race-title" }, slide.title || "레이싱 퀴즈"), statePill, countPill, el("span", { class: "race-sp" }), bReview, sndBtn, ctl1.el,
   ]);
   const grid = el("div", { class: "race-grid" });
   const countEl = el("div", { class: "race-count" });
@@ -1398,7 +1577,9 @@ function TeacherLive({ slide, ctx }) {
   const fHead = el("div", { class: "race-focus-h" }, [fBack, fName, fChips, el("span", { class: "race-sp" }), fStatus, fPrev, fNext]);
   const fStage = el("div", { class: "race-focus-stage" }, [focusView.canvas]);
   const focusEl = el("div", { class: "race-focus", tabindex: "-1", hidden: true }, [fHead, fStage]);
-  const wrap = el("div", { class: "race-grid-wrap" }, [grid, focusEl, countEl]);
+  const reviewBox = el("div", { class: "race-review", hidden: true });
+  let reviewEl = null;
+  const wrap = el("div", { class: "race-grid-wrap" }, [grid, focusEl, reviewBox, countEl]);
   const idleInfo = el("div", { class: "race-idle-info" });
   const root = el("div", { class: "race-live" }, [head, wrap, idleInfo]);
   const panelBody = el("div", { class: "race-panel" });
@@ -1519,8 +1700,8 @@ function TeacherLive({ slide, ctx }) {
     const fromGrid = !!a && grid.contains(a), fromFocus = !!a && focusEl.contains(a);
     if (!prev && next) gridScroll = wrap.scrollTop;
     focus = next;
-    grid.hidden = !!focus;
-    focusEl.hidden = !focus;
+    grid.hidden = !!focus || !reviewBox.hidden;
+    focusEl.hidden = !focus || !reviewBox.hidden;
     resetView(focusView); resetView(previewView);
     for (const t of race?.tiles || []) resetView(t.view);
     fSig = "";
@@ -1587,7 +1768,7 @@ function TeacherLive({ slide, ctx }) {
       const tm = r?.res ? `${r.rank === 1 ? "🏆 " : ""}${r.rank}위 ${fmtClock(r.res.totalMs)}` : ended ? "DNF" : "";
       return { lane, name: nameFn(sid), tm, ...scoreOf(r?.res, r?.res ? null : simOf(sid, t), Q) };
     });
-    const sig = JSON.stringify([ft.group.id, race.tiles.length, items.map(i => [i.name, i.tm, i.correct, i.answered])]);
+    const sig = JSON.stringify([ft.group.id, race.tiles.length, items.map(i => [i.name, i.tm, i.correct, i.tried, i.solved, i.extra])]);
     if (sig === fSig) return;
     fSig = sig;
     fName.textContent = ft.group.name || ft.group.id;
@@ -1595,9 +1776,10 @@ function TeacherLive({ slide, ctx }) {
       el("span", { class: "race-dot", style: { background: COLORS[i.lane].body } }),
       el("span", { class: "nm" }, i.name),
       el("span", {
-        class: `ac pill ${i.answered ? accCls(Math.round((i.correct / i.answered) * 100)) : "pill-muted"}`,
-        title: `푼 문제 ${i.answered}개 중 ${i.correct}개 정답`,
+        class: `ac pill ${i.tried ? accCls(Math.round((i.correct / i.tried) * 100)) : "pill-muted"}`,
+        title: `처음 푼 문제 ${i.tried}개 중 ${i.correct}개 정답`,
       }, `정답 ${i.correct}/${Q}`),
+      i.solved > i.correct || i.extra ? el("span", { class: "ac pill pill-accent", title: "다시 풀어 맞힌 수 · 추가 바퀴" }, `↻ ${i.solved}${i.extra ? ` +${i.extra}바퀴` : ""}`) : null,
       i.tm ? el("span", { class: `tm${i.tm === "DNF" ? " dnf" : ""}` }, i.tm) : null,
     ])));
     fPrev.hidden = fNext.hidden = race.tiles.length < 2;
@@ -1639,6 +1821,20 @@ function TeacherLive({ slide, ctx }) {
     if (dy) { try { sc.scrollTo({ top: sc.scrollTop + dy, behavior: "smooth" }); } catch { sc.scrollTop += dy; } }
   }
 
+  function setReview(on) {
+    on = !!on && !!race && act.phase === "ended";
+    reviewEl?.destroy?.();
+    reviewEl = on ? gameReview({ questions: reviewQs(cfg), logs: raceLogs(ctx.responses(), race.startedAt, race.rs), ctx, big: true }) : null;
+    reviewBox.replaceChildren(...(reviewEl ? [reviewEl] : []));
+    reviewBox.hidden = !on;
+    grid.hidden = on || !!focus;
+    focusEl.hidden = on || !focus;
+    bReview.textContent = on ? "← 경기 화면" : "📝 문제 리뷰";
+    bReview.className = `btn btn-sm ${on ? "" : "btn-primary"}`;
+    wrap.scrollTop = 0;
+    needDraw = true;
+    loop.kick();
+  }
   function sync() {
     act = ctx.activity() || { phase: "idle" };
     const sa = act.phase !== "idle" ? Number(act.startedAt) || 0 : 0;
@@ -1651,6 +1847,8 @@ function TeacherLive({ slide, ctx }) {
       fitGrid();
     }
     checkFocus(); // 같은 경기면 크게 보기 유지, 다시 편성됐으면 그리드로
+    bReview.hidden = !(race && act.phase === "ended");
+    if (bReview.hidden && !reviewBox.hidden) setReview(false);
     if (race) race.endSeen = act.phase === "ended" ? (race.endSeen ?? ctxNow(ctx)) : null; // endedAt 없을 때 멈출 시각
     paintHead();
     renderPanel(true);
@@ -1674,22 +1872,22 @@ function TeacherLive({ slide, ctx }) {
     }
     idleInfo.hidden = !!race;
     if (!race) {
-      const t = `참여 ${rosterIds().length}명 · ${secText(cfg.questions)} · 시작을 누르면 조가 편성돼요`;
+      const t = `참여 ${rosterIds().length}명 · ${secText(cfg.questions)}${PLAN.need ? ` · 목표 정답 ${PLAN.need}/${Q}(못 미치면 한 바퀴 더)` : ""} · 시작을 누르면 조가 편성돼요`;
       if (idleInfo.textContent !== t) idleInfo.textContent = t;
     }
   }
 
   const simOf = (sid, t) => {
     const m = race.rs.answers.get(sid);
-    return simulate(t, Q, laps, k => m?.get(k) || null, true, LIMS);
+    return simulate(t, PLAN, k => m?.get(k) || null, true);
   };
   function liveInfo(t) {
     const map = new Map();
     for (const g of race.groups) for (const sid of g.memberIds || []) {
       const s = simOf(sid, t);
       map.set(sid, {
-        lapMs: lapsOf(s.cross), correct: s.correct, answered: s.answered,
-        label: s.mode === "grid" ? "출발 전" : s.mode === "done" ? "결승" : `LAP ${Math.min(laps, s.cross.length + 1)}`,
+        lapMs: lapsOf(s.cross), correct: s.correct, tried: s.tried, solved: s.solved, round: s.round, streak: s.streak,
+        label: s.mode === "grid" ? "출발 전" : s.mode === "done" ? "결승" : s.cross.length < laps ? `LAP ${s.cross.length + 1}` : `추가 ${Math.max(1, s.round)}바퀴`,
       });
     }
     return map;
@@ -1707,7 +1905,7 @@ function TeacherLive({ slide, ctx }) {
     const blocks = race.groups.map(g => ({ g, rows: standings(g, results) }));
     const sig = JSON.stringify([view, ended, blocks.map(b => b.rows.map(r => {
       const l = live.get(r.sid);
-      return [r.sid, nameFn(r.sid), r.res?.totalMs ?? null, l?.label, l?.correct, l?.answered];
+      return [r.sid, nameFn(r.sid), r.res?.totalMs ?? null, l?.label, l?.correct, l?.tried, l?.solved, l?.streak];
     }))]);
     if (!force && sig === race.panelSig) return;
     race.panelSig = sig;
@@ -1759,12 +1957,12 @@ function TeacherLive({ slide, ctx }) {
     const ft = focusTile();
     if (ft) {
       // 크게 보기: 보이는 캔버스(이 조)만 그린다 — 숨은 미니 트랙은 쉰다
-      const cars = groupCars(ft.group, t, { Q, laps, lims: LIMS, rs: race.rs, results, nameFn });
+      const cars = groupCars(ft.group, t, { plan: PLAN, rs: race.rs, results, nameFn });
       drawn = focusView.draw(cars, dt, liveRun);
       paintFocusStatus(cars, t, results);
     } else {
       for (const tile of race.tiles) {
-        const cars = groupCars(tile.group, t, { Q, laps, lims: LIMS, rs: race.rs, results, nameFn });
+        const cars = groupCars(tile.group, t, { plan: PLAN, rs: race.rs, results, nameFn });
         drawn = tile.view.draw(cars, dt, liveRun) && drawn;
       }
     }
@@ -1796,7 +1994,7 @@ function TeacherLive({ slide, ctx }) {
     const sa = Number(p.startedAt) || race?.startedAt;
     if (!sa) return;
     if (p.name) NAMES.set(p.sid, p.name);
-    putAnswer(raceStore(`${slide.id}|${sa}`), p.sid, Number(p.k), { correct: !!p.correct, at: Number(p.at) || 0 });
+    putAnswer(raceStore(`${slide.id}|${sa}`), p.sid, Number(p.k), answerOf(p));
     onEvt();
   });
   ctx.on("race:finish", p => {
@@ -1843,6 +2041,7 @@ function TeacherLive({ slide, ctx }) {
       loop.stop();
       ro?.disconnect();
       document.removeEventListener("keydown", onKey);
+      reviewEl?.destroy?.();
       if (race?.endTimer != null) tk.cancel(race.endTimer);
       tk.clearAll();
       sound.bgm(null); sound.detach(); sndBtn.release();
@@ -1880,12 +2079,14 @@ function summary(slide, responses = [], session, ctx) {
       el("div", { class: "race-laps" }, [
         ...my.lapMs.map((ms, i) => el("span", { class: "pill" }, `LAP ${i + 1} ${fmtClock(ms)}`)),
         el("span", { class: "pill" }, `합계 ${fmtClock(my.totalMs)}`),
-        el("span", { class: "pill pill-ok" }, `정답 ${my.correct}/${my.total || cfg.questions.length}`),
+        el("span", { class: "pill pill-ok" }, `처음 정답 ${my.correct}/${my.total || cfg.questions.length}`),
+        my.solved > my.correct ? el("span", { class: "pill pill-accent" }, `다시 풀어 ${my.solved}/${my.total || cfg.questions.length}`) : null,
       ]),
     ]);
   }
   const all = groups.flatMap(g => g.memberIds);
   const nameFn = sid => nameOf(ctx, sid);
+  const logs = raceLogs(responses, sa, null);
   return el("div", { class: "race-sum" }, [
     el("div", { class: "race-sum-meta" }, [
       el("span", { class: "pill pill-muted" }, `${cfg.laps}바퀴 · 문제 ${cfg.questions.length}`),
@@ -1895,6 +2096,8 @@ function summary(slide, responses = [], session, ctx) {
       el("div", { class: "race-gt" }, g.name || g.id),
       standingsTable(standings(g, results), { laps: cfg.laps, Q: cfg.questions.length, ended: true, nameFn, liveOf: null }),
     ])),
+    // 문제 리뷰(정답은 문제마다 눌러야 보임)
+    logs.size ? el("div", { class: "race-gblock" }, [el("div", { class: "race-gt" }, "문제 리뷰"), gameReview({ questions: reviewQs(cfg), logs, ctx, big: false })]) : null,
   ]);
 }
 

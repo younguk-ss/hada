@@ -27,13 +27,14 @@
 //       정확히 가운데라 모드 버튼이 생기고 없어져도 ◀ ▶ 자리가 그대로이고, 좁은 화면은 모드·모둠 자리를 비워 둔 채(보이지 않게) 둬 같은 효과.
 // 가정(v2.9): 팝업 상호작용(js/popup.js) — 필기 슬라이드의 핀을 누르면 activity.__pop → 스테이지 위 팝업(오른쪽에 그 활동의 마감·공개 도구).
 //       다시 누르거나 ×·Esc·다른 슬라이드로 이동하면 닫힌다(학생 화면도 함께). 기록에는 그 슬라이드 뒤에 '팝업'으로 이어 붙인다.
-import { store, findLesson, findSession, findStudent, findTeacher, studentLabel, newId } from "./store.js";
+import { store, findLesson, findSession, findStudent, findTeacher, findSubject, studentLabel, newId } from "./store.js";
 import { go } from "./router.js";
 import { el, mount, template, toast, confirmDialog, promptDialog, modal, sheet, icon, fmtDate, debounce, copyText, copyTextLater } from "./ui.js";
 import {
   cloudReady, cloudCreateLesson, cloudSaveLesson, cloudDeleteLesson, cloudDuplicateLesson, cloudFetchLessonSlides,
   cloudStartSession, ensureSession, cloudFetchSession, patchSession, cloudEndSession, cloudResumeSession, cloudDeleteSession,
   subscribeSession, cloudEnsureReviewCode, cloudFetchReviewCodes, cloudInsertSessionSlide, cloudEnsureWorksheet,
+  subjectsReady, subjectColors, cloudCreateSubject, cloudUpdateSubject, cloudReorderSubjects, cloudDeleteSubject, cloudSetLessonSubject,
 } from "./cloud.js";
 import { fileToSlides } from "./storage.js";
 import { joinSessionChannel } from "./realtime.js";
@@ -52,7 +53,7 @@ const BLANK_ICON = '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" 
 const TOOLS_ICON = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h9"/><path d="M19 6h1"/><circle cx="16" cy="6" r="2.5"/><path d="M4 12h3"/><path d="M13 12h7"/><circle cx="10" cy="12" r="2.5"/><path d="M4 18h11"/><circle cx="18" cy="18" r="2.5"/></svg>';
 const MODES = [["none", "발표"], ["whole", "전체"], ["individual", "개별"], ["group", "모둠"]];
 const STATUS = { live: ["진행 중", "pill-live"], completed: ["끝남", "pill-ok"], stopped: ["중단", "pill-warn"] };
-const ACCEPT = ".pdf,.png,.jpg,.jpeg,.webp,application/pdf,image/png,image/jpeg,image/webp";
+const ACCEPT = ".pdf,.pptx,.png,.jpg,.jpeg,.webp,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation,image/png,image/jpeg,image/webp";
 
 // 화면 전용 보조 CSS (styles.css 클래스 위에 최소한만)
 const TEACHER_CSS = `
@@ -140,6 +141,39 @@ const TEACHER_CSS = `
 .t-zoomable { cursor:zoom-in; border-radius:8px; }
 .t-zoomable:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
 @media (hover:hover) { .t-wsp.t-zoomable:hover { border-color:var(--line-strong); box-shadow:var(--shadow-2); } .t-mini.t-zoomable:hover .slide-frame { box-shadow:0 0 0 1px var(--line-strong), var(--shadow-2); } }
+/* 교과(v2.15) */
+.subj-wrap { margin: -6px 0 18px; }
+.subj-wrap:empty { display: none; }
+.subj-bar { align-items: center; }
+.subj-chip { cursor: pointer; max-width: 220px; }
+.subj-chip .subj-name { overflow: hidden; text-overflow: ellipsis; }
+.subj-chip .subj-n { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.subj-chip.active .subj-n { color: rgba(255,255,255,.72); }
+.subj-chip.drop { border-color: var(--accent); background: var(--accent-soft); color: var(--ink); box-shadow: inset 0 0 0 1px var(--accent); }
+.subj-chip.drop .subj-n { color: var(--ink-2); }
+.subj-add { cursor: pointer; color: var(--ink-2); border-style: dashed; }
+.subj-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; display: inline-block; background: var(--muted); }
+.subj-dot.none { background: transparent; box-shadow: inset 0 0 0 1.5px var(--line-strong); }
+.subj-intro { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.subj-body { display: grid; gap: 28px; }
+.subj-sec { display: grid; gap: 12px; }
+.subj-sec-h { justify-self: start; display: inline-flex; align-items: center; gap: 8px; background: none; border: 0; padding: 2px 6px; margin-left: -6px; font-size: 16px; font-weight: 700; color: var(--ink); border-radius: 6px; cursor: pointer; }
+.subj-sec-h .subj-n { font-size: 13px; color: var(--muted); font-weight: 600; }
+@media (hover: hover) { .subj-sec-h:hover { background: var(--surface-2); } .subj-add:hover { color: var(--ink); border-color: var(--line-strong); } }
+.lesson-card.dragging { opacity: .45; }
+.subj-menu { max-height: min(60vh, 420px); overflow-y: auto; }
+.subj-menu .menu-cap { font-size: 12px; color: var(--muted); padding: 4px 12px 2px; }
+.subj-menu .menu-item.on { font-weight: 700; }
+.subj-menu .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.subj-tag { display: inline-flex; align-items: center; gap: 5px; margin-right: 6px; color: var(--ink-2); font-weight: 600; }
+.subj-pick { gap: 6px; flex: none; max-width: 180px; }
+.subj-pick > span:not(.subj-dot):not(.icon) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subj-mgr-wrap { display: grid; gap: 12px; width: min(480px, 82vw); }
+.subj-mgr { display: grid; gap: 6px; }
+.subj-mgr-row { display: flex; align-items: center; gap: 6px; }
+.subj-mgr-color { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--surface); box-shadow: 0 0 0 1px var(--line-strong); flex: none; cursor: pointer; padding: 0; }
+.subj-mgr-name { flex: 1; min-width: 0; }
+.subj-mgr-n { font-size: 12px; color: var(--muted); min-width: 44px; text-align: right; white-space: nowrap; }
 `;
 function ensureCss() { injectCss("teacher-views", TEACHER_CSS); }
 
@@ -462,6 +496,164 @@ function mySessions(tid) {
     .sort((a, b) => (a.status === "live" ? 0 : 1) - (b.status === "live" ? 0 : 1) || (b.startedAt || 0) - (a.startedAt || 0));
 }
 
+// ───────────────────────── 교과(v2.15) ─────────────────────────
+// 가정: 고른 교과(전체 '' · 미분류 NONE · 교과 id)는 기기·교사마다 기억(localStorage hada:subject:<교사 id>) — 수업 자료·기록 탭이 함께 쓴다.
+// 가정: 교과 기능은 subjectsReady()일 때만 보인다(006 마이그레이션 전 DB면 예전처럼 한 목록). 교과가 하나도 없으면 막대 대신 [+ 교과 만들기]만.
+const NONE = "none";
+function mySubjects(tid) {
+  return (store.state.subjects || []).filter(x => x.teacherId === tid).sort((a, b) => a.position - b.position);
+}
+// 자료의 교과 키: 교과 id, 없거나 지워진 교과면 NONE
+function subjKeyOf(lesson) { return lesson && lesson.subjectId && findSubject(lesson.subjectId) ? lesson.subjectId : NONE; }
+const subjStoreKey = tid => "hada:subject:" + tid;
+function readSubj(tid) { try { return localStorage.getItem(subjStoreKey(tid)) || ""; } catch (_) { return ""; } }
+function writeSubj(tid, v) { try { localStorage.setItem(subjStoreKey(tid), v || ""); } catch (_) {} }
+function validSubj(tid, v) { return !v || v === NONE || mySubjects(tid).some(x => x.id === v) ? v : ""; }
+function subjDot(sub) { return el("span", { class: "subj-dot" + (sub ? "" : " none"), style: sub && sub.color ? { background: sub.color } : null, "aria-hidden": "true" }); }
+function subjSig(tid) { return mySubjects(tid).map(x => [x.id, x.name, x.color, x.position].join(":")).join(",") + "|" + (subjectsReady() ? 1 : 0); }
+
+// 교과 칩 막대. counts(key) → 개수. onDropLesson(lessonId, subjectId|null) 이 있으면 자료 카드를 칩에 끌어다 놓아 옮긴다
+function subjectBar({ teacher, value, counts, onPick, onDropLesson = null, extra = [] }) {
+  const chip = (key, label, sub) => {
+    const on = value === key;
+    const b = el("button", {
+      class: "chip subj-chip" + (on ? " active" : ""), type: "button", "aria-pressed": on ? "true" : "false",
+      onClick: () => onPick(key),
+    }, [key ? subjDot(sub) : null, el("span", { class: "subj-name" }, label), el("span", { class: "subj-n" }, String(counts(key)))]);
+    if (onDropLesson && key) {
+      const has = (e) => [...(e.dataTransfer?.types || [])].includes("text/hada-lesson");
+      b.addEventListener("dragover", (e) => { if (has(e)) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; b.classList.add("drop"); } });
+      b.addEventListener("dragleave", () => b.classList.remove("drop"));
+      b.addEventListener("drop", (e) => {
+        b.classList.remove("drop");
+        const id = e.dataTransfer?.getData("text/hada-lesson");
+        if (!id) return;
+        e.preventDefault();
+        onDropLesson(id, key === NONE ? null : key);
+      });
+    }
+    return b;
+  };
+  return el("div", { class: "chips subj-bar", role: "toolbar", "aria-label": "교과" }, [
+    chip("", "전체", null),
+    ...mySubjects(teacher.id).map(x => chip(x.id, x.name, x)),
+    chip(NONE, "미분류", null),
+    ...extra,
+  ]);
+}
+
+// 새 교과(이름 입력). 같은 이름이 있으면 그 교과를 돌려준다 → 교과 | null
+async function createSubjectPrompt(teacher) {
+  const name = await promptDialog({ title: "새 교과", placeholder: "예: 국어, 수학, 3학년 과학", ok: "만들기", maxlength: 30 });
+  if (!name) return null;
+  const same = mySubjects(teacher.id).find(x => x.name.trim() === name.trim());
+  if (same) { toast(`'${same.name}' 교과가 이미 있어요`); return same; }
+  const r = await cloudCreateSubject(teacher.id, name);
+  if (!r || r.error) { toast((r && r.error) || "교과를 만들지 못했어요", { type: "error" }); return null; }
+  return r.subject;
+}
+
+// 자료를 다른 교과로(메뉴). current = 지금 교과 id | null
+function subjectMenu(anchor, teacher, current, onChoose) {
+  if (openPop && openPop.anchor === anchor) { closePop(); return; }
+  const item = (label, sub, sid) => el("button", {
+    class: "menu-item" + (current === sid ? " on" : ""), type: "button", role: "menuitemradio", "aria-checked": current === sid ? "true" : "false",
+    onClick: (e) => { e.stopPropagation(); closePop(); if (current !== sid) onChoose(sid); },
+  }, [subjDot(sub), el("span", { class: "grow" }, label), current === sid ? icon("check", 16) : null]);
+  const menu = el("div", { class: "menu subj-menu", role: "menu" }, [
+    el("div", { class: "menu-cap" }, "교과 옮기기"),
+    ...mySubjects(teacher.id).map(x => item(x.name, x, x.id)),
+    item("미분류", null, null),
+    el("div", { class: "menu-sep" }),
+    el("button", {
+      class: "menu-item", type: "button", role: "menuitem",
+      onClick: async (e) => { e.stopPropagation(); closePop(); const sub = await createSubjectPrompt(teacher); if (sub && sub.id !== current) onChoose(sub.id); },
+    }, [icon("plus", 18), "새 교과"]),
+  ]);
+  popover(anchor, menu, { className: "t-menu-pop" });
+}
+async function moveLesson(lessonId, subjectId) {
+  const r = await cloudSetLessonSubject(lessonId, subjectId);
+  if (!r || r.error) { toast((r && r.error) || "교과를 옮기지 못했어요", { type: "error" }); return; }
+  const sub = findSubject(subjectId);
+  toast(sub ? `'${sub.name}'(으)로 옮겼어요` : "미분류로 옮겼어요", { type: "ok" });
+}
+
+// 교과 관리 창: 이름 바꾸기 · 색 · 순서 · 지우기 · 추가
+function openSubjectManager(teacher) {
+  const list = el("div", { class: "subj-mgr" });
+  const nLessons = id => (store.state.lessons || []).filter(l => l.teacherId === teacher.id && l.subjectId === id).length;
+  let sig = null;
+  function render() {
+    const subs = mySubjects(teacher.id);
+    const nsig = subjSig(teacher.id) + "|" + subs.map(x => nLessons(x.id)).join(",");
+    if (nsig === sig) return;
+    sig = nsig;
+    if (!subs.length) { list.replaceChildren(el("div", { class: "empty" }, "아직 교과가 없어요")); return; }
+    const colors = subjectColors();
+    const ids = subs.map(x => x.id);
+    const move = (i, d) => {
+      const j = i + d;
+      if (j < 0 || j >= ids.length) return;
+      const next = ids.slice();
+      [next[i], next[j]] = [next[j], next[i]];
+      cloudReorderSubjects(teacher.id, next).then(r => { if (r && r.error) toast(r.error, { type: "error" }); });
+    };
+    list.replaceChildren(...subs.map((x, i) => {
+      const name = el("input", { class: "input input-sm subj-mgr-name", type: "text", maxlength: "30", "aria-label": "교과 이름", value: x.name });
+      name.addEventListener("change", async () => {
+        const v = name.value.trim();
+        if (!v) { name.value = x.name; return; }
+        if (v === x.name) return;
+        const r = await cloudUpdateSubject(x.id, { name: v });
+        if (r && r.error) { toast(r.error, { type: "error" }); name.value = x.name; }
+      });
+      name.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); name.blur(); } });
+      const color = el("button", {
+        class: "subj-mgr-color", type: "button", title: "색 바꾸기", "aria-label": `${x.name} 색 바꾸기`, style: { background: x.color || "var(--muted)" },
+        onClick: () => {
+          const next = colors[(colors.indexOf(x.color) + 1) % colors.length];
+          cloudUpdateSubject(x.id, { color: next }).then(r => { if (r && r.error) toast(r.error, { type: "error" }); });
+        },
+      });
+      const n = nLessons(x.id);
+      return el("div", { class: "subj-mgr-row" }, [
+        color, name,
+        el("span", { class: "subj-mgr-n" }, `자료 ${n}`),
+        el("button", { class: "btn btn-icon btn-ghost btn-sm", type: "button", title: "위로", "aria-label": `${x.name} 위로`, disabled: i === 0, onClick: () => move(i, -1) }, icon("chevron-up", 18)),
+        el("button", { class: "btn btn-icon btn-ghost btn-sm", type: "button", title: "아래로", "aria-label": `${x.name} 아래로`, disabled: i === subs.length - 1, onClick: () => move(i, 1) }, icon("chevron-down", 18)),
+        el("button", {
+          class: "btn btn-icon btn-ghost btn-sm", type: "button", title: "지우기", "aria-label": `${x.name} 지우기`,
+          onClick: async () => {
+            const ok = await confirmDialog({
+              title: `'${x.name}' 교과를 지울까요?`,
+              body: n ? `이 교과의 자료 ${n}개는 미분류로 옮겨져요. 자료와 수업 기록은 지워지지 않아요.` : "자료와 수업 기록은 지워지지 않아요.",
+              ok: "지우기", danger: true,
+            });
+            if (!ok) return;
+            const r = await cloudDeleteSubject(x.id);
+            if (r && r.error) toast(r.error, { type: "error" });
+          },
+        }, icon("trash", 18)),
+      ]);
+    }));
+  }
+  render();
+  const off = store.subscribe(render);
+  modal({
+    title: "교과 관리",
+    body: el("div", { class: "subj-mgr-wrap" }, [
+      el("p", { class: "hint" }, "교과를 지워도 자료는 지워지지 않고 미분류로 옮겨져요. 자료는 카드의 ⋯ 메뉴나 교과 칩으로 끌어다 놓아 옮길 수 있어요."),
+      list,
+    ]),
+    actions: [
+      { label: "교과 추가", icon: "plus", onClick: () => { createSubjectPrompt(teacher); } },
+      { label: "닫기", primary: true },
+    ],
+    onClose: off,
+  });
+}
+
 // ───────────────────────── 셸 (사이드바) ─────────────────────────
 function mountShell(teacher, active, onTab) {
   ensureCss();
@@ -544,15 +736,18 @@ export function teacherDashboard(params = {}) {
 // ── 수업 자료 탭 ──
 function lessonsTab(box, teacher) {
   let disposed = false, busy = false, booted = false, sig = null;
+  let subj = validSubj(teacher.id, readSubj(teacher.id)); // '' 전체 · NONE 미분류 · 교과 id
   const fileIn = el("input", { type: "file", accept: ACCEPT, hidden: true });
   const progress = el("span", { class: "pill", hidden: true });
-  const btnFile = el("button", { class: "btn", type: "button", onClick: () => fileIn.click() }, [icon("file", 18), "PDF·이미지로 만들기"]);
+  const btnFile = el("button", { class: "btn", type: "button", title: "PDF·PowerPoint(.pptx)·이미지를 슬라이드로", onClick: () => fileIn.click() }, [icon("file", 18), "파일로 만들기"]);
   const btnNew = el("button", { class: "btn btn-primary", type: "button", onClick: createBlank }, [icon("plus", 18), "새 수업"]);
   fileIn.addEventListener("change", onFile);
-  const grid = el("div", { class: "card-grid" });
+  const bar = el("div", { class: "subj-wrap" });
+  const body = el("div", { class: "subj-body" });
   box.append(
     el("div", { class: "page-head" }, [el("h1", {}, "수업 자료"), el("div", { class: "actions" }, [progress, btnFile, btnNew, fileIn])]),
-    grid,
+    bar,
+    body,
   );
 
   function myLessons() {
@@ -560,17 +755,64 @@ function lessonsTab(box, teacher) {
       .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
   }
   function countOf(l) { return Array.isArray(l.slides) ? l.slides.length : (l.slideCount || 0); }
+  const useSubj = () => subjectsReady() && booted;
+  // 새로 만드는 자료의 교과 = 지금 보고 있는 교과(전체·미분류면 없음)
+  const newSubjectId = () => (useSubj() && subj && subj !== NONE && findSubject(subj) ? subj : null);
+  function pick(key) {
+    subj = validSubj(teacher.id, key);
+    writeSubj(teacher.id, subj);
+    render();
+  }
   function render() {
     if (disposed) return;
     const list = myLessons();
-    const nsig = (booted ? "1" : "0") + list.map(l => [l.id, l.title, countOf(l), l.cover, l.updatedAt].join("|")).join("\n");
+    const on = useSubj();
+    const subs = on ? mySubjects(teacher.id) : [];
+    if (on) subj = validSubj(teacher.id, subj); // 부팅 전에는 기억한 값을 지우지 않는다
+    const cur = on && subs.length ? subj : "";
+    const nsig = (booted ? "1" : "0") + subjSig(teacher.id) + "|" + cur + "|" + list.map(l => [l.id, l.title, countOf(l), l.cover, l.updatedAt, on ? subjKeyOf(l) : ""].join("|")).join("\n");
     if (nsig === sig) return;
     sig = nsig;
+    // 교과 막대(교과가 없으면 만들기 안내만)
+    if (!on) bar.replaceChildren();
+    else if (!subs.length) {
+      bar.replaceChildren(el("div", { class: "subj-intro" }, [
+        el("span", { class: "hint" }, "교과를 만들면 자료를 교과별로 나눠 볼 수 있어요"),
+        el("button", { class: "btn btn-sm", type: "button", onClick: () => createSubjectPrompt(teacher) }, [icon("plus", 16), "교과 만들기"]),
+      ]));
+    } else {
+      const counts = key => (key ? list.filter(l => subjKeyOf(l) === key).length : list.length);
+      bar.replaceChildren(subjectBar({
+        teacher, value: cur, counts, onPick: pick, onDropLesson: (id, sid) => { if (findLesson(id)) moveLesson(id, sid); },
+        extra: [
+          el("button", { class: "chip subj-add", type: "button", onClick: async () => { const sub = await createSubjectPrompt(teacher); if (sub) pick(sub.id); } }, [icon("plus", 14), "교과"]),
+          el("button", { class: "chip subj-add", type: "button", title: "교과 이름·순서·색 바꾸기, 지우기", onClick: () => openSubjectManager(teacher) }, [icon("settings", 14), "관리"]),
+        ],
+      }));
+    }
     if (!list.length) {
-      grid.replaceChildren(el("div", { class: "empty empty-box", style: { gridColumn: "1 / -1" } }, booted ? "아직 자료가 없어요" : "불러오는 중…"));
+      body.replaceChildren(el("div", { class: "card-grid" }, el("div", { class: "empty empty-box", style: { gridColumn: "1 / -1" } }, booted ? "아직 자료가 없어요" : "불러오는 중…")));
       return;
     }
-    grid.replaceChildren(...list.map(lessonCard));
+    if (!subs.length) { body.replaceChildren(el("div", { class: "card-grid" }, list.map(lessonCard))); return; }
+    if (cur) {
+      const shown = list.filter(l => subjKeyOf(l) === cur);
+      const sub = findSubject(cur);
+      body.replaceChildren(el("div", { class: "card-grid" }, shown.length ? shown.map(lessonCard)
+        : el("div", { class: "empty empty-box", style: { gridColumn: "1 / -1" } },
+          sub ? `'${sub.name}'에 자료가 없어요 — [새 수업]으로 만들거나, 다른 자료의 ⋯ 메뉴에서 옮겨 오세요` : "미분류 자료가 없어요")));
+      return;
+    }
+    // 전체: 교과 순서대로 구역, 마지막에 미분류
+    const groups = [...subs.map(x => ({ key: x.id, sub: x })), { key: NONE, sub: null }]
+      .map(g => ({ ...g, items: list.filter(l => subjKeyOf(l) === g.key) }))
+      .filter(g => g.items.length);
+    body.replaceChildren(...groups.map(g => el("section", { class: "subj-sec" }, [
+      el("button", { class: "subj-sec-h", type: "button", title: "이 교과만 보기", onClick: () => pick(g.key) }, [
+        subjDot(g.sub), el("span", {}, g.sub ? g.sub.name : "미분류"), el("span", { class: "subj-n" }, String(g.items.length)),
+      ]),
+      el("div", { class: "card-grid" }, g.items.map(lessonCard)),
+    ])));
   }
   function lessonCard(l) {
     const cover = el("div", { class: "cover" }, l.cover
@@ -586,10 +828,15 @@ function lessonsTab(box, teacher) {
       onClick: (e) => { e.stopPropagation(); lessonMenu(btnMore, l.id); },
     }, icon("more", 18));
     const open = () => go("/editor/" + l.id);
+    const draggable = useSubj() && mySubjects(teacher.id).length > 0;
     const card = el("div", {
       class: "card lesson-card", role: "button", tabindex: "0", "aria-label": l.title || "수업 자료",
+      draggable: draggable ? "true" : null,
       onClick: open,
       onKeydown: (e) => { if ((e.key === "Enter" || e.key === " ") && e.target === card) { e.preventDefault(); open(); } },
+      // 교과 칩으로 끌어다 놓아 옮기기
+      onDragstart: (e) => { if (!draggable) return; e.dataTransfer.setData("text/hada-lesson", l.id); e.dataTransfer.effectAllowed = "move"; card.classList.add("dragging"); },
+      onDragend: () => card.classList.remove("dragging"),
     }, [
       cover,
       el("div", { class: "card-body" }, [
@@ -603,6 +850,7 @@ function lessonsTab(box, teacher) {
   function lessonMenu(anchor, lessonId) {
     menuPop(anchor, [
       { label: "편집", icon: "edit", onClick: () => go("/editor/" + lessonId) },
+      useSubj() ? { label: "교과 옮기기", icon: "book", onClick: () => subjectMenu(anchor, teacher, findLesson(lessonId)?.subjectId || null, sid => moveLesson(lessonId, sid)) } : null,
       typeof cloudDuplicateLesson === "function" ? { label: "복제", icon: "duplicate", onClick: () => duplicate(lessonId) } : null,
       { sep: true },
       { label: "삭제", icon: "trash", danger: true, onClick: () => remove(lessonId) },
@@ -646,7 +894,7 @@ function lessonsTab(box, teacher) {
     const title = await promptDialog({ title: "새 수업", placeholder: "수업 제목", ok: "만들기", maxlength: 80 });
     if (title == null || busy) return;
     setBusy(true);
-    const lesson = { id: newId("lesson"), teacherId: teacher.id, title: title || "새 수업", slides: [createSlide("ink")] };
+    const lesson = { id: newId("lesson"), teacherId: teacher.id, title: title || "새 수업", subjectId: newSubjectId(), slides: [createSlide("ink")] };
     let r;
     try { r = await cloudCreateLesson(lesson); } catch (e) { r = { error: "수업 자료를 만들지 못했어요" }; }
     setBusy(false);
@@ -665,7 +913,7 @@ function lessonsTab(box, teacher) {
       const slides = await fileToSlides(f, id, (d, t) => { progress.textContent = t > 1 ? `만드는 중 ${d}/${t}` : "만드는 중…"; });
       if (!slides || !slides.length) throw new Error("빈 파일이에요");
       const title = String(f.name || "").replace(/\.[^.]+$/, "").trim() || "새 수업";
-      const r = await cloudCreateLesson({ id, teacherId: teacher.id, title, slides });
+      const r = await cloudCreateLesson({ id, teacherId: teacher.id, title, subjectId: newSubjectId(), slides });
       if (!r || r.error) throw new Error((r && r.error) || "수업 자료를 만들지 못했어요");
       if (!disposed) go("/editor/" + id);
       else toast("수업 자료를 만들었어요", { type: "ok" });
@@ -684,8 +932,9 @@ function lessonsTab(box, teacher) {
 }
 
 // ── 수업 기록 탭 ──
-function sessionRow(s, { onOpen, teacher = null } = {}) {
+function sessionRow(s, { onOpen, teacher = null, subject = undefined } = {}) {
   const open = () => (onOpen ? onOpen(s.id) : go("/teacher/session/" + s.id));
+  // subject: 교과 표시(undefined = 표시 안 함, null = 미분류)
   const row = el("div", {
     class: "list-row clickable", role: "button", tabindex: "0",
     onClick: open,
@@ -693,7 +942,10 @@ function sessionRow(s, { onOpen, teacher = null } = {}) {
   }, [
     el("div", { class: "grow" }, [
       el("div", { class: "title" }, s.title || "수업"),
-      el("div", { class: "meta" }, `${fmtDate(s.startedAt)} · 참여 ${(s.participants || []).length}`),
+      el("div", { class: "meta" }, [
+        subject !== undefined ? el("span", { class: "subj-tag" }, [subjDot(subject), subject ? subject.name : "미분류"]) : null,
+        `${fmtDate(s.startedAt)} · 참여 ${(s.participants || []).length}`,
+      ]),
     ]),
     statusPill(s.status),
     reviewCopyBtn(s.id, teacher, { cls: "btn btn-sm t-rv-copy" }),
@@ -704,23 +956,35 @@ function sessionRow(s, { onOpen, teacher = null } = {}) {
   return row;
 }
 
+// 수업 기록은 그 수업 자료의 교과를 따른다(자료를 옮기면 기록도 함께)
 function recordsTab(box, teacher) {
+  const bar = el("div", { class: "subj-wrap" });
   const list = el("div", { class: "list" });
   const empty = el("div", { class: "empty empty-box" }, "끝난 수업이 여기 모여요");
-  box.append(el("div", { class: "page-head" }, [el("h1", {}, "수업 기록")]), list, empty);
-  let sig = null;
+  box.append(el("div", { class: "page-head" }, [el("h1", {}, "수업 기록")]), bar, list, empty);
+  let sig = null, booted = false;
+  let subj = validSubj(teacher.id, readSubj(teacher.id));
+  const keyOf = s => subjKeyOf(findLesson(s.lessonId));
+  function pick(key) { subj = validSubj(teacher.id, key); writeSubj(teacher.id, subj); render(); }
   function render() {
-    const ss = mySessions(teacher.id);
-    const nsig = ss.map(s => [s.id, s.title, s.status, s.startedAt, (s.participants || []).length].join("|")).join("\n");
+    const all = mySessions(teacher.id);
+    const on = subjectsReady() && booted && mySubjects(teacher.id).length > 0;
+    if (on) subj = validSubj(teacher.id, subj); // 부팅 전에는 기억한 값을 지우지 않는다
+    const cur = on ? subj : "";
+    const ss = cur ? all.filter(s => keyOf(s) === cur) : all;
+    const nsig = subjSig(teacher.id) + "|" + cur + "|" + (on ? 1 : 0) + "|" + all.map(s => [s.id, s.title, s.status, s.startedAt, (s.participants || []).length, on ? keyOf(s) : ""].join("|")).join("\n");
     if (nsig === sig) return;
     sig = nsig;
+    bar.replaceChildren(...(on ? [subjectBar({ teacher, value: cur, counts: key => (key ? all.filter(s => keyOf(s) === key).length : all.length), onPick: pick })] : []));
     list.hidden = !ss.length;
     empty.hidden = !!ss.length;
-    list.replaceChildren(...ss.map(s => sessionRow(s, { teacher })));
+    empty.textContent = all.length && cur ? "이 교과의 수업 기록이 없어요" : "끝난 수업이 여기 모여요";
+    list.replaceChildren(...ss.map(s => sessionRow(s, { teacher, subject: on ? findSubject(keyOf(s) === NONE ? null : keyOf(s)) : undefined })));
     // [복습 링크]가 누른 자리에서 바로 복사되게 이미 있는 복습 코드를 미리 읽어 둔다
     cloudFetchReviewCodes(ss.map(s => s.id)).catch(() => {});
   }
   render();
+  cloudReady.then(() => { booted = true; render(); });
   return { onStore: render };
 }
 
@@ -840,9 +1104,26 @@ function buildEditor(lessonId, teacher) {
   const wsBtn = el("button", {
     class: "btn", type: "button", title: "학습지 — 수업 중 학생이 각자 필기하는 PDF·이미지", onClick: openWorksheet,
   }, [el("span", { "aria-hidden": "true" }, "📝"), el("span", { class: "hide-sm" }, "학습지"), wsCnt]);
+  // 교과(v2.15): 제목 옆 [● 수학 ▾] — 눌러서 옮기기. 교과 기능을 쓸 수 없으면 숨김
+  const subjBtn = el("button", { class: "btn btn-sm btn-ghost subj-pick", type: "button", hidden: true, title: "교과" });
+  function paintSubjBtn() {
+    const l = L();
+    subjBtn.hidden = !l || !subjectsReady();
+    if (subjBtn.hidden) return;
+    const sub = findSubject(l.subjectId);
+    subjBtn.replaceChildren(subjDot(sub), el("span", { class: "hide-sm" }, sub ? sub.name : "교과 없음"), icon("chevron-down", 14));
+    subjBtn.setAttribute("aria-label", `교과: ${sub ? sub.name : "없음"} — 바꾸기`);
+  }
+  subjBtn.addEventListener("click", () => {
+    const l = L();
+    if (l) subjectMenu(subjBtn, teacher, l.subjectId || null, async sid => { await moveLesson(lessonId, sid); paintSubjBtn(); });
+  });
+  paintSubjBtn();
+  cloudReady.then(() => { if (!disposed) paintSubjBtn(); });
   const top = el("header", { class: "topbar editor-top" }, [
     el("button", { class: "btn btn-icon btn-ghost", type: "button", "aria-label": "뒤로", onClick: () => go("/teacher") }, icon("chevron-left")),
     titleIn,
+    subjBtn,
     el("span", { class: "topbar-group" }, [savePill, retryBtn, loadPill]),
     el("span", { class: "topbar-spacer" }),
     wsBtn,
@@ -853,7 +1134,7 @@ function buildEditor(lessonId, teacher) {
   const railList = el("div", { class: "rail-list" });
   const fileIn = el("input", { type: "file", accept: ACCEPT, hidden: true });
   const btnAdd = el("button", { class: "rail-add", type: "button", onClick: openAddModal }, [icon("plus", 16), "슬라이드"]);
-  const btnFile = el("button", { class: "rail-add", type: "button", onClick: () => fileIn.click() }, [icon("plus", 16), "파일"]);
+  const btnFile = el("button", { class: "rail-add", type: "button", title: "PDF·PowerPoint(.pptx)·이미지를 슬라이드로", onClick: () => fileIn.click() }, [icon("plus", 16), "파일"]);
   const rail = el("aside", { class: "rail", "aria-label": "슬라이드 목록" }, [railList, el("div", { class: "rail-foot" }, [btnAdd, btnFile, fileIn])]);
   const stage = el("section", { class: "stage editor-stage" });
   const insp = el("aside", { class: "inspector" });
@@ -1185,7 +1466,7 @@ function buildEditor(lessonId, teacher) {
     m = modal({ title: "슬라이드 추가", body, wide: true });
   }
 
-  // [+ 파일] PDF·이미지 → ink 여러 장
+  // [+ 파일] PDF·PowerPoint(.pptx)·이미지 → ink 여러 장
   fileIn.addEventListener("change", async () => {
     const f = fileIn.files && fileIn.files[0];
     fileIn.value = "";
@@ -1241,7 +1522,7 @@ function buildEditor(lessonId, teacher) {
     const grid = el("div", { class: "ws-grid" });
     const fileIn2 = el("input", { type: "file", accept: ACCEPT, multiple: true, hidden: true });
     const prog = el("span", { class: "pill", hidden: true });
-    const addBtn = el("button", { class: "btn btn-primary", type: "button", disabled: wsBusy, onClick: () => fileIn2.click() }, [icon("plus", 18), "PDF·이미지 추가"]);
+    const addBtn = el("button", { class: "btn btn-primary", type: "button", disabled: wsBusy, onClick: () => fileIn2.click() }, [icon("plus", 18), "PDF·PPT·이미지 추가"]);
     const body = el("div", { class: "stack" }, [
       el("div", { class: "ws-tools" }, [addBtn, prog, fileIn2]),
       grid,
@@ -1278,7 +1559,7 @@ function buildEditor(lessonId, teacher) {
     function renderGrid() {
       const list = pages();
       if (!list.length) {
-        grid.replaceChildren(el("div", { class: "empty ws-empty", style: { gridColumn: "1 / -1" } }, "아직 학습지가 없어요 — PDF나 이미지를 올려 보세요"));
+        grid.replaceChildren(el("div", { class: "empty ws-empty", style: { gridColumn: "1 / -1" } }, "아직 학습지가 없어요 — PDF·PowerPoint·이미지를 올려 보세요"));
         return;
       }
       grid.replaceChildren(...list.map((p, i) => card(p, i, list.length)));

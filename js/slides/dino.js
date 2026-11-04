@@ -15,10 +15,16 @@
 // 가정(v2.14): 문제마다 제한 시간 q.sec(10~120초, 기본 20초) — 넘기면 '시간 초과'(오답). 순위는 그대로 정답 수가 먼저.
 //       오답이면 다시 달리기 시작한 뒤(지나온 선인장이 비켜날 0.25초 뒤, 땅에 있을 때) 공룡이 뒤로 미끄러진다:
 //       세상이 멈춘 채 0.35초 동안 뒤로 64px 밀리고 0.5초 어질어질(점프 불가) → 1.1초에 걸쳐 제자리로.
+// 가정(v2.16): 목표 정답률(config.passPct, 기본 80%, 0 = 없음). Q문제를 다 푼 뒤 맞힌 문제가 목표(올림)보다 적으면 계속 달리며
+//       아직 못 맞힌 문제만 다시(선인장 jumpsPerQuestion 개마다) — 목표에 닿을 때까지 되풀이(안전장치 MAX_ROUNDS).
+//       다시 풀 문제가 있으면 틀려도 정답을 보여 주지 않는다. 틀렸을 때(config.holdWrong, 기본 켬) 그 문제 제한 시간이 끝날 때까지
+//       문제 창이 남아 있다('다시 나올 때를 위해 찾아 두세요'). 순위의 정답 = 처음에 맞힌 문제 수(correct), 다시 풀어 맞힌 수는 solved.
+//       콤보: 연속 정답 2·3·4개부터 달리기 속도 ×1.1·1.2·1.3(틀리면 끊김). 선인장 간격은 거리 기준이라 빨라지면 다음 문제도 빨리 온다.
+//       결과·끝난 뒤 'log' 응답·dino:progress 에 답 기록 [qi, opt, ok] → 교사 문제 리뷰(common.gameReview).
 import { el } from "../ui.js";
 import { findStudent } from "../store.js";
 import { registerSlideType, newId, injectCss, fmtMs } from "./registry.js";
-import { questionEditor, optionLetter, questionImage } from "./common.js";
+import { questionEditor, optionLetter, questionImage, gameReview } from "./common.js";
 import * as sound from "./game-sound.js";
 
 // ── 상수 ──
@@ -31,6 +37,10 @@ const BASE_SPEED = 320, SPEED_UP = 1.06;
 const GAP_MIN = 1.1, GAP_MAX = 2.0;      // 선인장 간격(초)
 const INVULN = 0.8, FEEDBACK_MS = 800;
 const QUIZ_SECS = [10, 15, 20, 30, 45, 60, 90, 120], QUIZ_SEC = 20; // 문제 제한(초) 고를 수 있는 값 · 기본
+const PASS_PCTS = [0, 60, 70, 80, 90, 100], PASS_PCT = 80; // 목표 정답률(%) — 못 미치면 틀린 문제를 다시 풀며 계속
+const MAX_ROUNDS = 6;                    // 다시 풀기 라운드 안전장치
+const COMBO_MAX = 3, COMBO_SPEED = 0.1;  // 연속 정답 2개부터 단계마다 +10% (3단계까지)
+const MAX_SPEED = BASE_SPEED * 2.2;
 const SLIP_WAIT = 0.25, SLIP_SLIDE = 0.35, SLIP_HOLD = 0.5, SLIP_BACK = 1.1, SLIP_PX = 64; // 오답 미끄러짐(초 · px)
 const INK = "#535353", SOFT = "#d6d2c8";
 
@@ -230,7 +240,8 @@ function createEngine(canvas, { auto = false, onPass, onHit, onJump } = {}) {
     if (w.nextIn <= 0) {
       const v = CACTI[Math.floor(Math.random() * CACTI.length)];
       w.obs.push({ x: W + 20, w: v.w, h: v.h, v, hit: false, passed: false });
-      w.nextIn = rnd(Math.random, GAP_MIN, GAP_MAX);
+      // 거리 기준 간격: 빨라지면 다음 선인장(과 다음 문제)도 빨리 온다. 너무 붙지 않게 0.7초 이하로는 줄이지 않음
+      w.nextIn = Math.max(0.7, rnd(Math.random, GAP_MIN, GAP_MAX) * (BASE_SPEED / Math.max(BASE_SPEED, w.speed)));
     }
     for (const o of w.obs) o.x -= sp * dt;
     // 충돌
@@ -329,9 +340,13 @@ function normQ(q) {
 function cfgOf(slide) {
   const c = slide?.config || {};
   const j = Math.round(Number(c.jumpsPerQuestion));
+  const questions = (Array.isArray(c.questions) ? c.questions : []).map(normQ);
+  const passPct = PASS_PCTS.includes(Number(c.passPct)) ? Number(c.passPct) : PASS_PCT;
   return {
-    questions: (Array.isArray(c.questions) ? c.questions : []).map(normQ),
+    questions,
     jumpsPerQuestion: j >= 1 && j <= 10 ? j : 3,
+    passPct, holdWrong: c.holdWrong !== false,
+    need: passPct ? Math.min(questions.length, Math.ceil((questions.length * passPct) / 100 - 1e-9)) : 0, // 목표 정답 수(올림)
   };
 }
 const newQuestion = (sec = QUIZ_SEC) => normQ({ id: newId("q"), sec });
@@ -360,8 +375,24 @@ function results(list) {
     total: num(r.payload?.total),
     timeMs: num(r.payload?.timeMs ?? r.timeMs, Infinity),
     hits: num(r.payload?.hits),
+    solved: num(r.payload?.solved ?? r.payload?.correct ?? r.score), // v2.15 까지는 다시 풀기가 없어 correct 와 같음
+    rounds: num(r.payload?.rounds),
   })).sort(cmpResult);
 }
+// 리뷰용 답 기록: 학생 id → [[qi, opt, ok], …]. 결과 응답의 log → 끝난 뒤 'log' 응답 → (교사 화면) 진행 이벤트로 모은 기록
+function dinoLogs(list, live = null) {
+  const m = new Map();
+  for (const key of ["result", "log"]) {
+    for (const r of list || []) {
+      if ((r.itemKey || "") !== key || m.has(r.studentId)) continue;
+      if (Array.isArray(r.payload?.log)) m.set(r.studentId, r.payload.log);
+    }
+  }
+  if (live) for (const [sid, p] of live) if (!m.has(sid) && p.log?.length) m.set(sid, p.log);
+  return m;
+}
+const reviewQs = cfg => cfg.questions.map(q => ({ id: q.id, question: q.question, image: q.image, options: q.options, answerId: q.answerIds[0] || null }));
+const comboMul = s => 1 + COMBO_SPEED * Math.min(COMBO_MAX, Math.max(0, s - 1));
 
 function nameOf(ctx, id) {
   let s = null;
@@ -388,7 +419,7 @@ function sessionSig(ctx) {
 // 리더보드 행 비교 키(같으면 DOM 을 다시 만들지 않는다)
 function rowsSig(rows, name) {
   return JSON.stringify(rows.map(r => [
-    r.sid, name(r.sid), r.kind, r.rank || 0, r.answered || 0, r.correct || 0, r.total || 0, r.hits || 0,
+    r.sid, name(r.sid), r.kind, r.rank || 0, r.answered || 0, r.correct || 0, r.total || 0, r.hits || 0, r.solved || 0, r.round || 0, r.tried || 0,
     Number.isFinite(r.timeMs) ? r.timeMs : -1,
   ]));
 }
@@ -407,18 +438,20 @@ function leaderboard(rows, { Q, name, meId = null, big = false, limit = 0, showR
   // 정답 칸: 큰 '맞힌 수/문제 수' + 정답률(푼 문제 중, 80% 이상 초록 · 50% 이상 주황 · 그 아래 빨강)
   const accEl = (r) => {
     const n = r.total || Q, c = r.correct || 0;
-    const done = r.kind === "done" ? n : (r.answered || 0); // 완주 = 모두 풂
+    const done = r.kind === "done" ? n : (r.tried ?? r.answered ?? 0); // 완주 = 모두 풂. 정답·정답률 = 처음에 맞힌 것
     if (!done) return el("span", { class: "dn-acc is-none" }, [el("b", {}, `0/${n}`)]);
     const pct = Math.round((c / done) * 100);
-    return el("span", { class: "dn-acc", title: `푼 문제 ${done}개 중 ${c}개 정답` }, [
+    const re = (r.solved || 0) > c || r.rounds || r.round;
+    return el("span", { class: "dn-acc", title: `처음 푼 문제 ${done}개 중 ${c}개 정답` }, [
       el("b", {}, `${c}/${n}`),
       el("span", { class: `pill ${pct >= 80 ? "pill-ok" : pct >= 50 ? "pill-warn" : "pill-danger"}` }, `${pct}%`),
+      re ? el("span", { class: "dn-retry", title: "틀린 문제를 다시 풀어 맞힌 수" }, `↻ ${r.solved || 0}/${n}`) : null,
     ]);
   };
   const rowEl = (r) => {
     let time;
     if (r.kind === "done") time = fmtMs(r.timeMs);
-    else if (r.kind === "live") time = el("span", { class: "pill pill-live" }, `진행 중 ${r.answered || 0}/${Q}`);
+    else if (r.kind === "live") time = el("span", { class: "pill pill-live" }, r.round ? `다시 풀기 ${r.round}회차` : `진행 중 ${Math.min(Q, r.tried ?? r.answered ?? 0)}/${Q}`);
     else time = el("span", { class: "pill pill-muted" }, "미완주");
     const rk = r.kind === "done" && r.rank ? el("span", { class: `dn-badge${r.rank <= 3 ? ` r${r.rank}` : ""}` }, String(r.rank)) : el("span", { class: "dn-badge is-none" }, "–");
     return el("div", { class: `dn-lb-row is-${r.kind}${meId && r.sid === meId ? " is-me" : ""}` }, [
@@ -453,8 +486,20 @@ function Editor({ slide, lesson, update, ctx }) {
       ...slide.config,
       questions: cfg.questions.map(q => ({ ...q, options: q.options.map(o => ({ ...o })), answerIds: q.answerIds.slice() })),
       jumpsPerQuestion: cfg.jumpsPerQuestion,
+      passPct: cfg.passPct,
+      holdWrong: cfg.holdWrong,
     },
   });
+  // 간단한 고르기 칸(누르면 바로 저장)
+  const segOf = (options, value, onPick) => {
+    const root = el("div", { class: "seg" });
+    const paintS = v => [...root.children].forEach((b, i) => b.classList.toggle("active", options[i].value === v));
+    options.forEach(o => root.appendChild(el("button", { type: "button", onClick: () => { paintS(o.value); onPick(o.value); } }, o.label)));
+    paintS(value);
+    return root;
+  };
+  const passSeg = segOf(PASS_PCTS.map(v => ({ value: v, label: v ? `${v}%` : "없음" })), cfg.passPct, v => { cfg.passPct = v; save(); });
+  const holdSeg = segOf([{ value: true, label: "남은 시간 멈춤" }, { value: false, label: "바로 달리기" }], cfg.holdWrong, v => { cfg.holdWrong = v; save(); });
 
   const preview = previewGame("is-small");
 
@@ -545,6 +590,14 @@ function Editor({ slide, lesson, update, ctx }) {
       el("span", {}, "문제 푸는 시간"), timeSeg,
       el("div", { class: "hint" }, "여기서 고르면 모든 문제에 적용돼요 · 문제마다 ⏱에서 따로 바꿀 수 있어요"),
     ]),
+    el("div", { class: "field" }, [
+      el("span", {}, "목표 정답률"), passSeg,
+      el("div", { class: "hint" }, "문제를 다 푼 뒤 이만큼 맞히지 못하면, 계속 달리며 틀린 문제를 다시 풀어요(목표에 닿을 때까지)"),
+    ]),
+    el("div", { class: "field" }, [
+      el("span", {}, "틀렸을 때"), holdSeg,
+      el("div", { class: "hint" }, "남은 시간 멈춤 = 그 문제 시간이 끝날 때까지 기다렸다 달려요. 빨리 찍어서 틀리면 손해예요"),
+    ]),
     list,
     el("div", {}, [addBtn]),
   ]);
@@ -556,15 +609,23 @@ function Student({ slide, ctx }) {
   css(ctx);
   const cfg = cfgOf(slide);
   const Q = cfg.questions.length;
-  const jpq = cfg.jumpsPerQuestion;
+  const jpq = cfg.jumpsPerQuestion, need = cfg.need, retry = need > 0;
   const meId = ctx.me?.id || null;
 
-  let mode = "";          // wait | count | play | question | feedback | done | over
+  let mode = "";          // wait | count | play | question | feedback | hold | done | over
   let gen = 0, startKey = null, dead = false;
-  let t0 = 0, answered = 0, correct = 0;
-  let localResult = null, submitState = ""; // '' | sending | ok | fail
+  // 판 상태: queue = 남은 문제 차례(문제 번호), round = 다시 풀기 회차(0 = 처음), log = 답 기록 [qi, opt, ok]
+  let t0 = 0, attempts = 0, firstOk = 0, streak = 0, round = 0, roundTotal = Q, roundDone = 0;
+  let queue = [], solved = new Set(), tried = new Set(), log = [];
+  let localResult = null, submitState = "", logSent = false; // submitState: '' | sending | ok | fail
   let qButtons = [];
   let waitMsg = "";
+  function resetRun() {
+    attempts = 0; firstOk = 0; streak = 0; round = 0; roundTotal = Q; roundDone = 0;
+    queue = cfg.questions.map((_, i) => i); solved = new Set(); tried = new Set(); log = [];
+    localResult = null; submitState = ""; logSent = false;
+  }
+  const speedNow = () => Math.min(MAX_SPEED, BASE_SPEED * Math.pow(SPEED_UP, Math.min(attempts, Q)) * comboMul(streak));
 
   const canvas = el("canvas");
   const overlay = el("div", { class: "dn-over", hidden: true });
@@ -573,8 +634,9 @@ function Student({ slide, ctx }) {
   const hudQ = el("span", { class: "pill" });
   const hudHit = el("span", { class: "pill" });
   const hudNext = el("span", { class: "pill pill-muted" });
+  const hudGoal = el("span", { class: "pill" }), hudCombo = el("span", { class: "pill dn-combo" });
   const sndBtn = sound.soundToggle({ className: "btn btn-sm btn-icon dn-snd" });
-  const hud = el("div", { class: "dn-hud", hidden: true }, [hudQ, hudHit, hudNext, sndBtn]);
+  const hud = el("div", { class: "dn-hud", hidden: true }, [hudQ, hudGoal, hudCombo, hudHit, hudNext, sndBtn]);
   sound.attach();
   const hint = el("div", { class: "dn-hint", hidden: true }, "탭하거나 스페이스로 점프");
   const result = el("div", { class: "dn-result", hidden: true });
@@ -586,7 +648,7 @@ function Student({ slide, ctx }) {
 
   // 가정: ctx.timeout(host 보조 함수, destroy 시 자동 정리)이 없으면 setTimeout. gen/dead 검사로 늦은 콜백 무시.
   const later = (fn, ms) => (typeof ctx.timeout === "function" ? ctx.timeout(fn, ms) : setTimeout(fn, ms));
-  const inGame = () => mode === "count" || mode === "play" || mode === "question" || mode === "feedback";
+  const inGame = () => mode === "count" || mode === "play" || mode === "question" || mode === "feedback" || mode === "hold";
 
   // 입력: 게임 영역 탭 / Space / ArrowUp
   function onTap(e) {
@@ -608,7 +670,7 @@ function Student({ slide, ctx }) {
   function onPass(passes) {
     paintHud();
     if (mode !== "play") return false;
-    if (passes % jpq === 0 && answered < Q) { askQuestion(); return true; }
+    if (passes % jpq === 0 && queue.length) { askQuestion(); return true; }
     return false;
   }
   function onHit() {
@@ -622,10 +684,15 @@ function Student({ slide, ctx }) {
 
   function paintHud() {
     const w = engine.world;
-    hudQ.textContent = `문제 ${answered}/${Q}`;
+    hudQ.textContent = round ? `다시 풀기 ${roundDone}/${roundTotal}` : `문제 ${tried.size}/${Q}`;
+    hudGoal.hidden = !retry;
+    hudGoal.textContent = solved.size >= need ? `목표 달성 ✓ ${solved.size}/${Q}` : `정답 ${solved.size}/${Q} · 목표 ${need}`;
+    hudGoal.className = `pill ${solved.size >= need ? "pill-ok" : ""}`;
+    hudCombo.hidden = streak < 2;
+    hudCombo.textContent = `🔥 ${streak}콤보 ×${comboMul(streak).toFixed(1)}`;
     hudHit.textContent = `충돌 ${w.hits}`;
     const left = jpq - (w.passes % jpq);
-    hudNext.textContent = answered >= Q ? "완료" : `다음 문제까지 ${left}`;
+    hudNext.textContent = !queue.length ? "완료" : `다음 문제까지 ${left}`;
   }
 
   function layout() {
@@ -659,7 +726,7 @@ function Student({ slide, ctx }) {
     if (mode === "wait" && waitMsg === text) return;
     gen++;
     mode = "wait"; waitMsg = text; startKey = null;
-    answered = 0; correct = 0; localResult = null; submitState = "";
+    resetRun();
     overlay.hidden = true; closeQuestion();
     engine.reset(); engine.setAuto(true); engine.setSpeed(BASE_SPEED); engine.freeze(false);
     layout();
@@ -670,7 +737,7 @@ function Student({ slide, ctx }) {
     gen++;
     const my = gen;
     mode = "count";
-    answered = 0; correct = 0; localResult = null; submitState = "";
+    resetRun();
     closeQuestion();
     engine.reset(); engine.setAuto(false); engine.setSpeed(BASE_SPEED); engine.freeze(true);
     paintHud(); layout();
@@ -686,23 +753,30 @@ function Student({ slide, ctx }) {
       sound.play("go");
       engine.freeze(false);
       layout();
-      if (meId) ctx.send("dino:progress", { sid: meId, answered: 0, correct: 0, hits: 0 });
+      if (meId) ctx.send("dino:progress", { sid: meId, answered: 0, tried: 0, correct: 0, solved: 0, hits: 0, round: 0 });
     };
     later(tick, 1000);
   }
 
   function askQuestion() {
-    const q = cfg.questions[answered];
+    const qi = queue[0];
+    const q = cfg.questions[qi];
     if (!q) return;
+    overlay.hidden = true; // 다시 풀기 알림이 떠 있었으면 닫기
     mode = "question";
     engine.freeze(true);
     const fb = el("div", { class: "dn-fb" });
-    qButtons = q.options.map((o, i) => el("button", {
-      class: "choice", type: "button", onClick: () => answer(q, o.id, fb),
-    }, [el("span", { class: "choice-key" }, optionLetter(i)), el("span", { class: "choice-text" }, o.text || " ")]));
+    const limMs = q.sec * 1000, until = performance.now() + limMs, my = gen;
     const bar = el("i"), barWrap = el("div", { class: "dn-qbar" }, [bar]), left = el("span", { class: "pill" });
+    const cur = { qi, q, fb, until, limMs, bar, barWrap, left, my };
+    qButtons = q.options.map((o, i) => el("button", {
+      class: "choice", type: "button", onClick: () => answer(cur, o.id),
+    }, [el("span", { class: "choice-key" }, optionLetter(i)), el("span", { class: "choice-text" }, o.text || " ")]));
     qLayer.replaceChildren(el("div", { class: "dn-qcard" }, [
-      el("div", { class: "dn-qtop" }, [el("span", { class: "dn-qnum" }, `문제 ${answered + 1} / ${Q}`), left]),
+      el("div", { class: "dn-qtop" }, [
+        round ? el("span", { class: "pill pill-warn" }, `다시 풀기 · ${qi + 1}번 문제`) : el("span", { class: "dn-qnum" }, `문제 ${qi + 1} / ${Q}`),
+        left,
+      ]),
       barWrap,
       el("h2", { class: "dn-qtext" }, q.question || " "),
       questionImage(q.image),
@@ -712,53 +786,98 @@ function Student({ slide, ctx }) {
     qLayer.hidden = false;
     layout();
     // 제한 시간: 0.1초마다 막대·남은 초, 다 되면 '시간 초과'(오답)
-    const limMs = q.sec * 1000, until = performance.now() + limMs, my = gen, k = answered;
     const tick = () => {
-      if (my !== gen || dead || mode !== "question" || answered !== k) return;
-      const rem = Math.max(0, until - performance.now());
-      bar.style.width = `${(rem / limMs) * 100}%`;
-      barWrap.classList.toggle("urgent", rem <= 5000);
-      const t = `${Math.ceil(rem / 1000)}초`;
-      if (left.textContent !== t) left.textContent = t;
-      if (rem <= 0) answer(q, null, fb);
+      if (my !== gen || dead || mode !== "question") return;
+      if (paintBar(cur) <= 0) answer(cur, null);
       else later(tick, 100);
     };
     tick();
   }
+  // 남은 시간 막대 → 남은 ms
+  function paintBar(cur) {
+    const rem = Math.max(0, cur.until - performance.now());
+    cur.bar.style.width = `${(rem / cur.limMs) * 100}%`;
+    cur.barWrap.classList.toggle("urgent", rem <= 5000);
+    const t = `${Math.ceil(rem / 1000)}초`;
+    if (cur.left.textContent !== t) cur.left.textContent = t;
+    return rem;
+  }
 
-  function answer(q, id, fb) {
+  function answer(cur, id) {
     if (mode !== "question") return;
-    mode = "feedback";
+    const { q, qi, fb } = cur;
     const ok = !!id && q.answerIds.includes(id);
-    answered += 1;
-    if (ok) correct += 1;
-    const timeMs = answered >= Q ? Math.round(performance.now() - t0) : null;
+    const oi = id ? q.options.findIndex(o => o.id === id) : -1;
+    attempts += 1;
+    if (!tried.has(qi)) { tried.add(qi); if (ok) firstOk += 1; }
+    if (ok) { solved.add(qi); streak += 1; } else streak = 0;
+    log.push([qi, oi, ok ? 1 : 0]);
+    queue.shift();
+    if (round) roundDone += 1;
+    if (round && solved.size >= need) queue = []; // 다시 풀기 중 목표에 닿으면 남은 문제 없이 끝
+    // 이 차례가 끝났으면: 목표에 닿았으면 끝, 아니면 못 맞힌 문제로 다시 풀기
+    let finished = false, newRound = 0;
+    if (!queue.length) {
+      if (solved.size >= need || round >= MAX_ROUNDS) finished = true;
+      else {
+        round += 1;
+        queue = cfg.questions.map((_, i) => i).filter(i => !solved.has(i));
+        roundTotal = queue.length; roundDone = 0; newRound = queue.length;
+      }
+    }
+    // 틀렸을 때: 다시 풀 수 있으면 정답을 알려 주지 않는다. 남은 시간 멈춤이면 제한 시간까지 이 창을 둔다
+    const hold = !ok && !!id && cfg.holdWrong && cur.until - performance.now() > FEEDBACK_MS;
+    mode = hold ? "hold" : "feedback";
     q.options.forEach((o, i) => {
       const b = qButtons[i];
       if (!b) return;
       b.disabled = true;
       if (o.id === id) b.classList.add("selected", ok ? "correct" : "wrong");
-      if (!ok && q.answerIds.includes(o.id)) b.classList.add("correct");
+      if (!ok && !retry && q.answerIds.includes(o.id)) b.classList.add("correct");
     });
-    fb.textContent = ok ? "정답!" : id ? "아쉬워요" : "시간 초과";
+    fb.textContent = ok
+      ? (streak >= 2 ? `정답! 🔥 ${streak}연속 — 더 빨라져요` : "정답!")
+      : `${id ? "아쉬워요" : "시간 초과"}${hold ? " — 시간이 끝나면 다시 달려요" : ""}${retry && !finished ? " · 이 문제는 다시 나올 수 있어요, 지금 찾아 두세요" : ""}`;
     fb.className = `dn-fb ${ok ? "ok" : "bad"}`;
-    if (answered < Q) sound.play(ok ? "correct" : "wrong"); // 마지막 문제는 완주 팡파르로
+    if (!finished) sound.play(ok ? (streak >= 2 ? "combo" : "correct") : "wrong"); // 마지막은 완주 팡파르로
     const hits = engine.world.hits;
-    if (meId) ctx.send("dino:progress", { sid: meId, answered, correct, hits });
-    engine.setSpeed(BASE_SPEED * Math.pow(SPEED_UP, answered));
+    if (meId) ctx.send("dino:progress", { sid: meId, answered: attempts, tried: tried.size, correct: firstOk, solved: solved.size, hits, round, last: [qi, oi, ok ? 1 : 0] });
+    engine.setSpeed(speedNow());
     paintHud();
-    // 마지막 문제: 피드백 0.8초 동안 교사가 [종료]해도 결과가 남도록 즉시 제출
-    if (answered >= Q) {
-      localResult = { correct, total: Q, timeMs, hits, run: startKey };
+    // 마지막 문제: 피드백 동안 교사가 [종료]해도 결과가 남도록 즉시 제출
+    if (finished) {
+      const timeMs = Math.round(performance.now() - t0);
+      localResult = { correct: firstOk, solved: solved.size, total: Q, timeMs, hits, run: startKey, attempts, rounds: round, log: log.slice() };
       submitResult();
     }
     const my = gen;
-    later(() => {
+    const go = () => {
       if (my !== gen || dead) return;
       closeQuestion();
-      if (answered >= Q) toDone();
-      else { mode = "play"; engine.freeze(false); if (!ok) engine.slip(); layout(); }
-    }, FEEDBACK_MS);
+      if (finished) { toDone(); return; }
+      mode = "play"; engine.freeze(false); if (!ok) engine.slip(); layout();
+      if (newRound) notice(`정답 ${solved.size}/${Q} — 목표 ${need}개! 틀린 ${newRound}문제를 다시 풀어요`);
+    };
+    if (!hold) { later(go, FEEDBACK_MS); return; }
+    const tick = () => {
+      if (my !== gen || dead || mode !== "hold") return;
+      if (paintBar(cur) <= 0) go(); else later(tick, 100);
+    };
+    tick();
+  }
+  // 게임 화면 위 잠깐 알림
+  function notice(text) {
+    overlay.replaceChildren(el("div", { class: "dn-notice" }, text));
+    overlay.hidden = false;
+    sound.play("count");
+    const my = gen;
+    later(() => { if (my === gen && !dead && mode !== "count") overlay.hidden = true; }, 3000);
+  }
+  // 다 풀지 못하고 끝나도 답 기록은 남긴다(교사 리뷰용)
+  function submitLog() {
+    if (logSent || !log.length || localResult) return;
+    logSent = true;
+    Promise.resolve().then(() => ctx.submit({ log: log.slice(), run: startKey, partial: true }, { itemKey: "log" })).catch(() => { logSent = false; });
   }
 
   async function submitResult() {
@@ -787,6 +906,7 @@ function Student({ slide, ctx }) {
   }
   function toOver() {
     if (mode !== "over") {
+      submitLog();
       gen++;
       mode = "over";
       overlay.hidden = true; closeQuestion();
@@ -815,7 +935,8 @@ function Student({ slide, ctx }) {
       kids.push(el("div", { class: "dn-rankcard" }, [
         el("div", { class: "dn-rank" }, [el("b", {}, `${rank}위`), el("span", {}, `/ ${total}명`)]),
         el("div", { class: "dn-stats" }, [
-          stat("정답", `${mine.correct}/${mine.total || Q}`),
+          stat("처음 정답", `${mine.correct}/${mine.total || Q}`),
+          (mine.solved || 0) > mine.correct ? stat("다시 풀어", `${mine.solved}/${mine.total || Q}`) : null,
           stat("시간", fmtMs(mine.timeMs)),
           stat("충돌", String(mine.hits)),
         ]),
@@ -889,7 +1010,7 @@ function TeacherLive({ slide, ctx }) {
   css(ctx);
   const cfg = cfgOf(slide);
   const Q = cfg.questions.length;
-  const progress = new Map(); // sid → {sid, answered, correct, hits}
+  const progress = new Map(); // sid → {sid, answered, tried, correct, solved, hits, round, log}
   let phase = null, busy = false, preview = null;
 
   const handlers = {
@@ -920,12 +1041,27 @@ function TeacherLive({ slide, ctx }) {
   sound.attach();
   const sndBtn = sound.soundToggle();
   let doneSeen = null; // 완주 수(새로 늘면 짧은 소리)
+  // 끝난 뒤 문제 리뷰(v2.16): 리더보드 대신 한 문제씩 크게, 정답은 문제마다 눌러야 보인다
+  let reviewEl = null;
+  const bReview = el("button", { class: "btn btn-primary", type: "button", hidden: true, onClick: () => setReview(!reviewEl) }, "📝 문제 리뷰");
+  const reviewBox = el("div", { class: "dn-review", hidden: true });
   const root = el("div", { class: "dn-live" }, [
     el("div", { class: "dn-live-head" }, [
-      el("h2", {}, slide.title || "공룡 점프"), pillBox, countP, el("span", { class: "dn-spacer" }), sndBtn, ctlHead,
+      el("h2", {}, slide.title || "공룡 점프"), pillBox, countP, el("span", { class: "dn-spacer" }), bReview, sndBtn, ctlHead,
     ]),
     body,
+    reviewBox,
   ]);
+  function setReview(on) {
+    on = !!on && phase === "ended";
+    reviewEl?.destroy?.();
+    reviewEl = on ? gameReview({ questions: reviewQs(cfg), logs: dinoLogs(ctx.responses(), progress), ctx, big: true }) : null;
+    reviewBox.replaceChildren(...(reviewEl ? [reviewEl] : []));
+    reviewBox.hidden = !on;
+    body.hidden = on;
+    bReview.textContent = on ? "← 순위표" : "📝 문제 리뷰";
+    bReview.className = `btn ${on ? "" : "btn-primary"}`;
+  }
 
   const kvDone = el("b");
   const panel = el("div", { class: "dn-panel" }, [
@@ -935,6 +1071,7 @@ function TeacherLive({ slide, ctx }) {
       kv("문제 간격", el("b", {}, `선인장 ${cfg.jumpsPerQuestion}개`)),
       kv("푸는 시간", el("b", {}, secText(cfg.questions).replace("문제마다 ", ""))),
       kv("완주", kvDone),
+      cfg.need ? kv("목표", el("b", {}, `${cfg.passPct}% (${cfg.need}/${Q})`)) : null,
     ]),
   ]);
 
@@ -942,7 +1079,13 @@ function TeacherLive({ slide, ctx }) {
   ctx.on("dino:progress", (p) => {
     if (!p || !p.sid) return;
     if ((ctx.activity()?.phase || "idle") === "idle") return;
-    progress.set(p.sid, { sid: p.sid, answered: num(p.answered), correct: num(p.correct), hits: num(p.hits) });
+    const prev = progress.get(p.sid);
+    const log = prev?.log ? prev.log.slice() : [];
+    if (Array.isArray(p.last)) log.push(p.last); // 답 기록(리뷰용) — 결과가 저장되면 그쪽이 먼저
+    progress.set(p.sid, {
+      sid: p.sid, answered: num(p.answered), tried: num(p.tried ?? p.answered), correct: num(p.correct),
+      solved: num(p.solved ?? p.correct), hits: num(p.hits), round: num(p.round), log,
+    });
     paintBoard();
   });
 
@@ -951,7 +1094,7 @@ function TeacherLive({ slide, ctx }) {
     const ids = new Set(done.map(r => r.sid));
     const rows = done.map((r, i) => ({ ...r, kind: "done", rank: i + 1 }));
     const live = [...progress.values()].filter(p => !ids.has(p.sid))
-      .sort((a, b) => (b.answered - a.answered) || (b.correct - a.correct) || (a.hits - b.hits));
+      .sort((a, b) => (b.correct - a.correct) || (b.tried - a.tried) || (b.solved - a.solved) || (a.hits - b.hits));
     for (const p of live) rows.push({ ...p, kind: phase === "ended" ? "dnf" : "live" });
     return { rows, doneN: done.length };
   }
@@ -978,6 +1121,8 @@ function TeacherLive({ slide, ctx }) {
     const changed = ph !== phase;
     if (changed) {
       phase = ph;
+      bReview.hidden = ph !== "ended";
+      if (ph !== "ended" && reviewEl) setReview(false);
       sound.bgm(ph === "running" ? "dino" : null);
       pillBox.replaceChildren(statusPill(ph));
       ctlHead.update(ph); ctlPanel.update(ph);
@@ -987,7 +1132,7 @@ function TeacherLive({ slide, ctx }) {
         preview = previewGame();
         body.replaceChildren(
           preview.el,
-          el("div", { class: "dn-info" }, Q ? `문제 ${Q}개 · 선인장 ${cfg.jumpsPerQuestion}개마다 문제 · ${secText(cfg.questions)}` : "아직 문제가 없어요"),
+          el("div", { class: "dn-info" }, Q ? `문제 ${Q}개 · 선인장 ${cfg.jumpsPerQuestion}개마다 문제 · ${secText(cfg.questions)}${cfg.need ? ` · 목표 정답 ${cfg.need}/${Q}(못 미치면 틀린 문제 다시)` : ""}` : "아직 문제가 없어요"),
         );
       }
     }
@@ -1006,7 +1151,7 @@ function TeacherLive({ slide, ctx }) {
       sessSig = sig;
       paintBoard();
     },
-    destroy() { if (preview) preview.engine.destroy(); preview = null; sound.bgm(null); sound.detach(); sndBtn.release(); },
+    destroy() { if (preview) preview.engine.destroy(); preview = null; reviewEl?.destroy?.(); sound.bgm(null); sound.detach(); sndBtn.release(); },
   };
 }
 
@@ -1033,6 +1178,7 @@ function summary(slide, responses = [], session, ctx) {
   const cfg = cfgOf(slide);
   const Q = cfg.questions.length;
   const rows = results(responses).map((r, i) => ({ ...r, kind: "done", rank: i + 1 }));
+  const logs = dinoLogs(responses);
   return el("div", { class: "dn-sum" }, [
     el("div", { class: "dn-sum-meta" }, [
       el("span", { class: "pill pill-muted" }, `문제 ${Q}개`),
@@ -1041,6 +1187,8 @@ function summary(slide, responses = [], session, ctx) {
     rows.length
       ? leaderboard(rows, { Q, name: id => nameOf(ctx, id), showRank: rows.length > 1 })
       : el("div", { class: "empty" }, "기록이 없어요"),
+    // 문제 리뷰(교사 기록만, 정답은 문제마다 눌러야 보임)
+    ctx?.isTeacher !== false && logs.size ? el("div", { class: "dn-sum-review" }, [el("div", { class: "dn-sum-h" }, "문제 리뷰"), gameReview({ questions: reviewQs(cfg), logs, ctx, big: false })]) : null,
   ]);
 }
 
@@ -1090,6 +1238,12 @@ const CSS = `
 .dn-qbar { height: 6px; border-radius: 999px; background: var(--surface-2); overflow: hidden; margin-top: -4px; }
 .dn-qbar i { display: block; height: 100%; width: 100%; background: var(--accent); border-radius: inherit; }
 .dn-qbar.urgent i { background: var(--danger); }
+.dn-hud .dn-combo { background: #fde2d4; color: #b3410f; font-weight: 800; }
+.dn-notice { padding: 10px 18px; border-radius: 999px; background: rgba(28,22,14,.82); color: #fff; font-weight: 700; font-size: clamp(14px, 2.2vw, 18px); text-align: center; max-width: 90%; animation: dn-pop .5s ease both; }
+.dn-retry { font-size: .62em; font-weight: 700; color: var(--accent-ink); white-space: nowrap; }
+.dn-review { display: flex; flex-direction: column; gap: 12px; }
+.dn-sum-review { display: grid; gap: 8px; margin-top: 4px; }
+.dn-sum-h { font-weight: 700; font-size: 14px; }
 .dn-qtext { margin: 0; font-size: 21px; line-height: 1.45; font-weight: 700; white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; }
 .dn-choices { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 @media (max-width: 560px) { .dn-choices { grid-template-columns: 1fr; } }
@@ -1114,7 +1268,7 @@ const CSS = `
 .dn-lb { display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
 .dn-lb-row { display: grid; grid-template-columns: 48px minmax(0, 1fr) 118px 112px 52px; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
 .dn-lb.no-rank .dn-lb-row { grid-template-columns: minmax(0, 1fr) 118px 112px 52px; }
-.dn-acc { display: inline-flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.dn-acc { display: inline-flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
 .dn-acc b { font-size: 1.2em; font-weight: 800; color: var(--ink); }
 .dn-acc .pill { height: 22px; padding: 0 8px; font-size: 13px; font-weight: 800; }
 .dn-acc.is-none b { color: var(--muted); font-weight: 700; }

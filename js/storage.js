@@ -1,4 +1,4 @@
-// 슬라이드 이미지: Supabase Storage(public 버킷 'slides') 업로드·썸네일·PDF 변환
+// 슬라이드 이미지: Supabase Storage(public 버킷 'slides') 업로드·썸네일·PDF·PowerPoint 변환
 // 경로: <lessonId>/<slideId>_<Date.now().toString(36)>.jpg, 썸네일은 같은 이름 + '_t.jpg' (폭 320px)
 // 로컬 모드: 업로드 없이 data URL을 그대로 돌려준다(썸네일은 작은 data URL).
 // 가정: 본 이미지는 긴 변 2400px 이하로 맞추고, 5MB를 넘으면 화질/크기를 낮춰 다시 인코딩한다.
@@ -286,11 +286,47 @@ function limiter(max) {
   return fn => new Promise((res, rej) => { q.push({ fn, res, rej }); next(); });
 }
 
-// PDF·이미지 → ink 슬라이드(업로드 완료된 URL). onProgress(done, total)
+// 쪽을 차례로 그려(render(i) → 캔버스) 동시 3개까지 올린다 → ink 슬라이드[]. 실패하면 이미 올린 그림은 지운다(best-effort)
+async function pagesToSlides(total, render, lessonId, report) {
+  const slides = new Array(total);
+  const run = limiter(3);
+  const jobs = [];
+  let done = 0;
+  let failed = null;
+  report(0, total);
+  try {
+    for (let i = 0; i < total && !failed; i++) {
+      // 렌더는 순서대로(메모리), 업로드는 동시 3개까지
+      const cv = await render(i);
+      const enc = await encodeCanvas(cv, 0.85);
+      cv.width = cv.height = 0;
+      const id = newId("slide");
+      // 업로드 실패는 여기서 잡아 두고(남은 쪽 중단) 아래에서 한 번에 처리
+      jobs.push(run(async () => {
+        if (failed) return;
+        const img = await putEncoded(lessonId, id, enc);
+        slides[i] = inkSlide(id, img);
+        report(++done, total);
+      }).catch(e => { failed ||= e; }));
+    }
+    await Promise.all(jobs);
+    if (failed) throw failed;
+    return slides;
+  } catch (e) {
+    // 진행 중 업로드가 끝난 뒤, 이미 올라간 이미지는 best-effort 삭제(고아 방지)
+    await Promise.allSettled(jobs);
+    for (const s of slides) if (s && s.bgPath) removeSlideImage(s.bgPath);
+    throw e;
+  }
+}
+
+// PDF·PowerPoint(.pptx)·이미지 → ink 슬라이드(업로드 완료된 URL). onProgress(done, total)
+// 가정(v2.15): .pptx 는 js/pptx.js 가 브라우저에서 직접 그린다(긴 변 2400px, 숨긴 슬라이드 제외). 옛 .ppt·.key 는 안내만.
 export async function fileToSlides(file, lessonId, onProgress) {
   const name = (file && file.name || "").toLowerCase();
   const ext = name.split(".").pop();
   const isPdf = file.type === "application/pdf" || ext === "pdf";
+  const isPptx = ext === "pptx" || file.type === "application/vnd.openxmlformats-officedocument.presentationml.presentation";
   const isImg = /^image\/(png|jpe?g|webp|gif|bmp)$/.test(file.type) || ["png", "jpg", "jpeg", "webp", "gif", "bmp"].includes(ext);
   const report = (d, t) => { try { onProgress && onProgress(d, t); } catch (_) {} };
   await waitClient();
@@ -303,21 +339,22 @@ export async function fileToSlides(file, lessonId, onProgress) {
     report(1, 1);
     return [inkSlide(id, img)];
   }
-  if (!isPdf) throw new Error("PDF 또는 이미지만 올릴 수 있어요");
+  if (isPptx) {
+    const { openPptx } = await import("./pptx.js");
+    const deck = await openPptx(await file.arrayBuffer());
+    try {
+      if (!deck.count) throw new Error("슬라이드가 없어요");
+      return await pagesToSlides(deck.count, i => deck.render(i, deck.aspect >= 1 ? MAX_SIDE : MAX_SIDE_PORTRAIT * deck.aspect), lessonId, report);
+    } finally { deck.close(); }
+  }
+  if (ext === "ppt" || ext === "pps" || ext === "key") throw new Error("옛 .ppt·Keynote 파일은 .pptx나 PDF로 저장해서 올려 주세요");
+  if (!isPdf) throw new Error("PDF·PowerPoint(.pptx)·이미지만 올릴 수 있어요");
 
   const pdfjs = await loadPdfJs();
   const doc = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
-  const total = doc.numPages;
-  const slides = new Array(total);
-  const run = limiter(3);
-  const jobs = [];
-  let done = 0;
-  let failed = null;
-  report(0, total);
   try {
-    for (let i = 1; i <= total && !failed; i++) {
-      // 렌더는 순서대로(메모리), 업로드는 동시 3개까지
-      const page = await doc.getPage(i);
+    return await pagesToSlides(doc.numPages, async (idx) => {
+      const page = await doc.getPage(idx + 1);
       // 긴 변 기준 해상도(세로 3000px · 가로 2400px), 배율 1.6~4
       const vp1 = page.getViewport({ scale: 1 });
       const scale = Math.min(4, Math.max(1.6, maxSideFor(vp1.width, vp1.height) / Math.max(vp1.width, vp1.height)));
@@ -330,26 +367,8 @@ export async function fileToSlides(file, lessonId, onProgress) {
       g.fillRect(0, 0, cv.width, cv.height);
       try { await page.render({ canvasContext: g, viewport: vp }).promise; }
       finally { page.cleanup?.(); }
-      const enc = await encodeCanvas(cv, 0.85);
-      cv.width = cv.height = 0;
-      const id = newId("slide");
-      const idx = i - 1;
-      // 업로드 실패는 여기서 잡아 두고(남은 페이지 중단) 아래에서 한 번에 처리
-      jobs.push(run(async () => {
-        if (failed) return;
-        const img = await putEncoded(lessonId, id, enc);
-        slides[idx] = inkSlide(id, img);
-        report(++done, total);
-      }).catch(e => { failed ||= e; }));
-    }
-    await Promise.all(jobs);
-    if (failed) throw failed;
-    return slides;
-  } catch (e) {
-    // 진행 중 업로드가 끝난 뒤, 이미 올라간 이미지는 best-effort 삭제(고아 방지)
-    await Promise.allSettled(jobs);
-    for (const s of slides) if (s && s.bgPath) removeSlideImage(s.bgPath);
-    throw e;
+      return cv;
+    }, lessonId, report);
   } finally {
     try { doc.destroy?.(); } catch (_) {}
   }

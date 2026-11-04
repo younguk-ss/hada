@@ -10,7 +10,7 @@
 //       남의 항목만 빠졌으면 4~8초(보통 작성자가 먼저 다시 써서 취소됨). 수렴 쓰기는 마감을 늦추지 않는다(스로틀).
 // 가정: patchSession의 DB 쓰기는 항상 세션 전체 meta(PATCH_KEYS)를 쓴다(실패 시 백오프 재시도).
 // 가정: 세션 구독은 첫 SUBSCRIBED 포함 매번 resync(=cloudFetchSession) 한다.
-import { store, setCloudMode, ensureSessionShape, findLesson, findSession, findStudent, findTeacher, newId, newJoinCode, normCode } from "./store.js";
+import { store, setCloudMode, ensureSessionShape, findLesson, findSession, findStudent, findTeacher, findSubject, newId, newJoinCode, normCode } from "./store.js";
 import { sync } from "./sync.js";
 import { currentChannel } from "./realtime.js";
 import { uploadSlideImage, isDataUrl, removeLessonImages, copySlideImage } from "./storage.js";
@@ -107,6 +107,7 @@ const SESSION_COLS = "id,lesson_id,teacher_id,title,status,flow,current_slide,gr
 const RECORD_COLS = "id,session_id,slide_id,scope,scope_id,strokes,texts,removed,last_writer,updated_at";
 const RESPONSE_COLS = "id,session_id,slide_id,student_id,item_key,payload,score,correct,time_ms,updated_at";
 const WS_COLS = "id,lesson_id,position,title,bg_url,bg_path,thumb_url,base_strokes,base_texts"; // 학습지 페이지(005)
+const SUBJECT_COLS = "id,teacher_id,name,position,color"; // 교과(006)
 
 function toTeacher(r, withHash = true) {
   const t = { id: r.id, name: r.name, joinCode: r.join_code || null };
@@ -378,9 +379,12 @@ export async function cloudBootTeacher(teacherId) {
   if (!trow) { store.set(s => { s.whoTeacher = null; }); return null; }
   const teacher = upsertById(store.state.teachers, toTeacher(trow));
 
-  const [lr, sr] = await Promise.all([
+  const [lr, sr, subR, lsR] = await Promise.all([
     supa.from("lesson_meta").select(LESSON_META_COLS).eq("teacher_id", teacherId).order("updated_at", { ascending: false }),
     supa.from("sessions").select(SESSION_COLS).eq("teacher_id", teacherId).order("started_at", { ascending: false }).limit(200),
+    // 교과(006): lesson_meta 뷰는 그대로 두고 따로 읽는다 — 마이그레이션 전 DB에서도 목록 조회가 깨지지 않게
+    supa.from("subjects").select(SUBJECT_COLS).eq("teacher_id", teacherId).order("position", { ascending: true }),
+    supa.from("lessons").select("id,subject_id").eq("teacher_id", teacherId),
   ]);
   // 실패한 단계는 건너뛴다(빈 결과로 덮지 않음)
   if (lr.error) warn("boot lessons", lr.error);
@@ -400,6 +404,7 @@ export async function cloudBootTeacher(teacherId) {
     });
     store.state.lessons = [...mine, ...keep];
   }
+  bootSubjects(teacherId, subR, lsR);
   let sessionIds = [];
   if (sr.error) warn("boot sessions", sr.error);
   else {
@@ -571,6 +576,8 @@ export async function cloudCreateLesson(lesson) {
   lesson.updatedAt = now;
   if (!Array.isArray(lesson.slides)) lesson.slides = [];
   if (!Array.isArray(lesson.worksheet)) lesson.worksheet = []; // 새 자료: 학습지 없음(복제는 채워서 넘어옴)
+  lesson.subjectId ??= null;
+  if (isCloud && subjState !== "ok") lesson.subjectId = null; // 교과 열이 없는 DB면 저장되지 않으니 미분류로
   if (!isCloud) {
     setLessonSlides(lesson, lesson.slides);
     store.set(s => { upsertById(s.lessons, lesson); });
@@ -580,6 +587,7 @@ export async function cloudCreateLesson(lesson) {
     await migrateDataUrls(lesson.id, lesson.slides, false);
     const { error } = await supa.from("lessons").insert({
       id: lesson.id, teacher_id: lesson.teacherId, title: lesson.title, created_at: iso(lesson.createdAt), updated_at: iso(now),
+      ...(lesson.subjectId && subjState === "ok" ? { subject_id: lesson.subjectId } : {}),
     });
     if (error) throw error;
     if (lesson.slides.length) {
@@ -732,9 +740,119 @@ export async function cloudDuplicateLesson(lessonId) {
       if (img) { im.url = img.url; im.path = img.path; } else im.path = null;
     })));
   }
-  const lesson = { id: nid, teacherId: src.teacherId, title: `${src.title} (복사본)`, createdAt: Date.now(), updatedAt: Date.now(), slides: copy, worksheet: wsCopy };
+  const lesson = { id: nid, teacherId: src.teacherId, title: `${src.title} (복사본)`, subjectId: src.subjectId || null, createdAt: Date.now(), updatedAt: Date.now(), slides: copy, worksheet: wsCopy };
   const r = await cloudCreateLesson(lesson);
   return r;
+}
+
+// ── 교과(subjects, 006 — v2.15) ──
+// 가정: 006 마이그레이션 전 DB에서도 앱이 죽지 않게 — subjects 테이블이나 lessons.subject_id 열이 없으면 교과 기능만 끈다
+//       (subjectsReady() false → 화면은 예전처럼 한 목록). 로컬 모드는 store 에만 둔다.
+// 가정: 교과를 바꿔도 자료의 updated_at 은 그대로(목록 순서가 흔들리지 않게). 교과 삭제 = 그 자료는 미분류(DB on delete set null).
+let subjState = "unknown"; // 클라우드: unknown(부팅 전·조회 실패) | ok | missing
+const SUBJECT_COLORS = ["#2563eb", "#16a34a", "#dc2626", "#d97706", "#7c3aed", "#0891b2", "#db2777", "#4b5563"];
+export function subjectColors() { return SUBJECT_COLORS.slice(); }
+export function subjectsReady() { return isCloud ? subjState === "ok" : !store.cloudMode; }
+function toSubject(r) {
+  return { id: r.id, teacherId: r.teacher_id, name: r.name || "", position: Number(r.position) || 0, color: r.color || null };
+}
+function fromSubject(x) {
+  return { id: x.id, teacher_id: x.teacherId, name: x.name, position: x.position, color: x.color || null };
+}
+function subjectsOf(teacherId) {
+  return (store.state.subjects || []).filter(x => x.teacherId === teacherId).sort((a, b) => a.position - b.position);
+}
+function bootSubjects(teacherId, subR, lsR) {
+  const err = subR.error || lsR.error;
+  if (err) {
+    if (isMissingRel(subR.error) || isMissingCol(lsR.error) || isMissingRel(lsR.error)) subjState = "missing"; // 006 전 DB: 조용히 끔
+    else warn("boot subjects", err);
+    return;
+  }
+  subjState = "ok";
+  store.state.subjects = [...(store.state.subjects || []).filter(x => x.teacherId !== teacherId), ...(subR.data || []).map(toSubject)];
+  const by = new Map((lsR.data || []).map(r => [r.id, r.subject_id || null]));
+  for (const l of store.state.lessons) if (l.teacherId === teacherId && by.has(l.id)) l.subjectId = by.get(l.id);
+}
+// 실패 처리 공통: 테이블·열이 없으면 기능을 끈다
+function subjFail(label, error) {
+  if (isMissingRel(error) || isMissingCol(error)) subjState = "missing";
+  warn(label, error);
+}
+const notReady = () => (isCloud && subjState !== "ok" ? { error: "교과 기능을 아직 쓸 수 없어요" } : null);
+
+export async function cloudCreateSubject(teacherId, name) {
+  await ready();
+  const nr = notReady(); if (nr) return nr;
+  const mine = subjectsOf(teacherId);
+  const used = new Set(mine.map(x => x.color));
+  const sub = {
+    id: newId("subj"), teacherId, name: String(name || "").trim().slice(0, 30) || "새 교과",
+    position: mine.length ? Math.max(...mine.map(x => x.position)) + 1 : 0,
+    color: SUBJECT_COLORS.find(c => !used.has(c)) || SUBJECT_COLORS[mine.length % SUBJECT_COLORS.length],
+  };
+  if (isCloud) {
+    const { error } = await supa.from("subjects").insert(fromSubject(sub));
+    if (error) { subjFail("createSubject", error); return { error: "교과를 만들지 못했어요" }; }
+  }
+  store.set(s => { s.subjects.push(sub); });
+  return { subject: sub };
+}
+// patch: { name?, color? }
+export async function cloudUpdateSubject(id, patch) {
+  await ready();
+  const nr = notReady(); if (nr) return nr;
+  const sub = findSubject(id);
+  if (!sub) return { error: "교과를 찾지 못했어요" };
+  const next = { ...sub, ...patch };
+  next.name = String(next.name || "").trim().slice(0, 30) || sub.name;
+  if (isCloud) {
+    const { error } = await supa.from("subjects").update({ name: next.name, color: next.color || null }).eq("id", id);
+    if (error) { subjFail("updateSubject", error); return { error: "교과를 바꾸지 못했어요" }; }
+  }
+  store.set(() => { Object.assign(sub, { name: next.name, color: next.color }); });
+  return { ok: true };
+}
+// ids = 새 순서(이 교사의 교과 id 전부)
+export async function cloudReorderSubjects(teacherId, ids) {
+  await ready();
+  const nr = notReady(); if (nr) return nr;
+  const mine = subjectsOf(teacherId);
+  const order = new Map(ids.map((id, i) => [id, i]));
+  const next = mine.map(x => ({ ...x, position: order.has(x.id) ? order.get(x.id) : ids.length + x.position }));
+  if (isCloud) {
+    const { error } = await supa.from("subjects").upsert(next.map(fromSubject), { onConflict: "id" });
+    if (error) { subjFail("reorderSubjects", error); return { error: "순서를 바꾸지 못했어요" }; }
+  }
+  store.set(() => { for (const n of next) { const x = findSubject(n.id); if (x) x.position = n.position; } });
+  return { ok: true };
+}
+export async function cloudDeleteSubject(id) {
+  await ready();
+  const nr = notReady(); if (nr) return nr;
+  if (isCloud) {
+    const { error } = await supa.from("subjects").delete().eq("id", id);
+    if (error) { subjFail("deleteSubject", error); return { error: "교과를 지우지 못했어요" }; }
+  }
+  store.set(s => {
+    s.subjects = s.subjects.filter(x => x.id !== id);
+    for (const l of s.lessons) if (l.subjectId === id) l.subjectId = null; // DB on delete set null 과 같게
+  });
+  return { ok: true };
+}
+// subjectId = null → 미분류
+export async function cloudSetLessonSubject(lessonId, subjectId) {
+  await ready();
+  const nr = notReady(); if (nr) return nr;
+  const l = findLesson(lessonId);
+  if (!l) return { error: "수업 자료를 찾지 못했어요" };
+  const sid = subjectId && findSubject(subjectId) ? subjectId : null;
+  if (isCloud) {
+    const { error } = await supa.from("lessons").update({ subject_id: sid }).eq("id", lessonId);
+    if (error) { subjFail("setLessonSubject", error); return { error: "교과를 옮기지 못했어요" }; }
+  }
+  store.set(() => { l.subjectId = sid; });
+  return { ok: true };
 }
 
 // config 안의 모든 image({ url, path, thumb })를 lessonId 폴더로 복사해 제자리에서 바꾼다. 실패하면 path만 비움(URL 공유)
