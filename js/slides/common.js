@@ -349,7 +349,8 @@ export function activityBar(ctx, { reveal = false, timer = false, countFn = null
     const ok = await ctx.confirm("응답을 모두 지울까요?", { ok: "초기화", danger: true });
     if (!ok) return;
     try { await ctx.clearResponses(); } catch (e) { console.warn("[activityBar] clearResponses", e); }
-    ctx.setActivity({ phase: "idle", reveal: false, startedAt: null, endsAt: null });
+    // clearedAt: 초기화한 시각 — 주관식 실시간 답안(레코드에 남은 쓰던 글)이 그 전 글을 버린다
+    ctx.setActivity({ phase: "idle", reveal: false, startedAt: null, endsAt: null, clearedAt: Date.now() });
   }
   function startTimer(sec) {
     closePop();

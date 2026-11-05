@@ -132,6 +132,9 @@ const CSS = `
 .ink-wrap.bar-side .ink-float .ink-sep { grid-column:1 / -1; width:auto; height:1px; margin:4px 6px; }
 .ink-wrap.bar-side .ink-float .ink-sep.sep-undo { display:none; }
 .ink-wrap.bar-side .ink-float .ink-zlbl { grid-column:1 / -1; order:2; width:auto; }
+/* 교사 수업 화면 왼쪽 세로 도구바: 위에 붙임(아래 왼쪽은 ‹ 넘기기 자리), [전체 지우기]는 두 칸을 다 써서 맨 끝 */
+.ink-live.bar-side > .ink-float { top:8px; transform:none; box-shadow:var(--shadow-1); }
+.ink-live.bar-side > .ink-float .btn { grid-column:1 / -1; order:3; margin:4px 0 0; justify-content:center; padding:0 4px; font-size:12.5px; }
 /* 읽기 전용(발표): 확대 버튼만 오른쪽 아래에 작게 */
 .ink-float.ink-zoombar { left:auto; right:max(8px, env(safe-area-inset-right)); transform:none; padding:4px; z-index:6;
   background:rgba(255,255,255,.82); -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px); }
@@ -1020,10 +1023,42 @@ function TeacherLive({ slide, session, ctx }) {
     fit?.destroy(); fit = null;
     hs?.destroy(); hs = null;
     hsChips = null;
+    try { offPage && offPage(); } catch (_) {}
+    offPage = null;
     viewer?.destroy(); viewer = null;
-    bar = null;
+    bar?.closePops?.();
+    bar = null; liveStage = null;
+    wrap.classList.remove("bar-side", "bar-compact");
     gal?.destroy(); gal = null;
   }
+
+  // 도구바 자리(v2.18 수업 화면 슬라이드 크게): 위 가로(늘 쓰던 자리) / 왼쪽 세로 2열 중 슬라이드가 더 크게 보이는 쪽.
+  // 가로로 넓은 화면(아이패드 가로·노트북)은 슬라이드 높이가 모자라므로, 위 줄을 비워 옆 빈 여백에 도구를 세우면 슬라이드가 커진다.
+  // 세로 화면은 폭이 모자라 위 줄이 슬라이드를 줄이지 않으므로 그대로 위. 학생 화면 placeBar와 같은 방식(맞춤에서 도구바만큼 비움).
+  let liveStage = null, offPage = null, barRaf = 0;
+  function placeBar() {
+    const z = viewer?.zoom;
+    if (!z || !bar || !liveStage) return;
+    const W = wrap.clientWidth, H = wrap.clientHeight;
+    if (!W || !H) return;
+    const pa = z.focusAspect() || 1.6;
+    const page = (w, h) => Math.min(w / pa, h);
+    const wasSide = wrap.classList.contains("bar-side");
+    const topH = (wasSide ? 50 : bar.offsetHeight || 50) + 10; // 위 도구바 + 틈
+    const topPage = page(W - 20, H - topH - 20);
+    const sidePage = page(W - 116 - 20, H - 20);              // 2열(100) + 왼쪽 여백(8+틈)
+    const side = H >= 460 && sidePage > topPage * 1.04;
+    wrap.classList.toggle("bar-side", side);
+    wrap.classList.toggle("bar-compact", side && H < 560);
+    bar.classList.toggle("ink-float", side);
+    if (side) {
+      const sr = liveStage.getBoundingClientRect(), br = bar.getBoundingClientRect();
+      z.setInsets({ left: Math.min(200, Math.max(0, br.right - sr.left) + 2) });
+    } else z.setInsets({});
+    if (wasSide !== side) { bar.closePops?.(); if (!barRaf) barRaf = requestAnimationFrame(() => { barRaf = 0; placeBar(); }); }
+  }
+  const barRo = typeof ResizeObserver === "function" ? new ResizeObserver(() => placeBar()) : null;
+  barRo?.observe(wrap);
 
   function mountBody() {
     teardownBody();
@@ -1040,11 +1075,14 @@ function TeacherLive({ slide, session, ctx }) {
           if (ok) viewer?.clearAll();
         },
       }, "전체 지우기");
-      bar = makeToolbar(() => viewer, { extras: [clearBtn] });
-      const zp = zoomPill(() => viewer);
-      wrap.replaceChildren(bar, stage, zp);
+      // 확대 버튼은 도구바 안에(슬라이드 위에 따로 뜨는 확대 알약이 슬라이드를 가리지 않게)
+      bar = makeToolbar(() => viewer, { extras: [clearBtn], zoom: true });
+      wrap.replaceChildren(bar, stage);
       bar.apply();
-      zp.bindZoom(viewer);
+      bar.bindZoom(viewer);
+      liveStage = stage;
+      offPage = viewer.zoom?.onChange((kind) => { if (kind === "page") placeBar(); }) || null;
+      placeBar();
       if (hotspotsOf(slide).length) hs = hotspotLayer(viewer.frame, { getSlide: () => slide, mode: ctx.openPopup ? "open" : "hidden", onOpen: openPop, activeId: activePop });
     } else {
       gal = makeGallery(bodyKey);
@@ -1359,6 +1397,8 @@ function TeacherLive({ slide, session, ctx }) {
       gbModal?.close(); gbModal = null;
       try { presOff && presOff(); } catch (_) {}
       presOff = null;
+      barRo?.disconnect();
+      if (barRaf) cancelAnimationFrame(barRaf);
       teardownBody();
     },
   };

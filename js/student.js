@@ -873,7 +873,7 @@ export function studentReviewView({ id } = {}) {
     const can = hadAnswer(slide, s.activity?.[slide.id]);
     answerBtn.hidden = !can;
     if (can) {
-      const label = answers.has(slide.id) ? "다시 풀기" : "정답 보기";
+      const label = answers.has(slide.id) ? "다시 풀기" : slide.type === "short" ? "답안 보기" : "정답 보기";
       setText(answerLabel, "answer", label);
       answerBtn.title = label;
       answerBtn.setAttribute("aria-label", label);

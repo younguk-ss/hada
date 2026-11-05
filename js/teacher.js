@@ -1768,7 +1768,12 @@ function buildLive(sessionId, teacher) {
     ]),
     el("div", { class: "drawer-body" }, [pluginBox, peopleBox]),
   ]);
-  const liveBody = el("div", { class: "live-body" }, [stage, wsStage, drawer, rail]);
+  // 아래 좌우 넘기기: 아이패드에서 손이 바로 닿게. 상단 ◀ ▶와 같은 동작. ‹ 는 스테이지 밖 레이어, › 는 레일 안 — 슬라이드 크기·비율에 영향 없음
+  const edgePrev = el("button", { class: "lt-edge", type: "button", "aria-label": "이전 슬라이드", title: "이전 슬라이드 (←)", hidden: true, onClick: () => step(-1) }, icon("chevron-left", 28));
+  const edgeNext = el("button", { class: "lt-edge lt-edge-rail", type: "button", "aria-label": "다음 슬라이드", title: "다음 슬라이드 (→)", hidden: true, onClick: () => step(1) }, icon("chevron-right", 28));
+  rail.appendChild(edgeNext); // 레일 맨 아래(margin-top:auto)
+  let edgeRaf = 0, edgeMo = null, edgeRo = null;
+  const liveBody = el("div", { class: "live-body" }, [stage, wsStage, drawer, rail, edgePrev]);
   const root = el("div", { class: "live" }, [top, liveBody]);
   mount(root);
 
@@ -1838,6 +1843,7 @@ function buildLive(sessionId, teacher) {
     const t = panel === "people" ? "참여" : panel === "tools" ? `도구 · ${slide ? slideLabel(slide) : ""}` : "";
     if (drawerTitle.textContent !== t) drawerTitle.textContent = t;
     syncRail();
+    edgeSoon(); // 좁은 화면에서는 패널이 스테이지 위에 겹쳐 뜸 → 아래 넘기기 자리 다시
   }
   function syncRail() {
     const has = !!pluginBox.firstChild;
@@ -1897,6 +1903,83 @@ function buildLive(sessionId, teacher) {
       flowBtn.title = free ? "자유 이동 (학생이 직접 넘김)" : "교사 진행";
       flowBtn.setAttribute("aria-pressed", String(free));
     }
+    watchEdge(isInk && !wsOpen);
+    edgeSoon();
+  }
+
+  // ── 아래 좌우 넘기기 자리 ──
+  // › 다음: 오른쪽 레일 맨 아래(레일은 늘 있는 자리라 슬라이드 종류·크기와 상관없이 같은 곳 — 슬라이드를 가리거나 줄이지 않음).
+  // ‹ 이전: 필기(PPT) 슬라이드가 한 장 크게 보일 때만 스테이지 왼쪽 아래의 빈 여백(옆 또는 아래)에. 보이는 슬라이드·도구바와
+  //   겹치지 않는 자리를 › 와 같은 높이 → 아래 모서리에서 위로 → 맨 아래 줄을 따라 안쪽으로 찾고, › 크기부터 36px까지 줄여 본다.
+  //   자리가 없으면(확대했거나 여백이 좁음, 퀴즈·담벼락·게임·개별 갤러리처럼 화면을 꽉 채우는 슬라이드) 숨김 — 상단 ◀ ▶는 늘 그대로.
+  const EDGE_SIZES = [[56, 12, 8], [48, 12, 8], [40, 10, 6], [36, 8, 6]]; // [버튼 크기, 화면 가장자리와 거리, 슬라이드·도구바와 띄울 거리]
+  const safeProbe = el("div", { class: "lt-safe-probe", "aria-hidden": "true" }); // 기기 안전 영역(px) 재기용
+  liveBody.appendChild(safeProbe);
+  function edgeSoon() { if (!edgeRaf && !disposed) edgeRaf = requestAnimationFrame(placeEdge); }
+  // 크기 바뀜(창·패널·전체 화면) + 필기 슬라이드일 때는 확대·이동·교체로 프레임이 움직이는 것까지(게임은 매 프레임 바뀌어 지켜보지 않음).
+  // 이때는 그 자리에서 바로 다시 놓는다(그리기 전) — 한 프레임이라도 옛 자리에 남아 커진 슬라이드를 가리지 않게
+  function watchEdge(on) {
+    if (!edgeRo && typeof ResizeObserver === "function") {
+      edgeRo = new ResizeObserver(placeEdge);
+      edgeRo.observe(stage);
+      edgeRo.observe(liveBody);
+    }
+    if (!on) { if (edgeMo) { edgeMo.disconnect(); edgeMo = null; } return; }
+    if (!edgeMo && typeof MutationObserver === "function") {
+      edgeMo = new MutationObserver(placeEdge);
+      edgeMo.observe(stage, { subtree: true, childList: true, attributes: true, attributeFilter: ["style", "class", "hidden"] });
+    }
+  }
+  function placeEdge() {
+    if (edgeRaf) { cancelAnimationFrame(edgeRaf); edgeRaf = 0; }
+    if (disposed) return;
+    const s = S();
+    const n = s ? (s.slidesSnapshot || []).length : 0;
+    const i = s ? s.currentSlide || 0 : 0;
+    const on = n > 0 && !wsOpen && !stage.hidden;
+    edgeNext.hidden = !on;
+    edgeNext.disabled = i >= n - 1;
+    const frame = on ? stage.querySelector(".ink-stage.zoom-view > .slide-frame") : null;
+    const p = frame ? prevSpot(frame) : null;
+    edgePrev.hidden = !p;
+    if (!p) return;
+    edgePrev.disabled = i <= 0;
+    const bs = edgePrev.style;
+    bs.left = p.x + "px"; bs.top = p.y + "px"; bs.width = bs.height = p.s + "px";
+  }
+  // → { x, y, s }(liveBody 기준 px) | null
+  function prevSpot(frame) {
+    const R = (n) => n.getBoundingClientRect();
+    const base = R(liveBody), st = R(stage), view = R(frame.parentElement), fr = R(frame);
+    if (st.width < 1 || st.height < 1 || fr.width < 1) return null;
+    // 보이는 슬라이드 = 프레임 ∩ 보기 영역(확대하면 보기 영역 전체) + 스테이지 위에 떠 있는 도구바
+    const blocks = [{ l: Math.max(fr.left, view.left), t: Math.max(fr.top, view.top), r: Math.min(fr.right, view.right), b: Math.min(fr.bottom, view.bottom) }];
+    stage.querySelectorAll(".ink-float, .ink-toolbar").forEach(nd => {
+      const r = R(nd);
+      if (r.width && r.height) blocks.push({ l: r.left, t: r.top, r: r.right, b: r.bottom });
+    });
+    // 좁은 화면: 열린 패널이 스테이지 위에 겹쳐 뜬다 → 그 왼쪽까지만
+    let right = st.right;
+    if (panel && getComputedStyle(drawer).position === "absolute") right = Math.min(right, R(rail).left - drawer.offsetWidth);
+    const sa = getComputedStyle(safeProbe);
+    const saL = parseFloat(sa.paddingLeft) || 0, saB = parseFloat(sa.paddingBottom) || 0;
+    const T = st.top + st.height * 0.4; // 아래쪽(스테이지 아래 60%)에서만
+    const C = (st.left + right) / 2;
+    const nr = edgeNext.hidden ? null : R(edgeNext);
+    const maxS = nr && nr.width ? Math.round(nr.width) : 56; // › 보다 크지 않게(한 쌍으로 보이게)
+    for (const [sz0, ins, gap] of EDGE_SIZES) {
+      if (sz0 > maxS && sz0 !== EDGE_SIZES[EDGE_SIZES.length - 1][0]) continue;
+      const sz = Math.min(sz0, maxS);
+      const L = st.left + Math.max(ins, saL), B = st.bottom - Math.max(ins, saB);
+      if (C - L < sz + gap) continue;
+      const free = (x, y) => y >= T && y + sz <= B && blocks.every(k => x + sz + gap <= k.l || x - gap >= k.r || y + sz + gap <= k.t || y - gap >= k.b);
+      const at = (x, y) => ({ x: Math.round(x - base.left), y: Math.round(y - base.top), s: sz });
+      // › 와 같은 높이(가운데 맞춤)면 한 쌍으로 보인다
+      if (nr) { const y = nr.top + (nr.height - sz) / 2; if (free(L, y)) return at(L, y); }
+      for (let y = B - sz; y >= T; y -= 4) if (free(L, y)) return at(L, y);
+      for (let x = L + 4; x + sz <= C - gap; x += 4) if (free(x, B - sz)) return at(x, B - sz);
+    }
+    return null;
   }
   function onlineSet() {
     try { return new Set(ch.online() || []); } catch (_) { return new Set(); }
@@ -2235,6 +2318,9 @@ function buildLive(sessionId, teacher) {
   return () => {
     disposed = true;
     clearInterval(wsTimer);
+    if (edgeRaf) cancelAnimationFrame(edgeRaf);
+    if (edgeRo) edgeRo.disconnect();
+    if (edgeMo) edgeMo.disconnect();
     document.removeEventListener("keydown", onKey);
     offStore();
     try { offPres(); } catch (_) {}

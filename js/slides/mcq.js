@@ -196,11 +196,11 @@ const QUIZ_CSS = `
 .qz-bar-label .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .qz-key { width: 28px; height: 28px; border-radius: 50%; border: 1.5px solid var(--line-strong); display: inline-grid; place-items: center; font-weight: 700; font-size: 13px; flex: none; background: var(--surface); color: var(--ink-2); }
 .qz-key.on { background: var(--accent); color: #fff; border-color: var(--accent); }
-.qz-panel { display: grid; gap: 14px; }
+.qz-panel { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr); min-width: 0; }
 .qz-roster { display: grid; }
-.qz-roster-row { display: flex; justify-content: space-between; gap: 8px; padding: 8px 2px; border-bottom: 1px solid var(--line); font-size: 14px; }
-.qz-roster-row .n { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.qz-roster-row .v { color: var(--ink-2); flex: none; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qz-roster-row { display: flex; justify-content: space-between; gap: 8px; padding: 8px 2px; border-bottom: 1px solid var(--line); font-size: 14px; min-width: 0; }
+.qz-roster-row .n { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qz-roster-row .v { color: var(--ink-2); flex: 0 1 auto; min-width: 0; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
 .qz-roster-row .v.ok { color: var(--ok); }
 .qz-roster-row .v.bad { color: var(--danger); }
 .qz-roster-row .v.none { color: var(--muted); }

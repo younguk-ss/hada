@@ -585,7 +585,7 @@ button.pill { cursor: pointer; }
 .drawer-head { display: flex; align-items: center; gap: 8px; padding: 10px 10px 0 16px; flex: none; }
 .drawer-head h3, .drawer-head h4 { flex: 1; font-size: 15px; }
 .drawer-tabs { flex: none; padding: 0 12px; }
-.drawer-body { flex: 1; min-height: 0; overflow-y: auto; padding: 16px; display: grid; gap: 14px; align-content: start; }
+.drawer-body { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; align-content: start; } /* 열 폭 고정 — 긴 내용이 패널을 가로로 넓히지 않게 */
 
 .toast-stack {
   position: fixed; z-index: 600;
@@ -1214,6 +1214,8 @@ body:has(.float-toolbar, .stu-toolbar, .ink-float) .toast-stack { bottom: calc(8
   overflow: hidden; overflow: clip; /* 닫힌 드로어(화면 밖)로 가로 스크롤이 생기지 않게 */
 }
 .live > .stage, .live-body > .stage, .live-stage { padding: 24px; padding-left: max(24px, var(--sal)); padding-bottom: max(24px, var(--sab)); }
+/* 필기(PPT) 슬라이드는 여백을 줄여 슬라이드를 크게(v2.18) — 맞춤 여백(zoom-view 10px)이 따로 있어 가장자리에 붙지 않음 */
+.live-body > .live-stage:has(> .slide-host[data-type="ink"]) { padding: 8px; padding-left: max(8px, var(--sal)); padding-bottom: max(8px, var(--sab)); }
 .live-body > .drawer {
   position: relative; top: auto; bottom: auto; right: auto; z-index: 5;
   width: 340px;
@@ -1252,6 +1254,27 @@ body:has(.float-toolbar, .stu-toolbar, .ink-float) .toast-stack { bottom: calc(8
 .lr-lock { position: absolute; bottom: 5px; right: 9px; line-height: 0; color: var(--accent); }
 .lr-lock svg { width: 12px; height: 12px; }
 @media (hover: hover) { .lr-item:not(.active):hover { background: var(--surface-2); color: var(--ink); } }
+/* 수업 진행 아래 좌우 넘기기: 자리·크기는 teacher.js가 슬라이드 바깥 빈 여백에 맞춰 정함(슬라이드를 가리지 않음). 패널(5)·레일(6)·팝업 아래 */
+.lt-edge {
+  position: absolute; left: 0; top: 0; z-index: 4;
+  width: 56px; height: 56px; padding: 0;
+  display: grid; place-items: center;
+  border: 1px solid var(--line); border-radius: 50%;
+  background: var(--surface); color: var(--ink);
+  box-shadow: var(--shadow-1);
+  touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  transition: transform .12s var(--ease), background-color .12s var(--ease), opacity .12s var(--ease);
+}
+.lt-edge .icon { display: grid; place-items: center; width: 100%; height: 100%; line-height: 0; }
+.lt-edge .icon svg { width: 50%; height: 50%; stroke-width: 2.2; } /* 크기가 바뀌어도(56~36px) 같은 비율 */
+.lt-edge:disabled { opacity: .35; box-shadow: none; }
+.lt-edge:not(:disabled):active { transform: scale(.92); background: var(--surface-2); }
+@media (hover: hover) { .lt-edge:not(:disabled):hover { border-color: var(--line-strong); background: var(--surface-2); } }
+/* › 는 레일 맨 아래(레일 안쪽 폭 52px) */
+.live-rail > .lt-edge-rail { position: relative; left: auto; top: auto; z-index: auto; flex: none; width: 48px; height: 48px; margin: auto auto 2px; }
+.lt-safe-probe { position: absolute; left: 0; top: 0; width: 0; height: 0; padding: 0 0 var(--sab) var(--sal); visibility: hidden; pointer-events: none; }
+@media print { .lt-edge { display: none !important; } }
 .live .seg { --seg-h: 36px; }
 .live .topbar .btn, .live-top .btn, .live-bar .btn { flex: none; }
 /* 코드 pill (탭 → QR) */
