@@ -1,6 +1,7 @@
 // 설문(poll) — 교사가 던진 질문의 선택지 중에서 학생이 자기 의견을 고르기(정답 없음)
 // 가정: 응답 payload { answerIds } 는 객관식과 같은 형태, score/correct 는 null(채점 안 함).
-// 가정: 결과(선택지별 인원·%)는 교사가 [결과 공개]하면 학생에게도 보인다. 공개 중에도 마감 전이면 고를 수 있다(의견은 바뀔 수 있음).
+// 가정: 결과(선택지별 인원·%)는 교사가 [결과 공개]하면 학생에게도 보인다.
+// 가정(v2.17): 한 번 제출하면 답을 바꿀 수 없다(수업 중 계속 바꾸지 않게). 교사가 [초기화]로 응답을 지우면 다시 고를 수 있다.
 // 가정: 객관식과 달리 전원 응답해도 자동 마감·공개하지 않는다(교사가 결정).
 // 가정: 누가 무엇을 골랐는지는 교사만 본다(막대·타일 탭 → 응답자, 패널 학생 목록). 학생 화면에는 이름이 없다.
 import { el } from "../ui.js";
@@ -108,6 +109,7 @@ function Student({ slide, ctx }) {
     return { b, id: o.id };
   });
   const submitB = el("button", { class: "btn btn-primary btn-lg btn-block qz-submit", type: "button", onClick: submit }, "제출");
+  const onceHint = el("p", { class: "hint qz-once" }, "제출하면 답을 바꿀 수 없어요");
   const bars = choiceBars([], 0, { revealed: true });
   const results = el("div", { class: "poll-res", hidden: true }, [el("div", { class: "poll-res-head" }, "결과"), bars]);
   const root = el("div", { class: "qz-stu poll-stu" }, [
@@ -116,13 +118,14 @@ function Student({ slide, ctx }) {
     questionImage(cfg.image),
     el("div", { class: "qz-choices" }, btns.map(x => x.b)),
     submitB,
+    onceHint,
     results,
   ]);
 
   const locked = () => isLocked(st, clockNow(ctx));
 
   function pick(id) {
-    if (locked() || sending) return;
+    if (locked() || sending || mine) return; // 제출한 뒤에는 바꿀 수 없음
     if (cfg.multiple) { if (sel.has(id)) sel.delete(id); else sel.add(id); }
     else sel = new Set([id]);
     dirty = !sameSet([...sel], mine?.payload?.answerIds || []);
@@ -130,7 +133,7 @@ function Student({ slide, ctx }) {
   }
 
   async function submit() {
-    if (locked() || sending || !sel.size) return;
+    if (locked() || sending || mine || !sel.size) return;
     const picked = cfg.options.map(o => o.id).filter(id => sel.has(id));
     sending = true; paint();
     try {
@@ -143,15 +146,18 @@ function Student({ slide, ctx }) {
 
   function paint() {
     const lock = locked();
-    if (lock && dirty && !sending) { sel = new Set(mine?.payload?.answerIds || []); dirty = false; }
-    status.set({ state: st, submitted: !!mine && !dirty });
+    // 잠김·제출됨(다른 기기에서 낸 경우 포함) → 고르던 것은 버리고 제출본을 보여 준다
+    if ((lock || mine) && dirty && !sending) { sel = new Set(mine?.payload?.answerIds || []); dirty = false; }
+    const done = !!mine && !sending;
+    status.set({ state: st, submitted: done });
     for (const x of btns) {
-      x.b.disabled = lock;
+      x.b.disabled = lock || done;
       x.b.classList.toggle("selected", sel.has(x.id));
     }
     submitB.hidden = lock;
-    submitB.disabled = sending || !sel.size || (!!mine && !dirty);
-    submitB.textContent = sending ? "제출 중…" : (mine && !dirty ? "제출함" : (mine ? "다시 제출" : "제출"));
+    submitB.disabled = sending || !sel.size || done;
+    submitB.textContent = sending ? "제출 중…" : (done ? "제출함" : "제출");
+    onceHint.hidden = lock || done;
     // 결과: 교사가 공개했을 때만 (내가 고른 선택지 강조)
     const show = st.reveal === true;
     results.hidden = !show;

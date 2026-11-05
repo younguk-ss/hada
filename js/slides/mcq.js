@@ -4,6 +4,7 @@
 // 가정: config.timerSec 는 편집기에서 다루지 않는다(수업 중 activityBar 타이머 프리셋 사용). 값은 보존만.
 // 가정: 타이머 만료 → phase 'ended' 전환은 common.activityBar 가 담당. 학생은 endsAt 에 로컬로도 잠근다.
 // 가정: 잠기는 순간 제출하지 않은 변경은 버리고 제출본을 보여 준다(정답 공개 ✓/✗ 가 실제 제출과 일치하도록).
+// 가정(v2.17): 한 번 제출하면 답을 바꿀 수 없다(수업 중 계속 바꾸지 않게). 교사가 [초기화]로 응답을 지우면 다시 고를 수 있다.
 // 가정: endsAt·startedAt 은 교사 시계 기준. 코어가 ctx.now()(학생 기기의 교사 시계 추정)를 주면 그것으로 비교하고,
 //       없으면 Date.now()(보정 없음). common.countdownPill/phasePill 은 Date.now() 를 쓰므로 toLocalTime 으로 바꿔 넘긴다.
 // 가정(v2.9): 정답 표시 = reveal || phase 'ended'(마감·타이머 끝). 전원 응답 자동 공개는 쓰지 않는다 — 결과는 늘 교사가 연다.
@@ -184,6 +185,7 @@ const QUIZ_CSS = `
 .choice.correct .qz-mark { color: var(--ok); }
 .choice.wrong .qz-mark { color: var(--danger); }
 .qz-submit { min-height: 52px; font-size: 17px; }
+.qz-once { margin: -8px 0 0; text-align: center; }
 .qz-live { height: 100%; overflow: auto; padding: 28px 36px; display: flex; flex-direction: column; gap: 20px; box-sizing: border-box; }
 .qz-live .qz-q { font-size: clamp(22px, 3vw, 34px); }
 .qz-live-head { display: flex; gap: 8px; align-items: center; justify-content: flex-end; min-height: 24px; }
@@ -352,6 +354,7 @@ function Student({ slide, ctx }) {
     return { b, mark, id: o.id };
   });
   const submitB = el("button", { class: "btn btn-primary btn-lg btn-block qz-submit", type: "button", onClick: submit }, "제출");
+  const onceHint = el("p", { class: "hint qz-once" }, "제출하면 답을 바꿀 수 없어요");
 
   const root = el("div", { class: "qz-stu mcq-stu" }, [
     status.el,
@@ -359,6 +362,7 @@ function Student({ slide, ctx }) {
     questionImage(cfg.image),
     el("div", { class: "qz-choices" }, btns.map(x => x.b)),
     submitB,
+    onceHint,
   ]);
 
   // 정답 표시: 정답 공개 · 마감(타이머 끝 포함) — 교사가 결과를 열 때만(v2.9)
@@ -368,7 +372,7 @@ function Student({ slide, ctx }) {
   const locked = (rev = revealed()) => rev || isLocked(st, clockNow(ctx));
 
   function pick(id) {
-    if (locked() || sending) return;
+    if (locked() || sending || mine) return; // 제출한 뒤에는 바꿀 수 없음
     if (cfg.multiple) { if (sel.has(id)) sel.delete(id); else sel.add(id); }
     else sel = new Set([id]);
     const saved = mine?.payload?.answerIds || [];
@@ -377,7 +381,7 @@ function Student({ slide, ctx }) {
   }
 
   async function submit() {
-    if (locked() || sending || !sel.size) return;
+    if (locked() || sending || mine || !sel.size) return;
     const picked = cfg.options.map(o => o.id).filter(id => sel.has(id));
     sending = true; paint();
     try {
@@ -391,12 +395,14 @@ function Student({ slide, ctx }) {
   function paint() {
     const rev = revealed();
     const lock = locked(rev);
-    if (lock && dirty && !sending) { sel = new Set(mine?.payload?.answerIds || []); dirty = false; }
+    // 잠김·제출됨(다른 기기에서 낸 경우 포함) → 고르던 것은 버리고 제출본을 보여 준다
+    if ((lock || mine) && dirty && !sending) { sel = new Set(mine?.payload?.answerIds || []); dirty = false; }
+    const done = !!mine && !sending;
     const show = rev && graded; // 정답 ✓/✗ 표시
     const picks = mine?.payload?.answerIds || [];
     const ok = show && !!mine && sameSet(picks, cfg.answerIds);
     // 공개 중에는 결과 pill 하나만(마감·제출함·여러 개 선택 숨김)
-    status.set({ state: show ? { phase: "idle" } : st, submitted: !show && !!mine && !dirty });
+    status.set({ state: show ? { phase: "idle" } : st, submitted: !show && done });
     if (multiP) multiP.hidden = show;
     resP.hidden = !show;
     if (show) {
@@ -406,15 +412,16 @@ function Student({ slide, ctx }) {
     for (const x of btns) {
       const picked = sel.has(x.id);
       const isAns = cfg.answerIds.includes(x.id);
-      x.b.disabled = lock;
+      x.b.disabled = lock || done;
       x.b.classList.toggle("selected", picked && !show);
       x.b.classList.toggle("correct", show && isAns);
       x.b.classList.toggle("wrong", show && picked && !isAns);
       x.mark.textContent = show ? (isAns ? "✓" : picked ? "✗" : "") : "";
     }
     submitB.hidden = lock;
-    submitB.disabled = sending || !sel.size || (!!mine && !dirty);
-    submitB.textContent = sending ? "제출 중…" : (mine && !dirty ? "제출함" : (mine ? "다시 제출" : "제출"));
+    submitB.disabled = sending || !sel.size || done;
+    submitB.textContent = sending ? "제출 중…" : (done ? "제출함" : "제출");
+    onceHint.hidden = lock || done;
   }
   paint();
 

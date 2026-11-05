@@ -2,9 +2,14 @@
 // 가정: YouTube 가 아니면 경로 확장자가 mp4/webm/m4v/mov/ogv/ogg 인 http(s) 주소만 <video> 로 재생한다. 그 외는 미지원.
 // 가정: 플레이어는 16:9 고정, 스테이지 안에서 contain(컨테이너 쿼리 단위) 로 맞춘다.
 // 가정: YT.Player 는 el 이 문서에 붙은 뒤에 만든다(붙을 때까지 100ms 간격 대기, 최대 10초).
-import { el } from "../ui.js";
+// 가정(v2.17): 재생 방식 = 수업 중 바꾼 값(activity.playMode) > 편집기 설정(config.playMode) > 기본 'teacher'.
+//       'teacher'(교사 재생) → 학생 화면에는 플레이어 없이 '칠판의 영상을 봐주세요'. 'student'(학생 재생) → 학생도 각자 플레이어.
+//       자유 이동(session.flow 'student')·복습에서는 교사가 화면을 이끌지 않으니 늘 학생 재생(videoquiz 와 같은 규칙).
+//       교사 재생으로 바꾸면 학생 플레이어를 없애므로 학생 화면에서 돌던 영상도 멈춘다.
+import { el, icon } from "../ui.js";
 import { registerSlideType, parseYouTubeId, injectCss } from "./registry.js";
 import { loadYouTubeApi } from "./common.js";
+import { seg, field } from "./mcq.js";
 
 export const VIDEO_UNSUPPORTED = "유튜브 또는 mp4 주소만 지원해요";
 
@@ -77,6 +82,13 @@ const CSS = `
 .md-thumb-badge{position:absolute;right:6px;top:6px;width:22px;height:22px;display:grid;place-items:center;border-radius:6px;background:rgba(0,0,0,.55);color:#fff}
 .md-thumb-badge svg{width:16px;height:16px}
 .md-thumb-title{position:absolute;left:0;right:0;bottom:0;padding:4px 6px;font-size:11px;color:#fff;background:linear-gradient(transparent,rgba(0,0,0,.6));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.md-stu{height:100%}
+.md-watch{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;text-align:center;box-sizing:border-box}
+.md-watch-icon{width:64px;height:64px;border-radius:18px;background:var(--surface-2);color:var(--muted);display:grid;place-items:center}
+.md-watch-icon svg{width:30px;height:30px}
+.md-watch-text{font-size:20px;font-weight:600;color:var(--ink-2)}
+.md-panel{display:grid;gap:10px}
+.md-panel .hint,.md-edit .hint{margin:0}
 `;
 export function ensureMediaCss(ctx) { (ctx?.injectCss || injectCss)("media-video", CSS); }
 
@@ -264,6 +276,27 @@ export function videoThumb(slide, icon, label) {
   ]);
 }
 
+// ── 재생 방식(교사 재생 / 학생 재생) ──
+const PLAY_MODES = [{ value: "teacher", label: "교사 재생" }, { value: "student", label: "학생 재생" }];
+const PLAY_HINT = {
+  teacher: "학생 화면에는 동영상 대신 '칠판의 영상을 봐주세요'가 떠요",
+  student: "학생도 자기 화면에서 따로 재생할 수 있어요",
+};
+
+export function playModeOf(slide, act) {
+  return (act?.playMode ?? slide?.config?.playMode) === "student" ? "student" : "teacher";
+}
+
+// 학생 화면에 플레이어를 둘지: 자유 이동·복습이면 늘 학생 재생
+function studentPlays(slide, ctx, act) {
+  if (ctx?.session?.()?.flow === "student") return true;
+  return playModeOf(slide, act || ctx?.activity?.()) === "student";
+}
+
+function paintSeg(segEl, value) {
+  [...segEl.children].forEach((b, i) => b.classList.toggle("active", PLAY_MODES[i]?.value === value));
+}
+
 // ── video 타입 ──
 const ICON = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M10 9.2v5.6l4.8-2.8z"/></svg>`;
 
@@ -282,14 +315,67 @@ function Editor({ slide, update, ctx }) {
     t = setTimeout(() => preview.set(cfg.url), 600);
   });
   preview.set(cfg.url);
-  const root = el("div", { class: "md-edit" }, [el("div", { class: "field" }, [input]), box]);
+  const modeHint = el("p", { class: "hint" });
+  const modeSeg = seg(PLAY_MODES, playModeOf(slide), (v) => {
+    cfg = { ...cfg, playMode: v };
+    update({ config: cfg });
+    modeHint.textContent = PLAY_HINT[v];
+  });
+  modeHint.textContent = PLAY_HINT[playModeOf(slide)];
+  const root = el("div", { class: "md-edit" }, [el("div", { class: "field" }, [input]), field("재생", modeSeg), modeHint, box]);
   return { el: root, destroy() { clearTimeout(t); preview.destroy(); } };
 }
 
-function liveView({ slide, ctx }) {
+// 교사 화면: 늘 플레이어. 도구 패널에서 수업 중에 교사 재생 ↔ 학생 재생
+function TeacherLive({ slide, ctx }) {
   ensureMediaCss(ctx);
   const st = playerStage(slide.config?.url);
-  return { el: st.el, destroy() { st.destroy(); } };
+  const modeSeg = seg(PLAY_MODES, playModeOf(slide, ctx.activity()), (v) => { ctx.setActivity({ playMode: v }); paint({ ...ctx.activity(), playMode: v }); });
+  const note = el("p", { class: "hint" });
+  const panel = el("div", { class: "md-panel" }, [field("학생 화면", modeSeg), note]);
+  function paint(act) {
+    const m = playModeOf(slide, act || ctx.activity());
+    paintSeg(modeSeg, m);
+    note.textContent = ctx.session?.()?.flow === "student" ? "자유 이동 중에는 학생이 각자 재생해요" : PLAY_HINT[m];
+  }
+  paint();
+  return {
+    el: st.el,
+    panel,
+    onActivity(a) { paint(a); },
+    onSession() { paint(); },
+    destroy() { st.destroy(); },
+  };
+}
+
+// 학생 화면: 교사 재생이면 안내만, 학생 재생이면 플레이어
+function Student({ slide, ctx }) {
+  ensureMediaCss(ctx);
+  const root = el("div", { class: "md-stu" });
+  let stage = null, plays = null;
+  function sync(act) {
+    const next = studentPlays(slide, ctx, act);
+    if (next === plays) return;
+    plays = next;
+    stage?.destroy();
+    stage = null;
+    if (plays) {
+      stage = playerStage(slide.config?.url);
+      root.replaceChildren(stage.el);
+    } else {
+      root.replaceChildren(el("div", { class: "md-watch" }, [
+        el("span", { class: "md-watch-icon" }, [icon("video", 30)]),
+        el("div", { class: "md-watch-text" }, "칠판의 영상을 봐주세요"),
+      ]));
+    }
+  }
+  sync();
+  return {
+    el: root,
+    onActivity(a) { sync(a); },
+    onSession() { sync(); },
+    destroy() { stage?.destroy(); stage = null; },
+  };
 }
 
 registerSlideType({
@@ -298,11 +384,11 @@ registerSlideType({
   label: "동영상",
   desc: "유튜브·mp4 동영상",
   icon: ICON,
-  create() { return { type: "video", config: { url: "" } }; },
+  create() { return { type: "video", config: { url: "", playMode: "teacher" } }; },
   thumb(slide) { return videoThumb(slide, ICON, "동영상"); },
   Editor,
-  Student: liveView,
-  TeacherLive: liveView,
+  Student,
+  TeacherLive,
   summary(slide) {
     ensureMediaCss();
     const url = String(slide.config?.url || "").trim();

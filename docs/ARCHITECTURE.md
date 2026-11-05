@@ -405,7 +405,7 @@ ctx = {
 | wall | 담벼락 | interact | `{prompt:'', allowColor:true, showNames:true}` |
 | link | 웹 링크 | media | `{url:'', title:''}` |
 | embed | 임베드 | media | `{html:'', src:''}` |
-| video | 동영상 | media | `{url:''}` |
+| video | 동영상 | media | `{url:'', playMode:'teacher'}` |
 | videoquiz | 동영상 퀴즈 | media | `{url:'', questions:[]}` |
 | dino | 공룡 점프 | game | `{questions:[{…, sec:20}], jumpsPerQuestion:3, passPct:80, holdWrong:true}` |
 | race | 레이싱 퀴즈 | game | `{questions:[{…, sec:20}], laps:2, passPct:80, holdWrong:true}` (옛 `quizSec` = sec 없는 문제의 기본값) |
@@ -440,7 +440,7 @@ ctx = {
 
 **embed**: 붙여넣은 html에서 첫 `<iframe>`의 src만 추출(`/<iframe[^>]*src=["']([^"']+)/i`), 아니면 입력 자체가 http(s) URL이면 그것을 src로. `javascript:` 거부. 렌더 `<iframe sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-presentation" allow="autoplay; fullscreen; clipboard-write" referrerpolicy="no-referrer-when-downgrade">`. 저장 시 `config.src`에 추출값.
 
-**video**: YouTube(`parseYouTubeId`) → IFrame Player API(`loadYouTubeApi()` 1회 로드), 아니면 `<video controls playsinline>`(mp4/webm). 그 외 → 편집기 경고 '유튜브 또는 mp4 주소만 지원해요'. 학생 자율 재생. 교사 TeacherLive 같은 플레이어.
+**video**: YouTube(`parseYouTubeId`) → IFrame Player API(`loadYouTubeApi()` 1회 로드), 아니면 `<video controls playsinline>`(mp4/webm). 그 외 → 편집기 경고 '유튜브 또는 mp4 주소만 지원해요'. 재생 방식(v2.17) = `activity.playMode`(수업 중 교사 도구 패널) > `config.playMode`(편집기 [교사 재생 | 학생 재생]) > 기본 `'teacher'`. 교사 재생이면 학생 화면은 플레이어 없이 `칠판의 영상을 봐주세요`(바꾸면 학생 플레이어를 없애 재생도 멈춤), 학생 재생이면 학생도 각자 플레이어. `session.flow==='student'`(자유 이동·복습)면 늘 학생 재생. 교사 TeacherLive 는 늘 같은 플레이어.
 
 **videoquiz**: `session.flow==='teacher'`면 교사 페이스 — 영상은 교사 화면에서만 재생, 학생은 `칠판의 영상을 봐주세요`; 시점 도달 시 교사 클라이언트가 일시정지 + `activity.vq={state:'question',qid}`·`vqAsked`, 학생 화면에 문제, `vqRevealed`(전원 응답 시 자동), `[계속 재생]`. `flow==='student'`면 아래 자율 재생. questions `[{id, atSec, kind:'mcq'|'short'|'essay', question, options?:[{id,text}]×4, answerIds?}]` atSec 오름차순. 250ms 폴링(YouTube `getCurrentTime`)/`timeupdate`. 미응답 문제 중 `atSec <= currentTime`이 있으면 일시정지 + 가장 이른 문제 오버레이(탐색으로 건너뛰어도 걸림). 제출 `submit(payload, { itemKey: q.id, correct })` → 닫고 재생. mcq 자동 채점, short(1줄 100자)/essay(여러 줄 1000자) 채점 없음. 교사 panel: 문제별 결과(mcq 막대, 서술 카드). 편집기: URL + 미리보기 플레이어 + `[현재 시점에 문제 추가]`(플레이어 현재 초 → atSec) + 문제 목록(시점 mm:ss 편집 가능).
 
