@@ -32,6 +32,11 @@
 //    거의 끌지 않은(4px 미만) 도형은 버린다. 굵기는 펜과 같은 규칙(7), 압력 없이 고르게.
 // 11) 텍스트 부분 색(v2.10): Text.runs = [{ t, c }](t를 이으면 value, c = null이면 글 상자 색). 정적 그림은 drawTextBox가
 //    글자별 색을 칸 폭 줄바꿈 뒤에도 그대로 칠한다.
+// 12) 올가미(v2.19, js/lasso.js): 도구 'lasso'면 포인터를 setToolHandler로 넘긴다(펜·손바닥·두 손가락 확대 규칙은 펜과 같음, 펜 지우개 끝은 그대로 지우개).
+//    고른 획은 고르는 순간 '떠 있는 층'(floatStart) — 고른 획을 뺀 캐시 + 고른 획만 그린 비트맵 한 장. 끄는 동안은 그 비트맵만 옮겨 그리고
+//    (획이 많아도 프레임마다 그림 2장), 놓아도(replaceStrokes shift) 비트맵을 그대로 둔 채 자리만 기억, 선택을 풀면(floatEnd) 비트맵을
+//    캐시에 찍어 넣는다 → 고르기 때 한 번 말고는 쪽 전체를 다시 그리지 않는다. 올가미 선·선택 상자는 setOverlay가 매 프레임 마지막에 그린다.
+//    되돌리기는 기록 스택 — 그린 획('add', 옮겨져 새 id가 되면 alias로 따라감)과 올가미 작업(pushUndo)이 순서대로.
 
 import { newId } from "./slides/registry.js";
 import { isPalmTouch } from "./pen-input.js";
@@ -76,7 +81,13 @@ export class InkCanvas {
     this.onCommit = opts.onCommit || (() => {});
     this.onLive = opts.onLive || (() => {});
     this.onEnd = opts.onEnd || (() => {});   // 제스처 종료(commit 여부 무관)
-    this._mine = [];             // 이 인스턴스가 그린 획 id (undo용)
+    this._hist = [];             // 되돌리기 기록: { k:'add', id } | { k:'op', run }(12)
+    this._alias = new Map();     // 옮겨져 바뀐 획 id: 옛 id → 새 id(12)
+    this.toolHandler = null;     // 'lasso' 도구의 포인터 처리(12)
+    this._hand = null;           // 처리기가 잡은 포인터 { pid, type }
+    this.overlay = null;         // (ctx, map) → 매 프레임 마지막에 덧그림(12)
+    this.floating = null;        // 떠 있는 층 { keys:Set, dx, dy(끄는 중), bx, by(비트맵이 획 자리보다 늦은 만큼), ok, moved }(12)
+    this.onView = null;          // 보기·크기가 바뀌면(올가미 막대 자리)
     this._destroyed = false;
 
     // 확정 획 캐시 (offscreen)
@@ -118,10 +129,18 @@ export class InkCanvas {
     this.strokes = next;
     this._keys = keys;
     this.cacheValid = false;
+    // 떠 있는 획이 다른 기기에서 지워졌으면 그 획을 빼고 비트맵을 다시(12)
+    const fl = this.floating;
+    if (fl) {
+      const ks = new Set(keys);
+      let lost = false;
+      for (const k of [...fl.keys]) if (!ks.has(k)) { fl.keys.delete(k); lost = true; }
+      if (lost) { if (fl.keys.size) this._floatStale(); else { this.floating = null; if (this._floatCv) this._floatCv.width = this._floatCv.height = 0; } }
+    }
     this._scheduleDraw();
   }
-  isDrawing() { return !!this.current; }
-  pointerType() { return this.current ? this._ptype : null; }
+  isDrawing() { return !!this.current || !!this._hand; }
+  pointerType() { return this.current ? this._ptype : this._hand ? this._hand.type : null; }
   appendStroke(s) {
     this.strokes.push(s);
     this._keys.push(strokeKey(s, this.strokes.length - 1));
@@ -133,10 +152,20 @@ export class InkCanvas {
     this.view = v ? { ox: v.ox, oy: v.oy, cw: v.cw, ch: v.ch, baseW: v.baseW || v.cw } : null;
     this._updateK();
     this.cacheValid = false;
+    if (this.floating) this._floatStale();
     this._scheduleDraw();
+    try { this.onView && this.onView(); } catch (_) {}
   }
   // 그리던 획 버리기(두 손가락 확대가 시작될 때 등). 저장하지 않음.
   cancelStroke() {
+    if (this._hand) {
+      const h = this._hand;
+      this._hand = null;
+      try { this.toolHandler && this.toolHandler.cancel && this.toolHandler.cancel(); } catch (e) { console.warn("[ink] 올가미 취소", e); }
+      try { this.canvas.releasePointerCapture(h.pid); } catch (_) {}
+      this._scheduleDraw();
+      return;
+    }
     if (!this.current) return;
     const pid = this._pid;
     this._cancelCurrent();
@@ -150,23 +179,121 @@ export class InkCanvas {
     this.readOnly = !!v;
     // 읽기 전용이면 터치 스크롤 허용
     this.canvas.style.touchAction = this.readOnly ? "" : "none";
-    if (v) this._cancelCurrent();
+    if (v) { this._cancelCurrent(); this.cancelStroke(); }
   }
 
-  // 이 캔버스에서 그린 마지막 획 제거 → onCommit({type:'erase', ids:[id]})
+  // 되돌리기: 이 캔버스에서 그린 마지막 획 제거(onCommit erase) 또는 마지막 올가미 작업 되돌리기(12)
   undo() {
-    while (this._mine.length) {
-      const id = this._mine.pop();
+    while (this._hist.length) {
+      const h = this._hist.pop();
+      if (h.k === "op") {
+        try { if (h.run() !== false) return true; } catch (e) { console.warn("[ink] 되돌리기", e); }
+        continue;
+      }
+      const id = this.resolve(h.id);
       const i = this._keys.indexOf(id);
       if (i < 0) continue; // 이미 지워짐
       this.strokes.splice(i, 1);
       this._keys.splice(i, 1);
+      this._floatDrop([id]);
       this.cacheValid = false;
       this._scheduleDraw();
       this.onCommit({ type: "erase", ids: [id] });
       return true;
     }
     return false;
+  }
+
+  // ── 올가미 지원(12) ──
+  setToolHandler(h) { if (this._hand) this.cancelStroke(); this.toolHandler = h || null; }
+  setOverlay(fn) { this.overlay = fn || null; this._scheduleDraw(); }
+  requestDraw() { this._scheduleDraw(); }
+  pushUndo(run) { if (typeof run === "function") this._hist.push({ k: "op", run }); }
+  alias(map) { for (const [a, b] of map || []) if (a && b && a !== b) this._alias.set(a, b); }
+  resolve(id) { let x = id; for (let n = 0; this._alias.has(x) && n < 64; n++) x = this._alias.get(x); return x; }
+  keys() { return this._keys.slice(); }
+  strokeOf(key) { const i = this._keys.indexOf(key); return i >= 0 ? this.strokes[i] : null; }
+  // 정규화 좌표 ↔ 캔버스: { x(nx), y(ny) → 장치 px, cssX(nx), cssY(ny) → CSS px, d: 장치 px/CSS px, v: 보기 }
+  mapper() {
+    const v = this._v(), d = this.canvas.width / (this._cssW || 1);
+    return { v, d, x: (nx) => (v.ox + nx * v.cw) * d, y: (ny) => (v.oy + ny * v.ch) * d, cssX: (nx) => v.ox + nx * v.cw, cssY: (ny) => v.oy + ny * v.ch };
+  }
+  // 다각형(정규화 점 목록) 안에 든 획 키 — 점(최대 24개 고르게)의 절반 이상이 안에 있으면. accept(key, stroke)로 거름
+  selectInPolygon(poly, accept = null) {
+    if (!poly || poly.length < 3) return [];
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const p of poly) { if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x; if (p.y < y0) y0 = p.y; if (p.y > y1) y1 = p.y; }
+    const out = [];
+    this.strokes.forEach((s, i) => {
+      const k = this._keys[i];
+      if (!s || !s.points || !s.points.length || (accept && !accept(k, s))) return;
+      const b = strokeBounds(s);
+      if (b.x1 < x0 || b.x0 > x1 || b.y1 < y0 || b.y0 > y1) return;
+      const pts = s.points, n = pts.length, m = Math.min(n, 24);
+      let hit = 0;
+      for (let j = 0; j < m; j++) { const q = pts[m === 1 ? 0 : Math.round(j * (n - 1) / (m - 1))]; if (inPolygon(q.x, q.y, poly)) hit++; }
+      if (hit * 2 >= m) out.push(k);
+    });
+    return out;
+  }
+  // 떠 있는 층(12) — 고른 획을 캐시에서 빼고 비트맵 한 장으로 그림. 같은 획이면 그대로
+  floatStart(keys) {
+    const set = new Set(keys || []);
+    const fl = this.floating;
+    if (fl && fl.keys.size === set.size && [...set].every(k => fl.keys.has(k))) return;
+    if (fl) this.floatEnd();
+    if (!set.size) return;
+    this.floating = { keys: set, dx: 0, dy: 0, bx: 0, by: 0, ok: false, moved: false };
+    this.cacheValid = false;
+    this._scheduleDraw();
+  }
+  floatMove(dx, dy) { if (!this.floating) return; this.floating.dx = dx; this.floating.dy = dy; this._scheduleDraw(); }
+  // 선택 끝: 옮기거나 바꾼 적이 있으면(획이 목록 끝 = 맨 위) 비트맵을 캐시에 찍어 넣고, 아니면 캐시를 다시 그림(쌓인 순서 그대로)
+  floatEnd() {
+    const fl = this.floating;
+    if (!fl) return;
+    this.floating = null;
+    const hl = this.strokes.some((s, i) => fl.keys.has(this._keys[i]) && s.tool === "highlight"); // 형광펜은 섞는 방식이 달라 다시 그림
+    if (fl.moved && fl.ok && this.cacheValid && !hl && this._floatCv && this._floatCv.width) {
+      const m = this.mapper();
+      this.cacheCtx.drawImage(this._floatCv, Math.round(fl.bx * m.v.cw * m.d), Math.round(fl.by * m.v.ch * m.d));
+    } else this.cacheValid = false;
+    if (this._floatCv) this._floatCv.width = this._floatCv.height = 0;
+    this._scheduleDraw();
+  }
+  _floatStale() { const fl = this.floating; fl.ok = false; fl.bx = 0; fl.by = 0; }
+  // 떠 있는 획 중 keys가 지워졌으면(펜 지우개 끝·되돌리기) 빼고 비트맵을 다시
+  _floatDrop(keys) {
+    const fl = this.floating;
+    if (!fl) return;
+    let lost = false;
+    for (const k of keys) if (fl.keys.delete(k)) lost = true;
+    if (!lost) return;
+    if (fl.keys.size) this._floatStale();
+    else { this.floating = null; if (this._floatCv) this._floatCv.width = this._floatCv.height = 0; }
+  }
+  // oldKeys 획을 newStrokes로 바꿈(옮기기·색 바꾸기·지우기·되돌리기) — 새 획은 목록 끝(맨 위).
+  // 떠 있는 층이 바로 그 획들이면 캐시는 그대로: 옮기기(shift=[dx,dy])는 비트맵도 그대로 두고 자리만 기억, 색 바꾸기는 비트맵만 다시(고른 획만).
+  replaceStrokes(oldKeys, newStrokes, { shift = null } = {}) {
+    const gone = new Set(oldKeys || []);
+    const fl = this.floating;
+    const same = !!fl && fl.keys.size === gone.size && [...gone].every(k => fl.keys.has(k));
+    if (fl && !same) this.floatEnd();
+    const next = [], keys = [];
+    this.strokes.forEach((s, i) => { if (!gone.has(this._keys[i])) { next.push(s); keys.push(this._keys[i]); } });
+    const added = [];
+    for (const s of newStrokes || []) { next.push(s); const k = strokeKey(s, next.length - 1); keys.push(k); added.push(k); }
+    this.strokes = next; this._keys = keys;
+    if (same && this.floating) {
+      const f = this.floating;
+      f.keys = new Set(added);
+      f.dx = 0; f.dy = 0; f.moved = true;
+      if (!added.length) { this.floating = null; if (this._floatCv) this._floatCv.width = this._floatCv.height = 0; } // 지움: 캐시에 이미 없음
+      else if (shift) { f.bx += shift[0]; f.by += shift[1]; }
+      else this._floatStale();
+    } else if (gone.size) this.cacheValid = false;
+    else for (const s of newStrokes || []) this._appendToCache(s);
+    this._scheduleDraw();
   }
 
   resize() {
@@ -184,7 +311,9 @@ export class InkCanvas {
     canvas.width = w; canvas.height = h;
     this.cache.width = w; this.cache.height = h;
     this.cacheValid = false;
+    if (this.floating) this._floatStale();
     this._scheduleDraw();
+    try { this.onView && this.onView(); } catch (_) {}
   }
 
   destroy() {
@@ -199,7 +328,12 @@ export class InkCanvas {
     c.removeEventListener("contextrestored", this._onRestore);
     this.cache.removeEventListener("contextrestored", this._onRestore);
     this.current = null;
+    this._hand = null;
+    this.toolHandler = null;
+    this.overlay = null;
+    this.floating = null;
     this.cache.width = this.cache.height = 0;
+    if (this._floatCv) this._floatCv.width = this._floatCv.height = 0;
   }
 
   // 슬라이드가 캔버스 안에서 차지하는 영역(CSS px)
@@ -255,9 +389,19 @@ export class InkCanvas {
       if (this.readOnly || this._destroyed) return;
       if (e.pointerType === "mouse" && e.button !== 0) return;
       if (e.pointerType === "touch" && isPalmTouch(e)) return; // 손바닥(8) — zoom-view가 먼저 거르지만 한 번 더
-      if (this.current) return; // 멀티터치: 첫 포인터만 (펜이 닿으면 zoom-view가 손바닥 획을 먼저 취소)
+      if (this.current || this._hand) return; // 멀티터치: 첫 포인터만 (펜이 닿으면 zoom-view가 손바닥 획을 먼저 취소)
       const pt = this._toNorm(e);
       if (!this._inside(pt)) return;
+      // 올가미(12): 펜 지우개 끝·옆 버튼이 아니면 처리기로
+      const penEraseL = e.pointerType === "pen" && (e.button === 5 || e.button === 2 || (e.buttons & 34) !== 0);
+      if (this.tool === "lasso" && this.toolHandler && !penEraseL) {
+        this._hand = { pid: e.pointerId, type: e.pointerType || "mouse" };
+        try { c.setPointerCapture(e.pointerId); } catch (_) {}
+        try { this.toolHandler.down(pt, e); } catch (err) { console.warn("[ink] 올가미", err); }
+        this._scheduleDraw();
+        e.preventDefault();
+        return;
+      }
       pid = e.pointerId;
       this._pid = pid;
       this._ptype = e.pointerType || "mouse";
@@ -283,6 +427,13 @@ export class InkCanvas {
     }, { passive: false });
 
     on("pointermove", (e) => {
+      if (this._hand && e.pointerId === this._hand.pid) {
+        const f = this._frame();
+        const evs = (typeof e.getCoalescedEvents === "function") ? e.getCoalescedEvents() : [e];
+        const list = (evs.length ? evs : [e]).map(ev => this._toNorm(ev, f));
+        try { this.toolHandler && this.toolHandler.move(list, e); } catch (err) { console.warn("[ink] 올가미", err); }
+        return;
+      }
       if (!this.current || e.pointerId !== pid) return;
       // 도형(10): 시작점 ~ 지금 점으로 다시 만든다
       if (this.current.shape) {
@@ -323,6 +474,17 @@ export class InkCanvas {
     }, { passive: true });
 
     const finish = (e) => {
+      if (this._hand && e.pointerId === this._hand.pid) {
+        this._hand = null;
+        try { c.releasePointerCapture(e.pointerId); } catch (_) {}
+        try {
+          if (e.type === "pointercancel") this.toolHandler && this.toolHandler.cancel && this.toolHandler.cancel();
+          else this.toolHandler && this.toolHandler.up(this._toNorm(e), e);
+        } catch (err) { console.warn("[ink] 올가미", err); }
+        this._scheduleDraw();
+        try { this.onEnd(); } catch (_) {}
+        return;
+      }
       if (!this.current || e.pointerId !== pid) return;
       const s = this.current;
       const liveN = this._liveN;
@@ -349,6 +511,7 @@ export class InkCanvas {
         if (ids.length) {
           this.strokes = keepS;
           this._keys = keepK;
+          this._floatDrop(ids);
           this.cacheValid = false;
           this.onCommit({ type: "erase", ids });
         }
@@ -359,7 +522,7 @@ export class InkCanvas {
         s.points = s.points.map(p => ({ x: r4(p.x), y: r4(p.y), p: r2(p.p ?? 0.5) }));
         this.strokes.push(s);
         this._keys.push(s.id);
-        this._mine.push(s.id);
+        this._hist.push({ k: "add", id: s.id });
         // 앞 구간은 이미 캐시에 있음(8) → 남은 끝 구간만. 캐시가 무효면 다음 렌더가 통째로 다시 그림
         if (liveN > 0 && this.cacheValid) this._paint(this.cacheCtx, [s], { from: liveN, to: s.points.length - 1, pts: s.points });
         else this._appendToCache(s);
@@ -426,10 +589,27 @@ export class InkCanvas {
       if (inc) this._paint(ctx, [cur], { from: this._liveN, to: pts.length - 1, pts });
       else this._paint(ctx, [pts === cur.points ? cur : { ...cur, points: pts }]);
     }
+    const fl = this.floating;
+    if (fl) {
+      // 떠 있는 층(12): 고른 획만 그린 비트맵을 한 번 만들어 두고 옮겨 그림
+      if (!fl.ok) {
+        const fc = this._floatCv || (this._floatCv = document.createElement("canvas"));
+        if (fc.width !== canvas.width || fc.height !== canvas.height) { fc.width = canvas.width; fc.height = canvas.height; }
+        const g = fc.getContext("2d");
+        g.clearRect(0, 0, fc.width, fc.height);
+        this._paint(g, this.strokes.filter((s, i) => fl.keys.has(this._keys[i])), { noClip: true });
+        fl.ok = true; fl.bx = 0; fl.by = 0;
+      }
+      const m = this.mapper();
+      ctx.drawImage(this._floatCv, Math.round((fl.bx + fl.dx) * m.v.cw * m.d), Math.round((fl.by + fl.dy) * m.v.ch * m.d));
+    }
+    if (this.overlay) { try { this.overlay(ctx, this.mapper()); } catch (e) { console.warn("[ink] overlay", e); } }
   }
 
   // 보기 변환을 적용해 획 그리기(슬라이드 영역 밖은 잘라냄). range = { from, to, pts } → 그 구간만(8)
   _paint(g, list, range = null) {
+    const noClip = !!(range && range.noClip);
+    if (noClip) range = null;
     const draw = (s, W, H, k) => (range ? drawStrokeRange(g, s, W, H, k, range.from, range.to, range.pts) : drawStroke(g, s, W, H, k));
     if (!this.view) {
       for (const s of list) draw(s, g.canvas.width, g.canvas.height, this._k);  // 보기 없음 = 배율 1(실제 굵기)
@@ -437,9 +617,7 @@ export class InkCanvas {
     }
     const v = this.view, d = g.canvas.width / (this._cssW || 1);
     g.save();
-    g.beginPath();
-    g.rect(v.ox * d, v.oy * d, v.cw * d, v.ch * d);
-    g.clip();
+    if (!noClip) { g.beginPath(); g.rect(v.ox * d, v.oy * d, v.cw * d, v.ch * d); g.clip(); }
     g.translate(v.ox * d, v.oy * d);
     const zv = (v.cw || 1) / (v.baseW || v.cw || 1);
     // 7) 쓸 때 배율까지만 함께 커짐 — 축소하면 가늘어지고, 더 확대해도 쓸 때보다 굵어지지 않음
@@ -450,7 +628,8 @@ export class InkCanvas {
   _rebuildCache() {
     const { cache, cacheCtx } = this;
     cacheCtx.clearRect(0, 0, cache.width, cache.height);
-    this._paint(cacheCtx, this.strokes);
+    const fl = this.floating;
+    this._paint(cacheCtx, fl ? this.strokes.filter((s, i) => !fl.keys.has(this._keys[i])) : this.strokes);
     this.cacheValid = true;
     this._liveN = 0; // 그리는 중인 획의 확정 구간은 다음 렌더에서 다시 캐시에 그린다
   }
@@ -462,6 +641,29 @@ export class InkCanvas {
 
   // 외부에서 강제로 다시 그리고 싶을 때
   redraw() { this.cacheValid = false; this._scheduleDraw(); }
+}
+
+// 획이 차지하는 범위(정규화, 굵기 여유 포함) — 획 객체는 바뀌지 않으므로 기억해 둔다(12)
+const boundsCache = new WeakMap();
+export function strokeBounds(s) {
+  let b = boundsCache.get(s);
+  if (b) return b;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const p of s.points || []) { if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x; if (p.y < y0) y0 = p.y; if (p.y > y1) y1 = p.y; }
+  if (Array.isArray(s.box)) { x0 = Math.min(x0, s.box[0], s.box[2]); x1 = Math.max(x1, s.box[0], s.box[2]); y0 = Math.min(y0, s.box[1], s.box[3]); y1 = Math.max(y1, s.box[1], s.box[3]); }
+  const pad = Math.max(0.001, (s.size || 2) / REF_W);
+  b = { x0: x0 - pad, y0: y0 - pad * 1.6, x1: x1 + pad, y1: y1 + pad * 1.6 };
+  boundsCache.set(s, b);
+  return b;
+}
+// 점이 다각형 안인가(짝홀 규칙)
+export function inPolygon(x, y, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i], b = poly[j];
+    if ((a.y > y) !== (b.y > y) && x < ((b.x - a.x) * (y - a.y)) / ((b.y - a.y) || 1e-12) + a.x) inside = !inside;
+  }
+  return inside;
 }
 
 function sigOf(list, keys) {

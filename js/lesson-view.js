@@ -29,6 +29,8 @@
 //       선택한 칸은 도구바의 색·S/M/L도 바로 따른다. 옮기기·크기는 손을 뗄 때 저장(ts 갱신 → 병합에서 최신이 이김).
 //       w가 없으면 예전처럼 글자에 맞춰 늘어남(최대 70%). 미니·인쇄(canvas.js drawTextBox)도 같은 칸 폭으로 줄바꿈.
 // 가정: 컨테이너 단위(cqw)를 모르는 구형 브라우저는 글자 크기를 프레임 폭 기준 px로 계산해 넣고 프레임 크기가 바뀌면 다시 맞춘다.
+// 올가미(v2.19, js/lasso.js): 도구 'lasso'로 획·글 상자를 둘러싸 고르고 끌어 옮기기·색 바꾸기·지우기. 획은 새 id(옛 id는 지운 표시),
+//       글 상자는 같은 id에 x·y·ts만. 편집기 기본 필기(바닥 레이어)는 고르지 않는다. 되돌리기 한 번에 작업 하나.
 // 놓인 이미지(v2.10, slide.config.images): 배경 위·필기 아래 레이어. Img = { id, url, path, x, y, w, ar } — x·y는 왼쪽 위(프레임 정규화),
 //       w는 프레임 폭 비율, ar은 가로/세로(높이 = w × 1.6 / ar). 모든 scope에서 그리고, 편집기(edit)의 '이미지' 도구일 때만
 //       끌어서 옮기기·모서리로 크기(비율 유지)·× 삭제·Delete 키. 이미지 파일은 지우지 않는다(지난 수업 스냅샷이 같은 URL을 참조).
@@ -39,6 +41,7 @@ import { store } from "./store.js";
 import { cloudWriteRecord } from "./cloud.js";
 import { newId, injectCss } from "./slides/registry.js";
 import { createZoomView } from "./zoom-view.js";
+import { createLasso } from "./lasso.js";
 
 const BASE_CSS = `
 :where(.slide-frame) { position:relative; aspect-ratio:16/10; background:#fff; overflow:hidden; }
@@ -261,6 +264,8 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
 
   const zv = zoom ? createZoomView({ viewport: root, frame, canvas, ink, getImg: () => img, src: slide.thumb || slide.bg, include: zoomInclude }) : null;
   let zvSrc = slide.bg || null;
+  // 올가미(v2.19) — 쓸 수 있는 화면에서만. 함수 선언(lasso*)은 아래(호이스팅)
+  const lasso = writable ? createLasso({ ink, canvas, hooks: { selectable: lassoSelectable, texts: lassoTexts, apply: lassoApply, remove: lassoRemove, previewTexts: lassoPreview } }) : null;
 
   // 텍스트 상자 선택(v2.8) — 쓸 수 있는 화면에서만
   let selKey = null;      // 선택한 텍스트 id
@@ -366,6 +371,145 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
     clearTimeout(textTimer);
     textTimer = 0;
     persist();
+  }
+
+  // ── 올가미(v2.19): 고른 획·글 상자 옮기기·색 바꾸기·지우기 ──
+  // 가정: 획은 새 id로 다시 만든다(옛 id는 지운 표시 → 다른 기기·묶음 행이 id로 합쳐도 겹치지 않음). 글 상자는 같은 id에 x·y·ts(·색)만.
+  let selCache = null; // 고를 수 있는 획 키(이 레이어 Rec의 획) — 배열·길이가 같으면 재사용
+  function lassoSelectable(key) {
+    const rec = pathFor(false);
+    if (!selCache || selCache.arr !== rec.strokes || selCache.n !== rec.strokes.length) {
+      selCache = { arr: rec.strokes, n: rec.strokes.length, set: new Set(rec.strokes.map((x, i) => strokeKey(x, i + baseN))) };
+    }
+    return selCache.set.has(key);
+  }
+  function lassoTexts() {
+    const rec = pathFor(false);
+    const rm = rec.removed && rec.removed.length ? new Set(rec.removed) : null;
+    const lw = textLayer.clientWidth || 1, lh = textLayer.clientHeight || 1;
+    const out = [];
+    (rec.texts || []).forEach((t, i) => {
+      if (!t || !String(t.value || "").trim()) return;
+      const key = t.id || ("#t" + i);
+      if (rm && rm.has(key)) return;
+      const node = textEls.get(key);
+      if (!node || !node.isConnected) return;
+      out.push({ key, x: t.x || 0, y: t.y || 0, w: node.offsetWidth / lw, h: node.offsetHeight / lh });
+    });
+    return out;
+  }
+  function lassoPreview(texts, dx, dy) {
+    const px = dx * (textLayer.clientWidth || 0), py = dy * (textLayer.clientHeight || 0);
+    for (const t of texts || []) { const node = textEls.get(t.key); if (node) node.style.transform = dx || dy ? `translate(${px}px, ${py}px)` : ""; }
+  }
+  // 고른 획을 (dx, dy)만큼 옮기거나 color로 칠한 새 획으로 바꾸고, 글 상자도 같이 → { keys(새 획 키), texts, undo }
+  function lassoApply({ keys = [], texts = [], dx = 0, dy = 0, color = null }) {
+    if (destroyed || !writable) return null;
+    const rec = pathFor(true);
+    const want = new Set(keys), now = Date.now();
+    const keep = [], olds = [], news = [], oldKeys = [], alias = new Map();
+    rec.strokes.forEach((s, i) => {
+      const k = strokeKey(s, i + baseN);
+      if (!s || !want.has(k)) { keep.push(s); return; }
+      const n = { ...s, id: newId("st"), ts: now + news.length };
+      if (dx || dy) {
+        n.points = (s.points || []).map(p => ({ x: r4(p.x + dx), y: r4(p.y + dy), p: p.p }));
+        if (Array.isArray(s.box)) n.box = [r4(s.box[0] + dx), r4(s.box[1] + dy), r4(s.box[2] + dx), r4(s.box[3] + dy)];
+      }
+      if (color) n.color = color;
+      olds.push(s); news.push(n); oldKeys.push(k); alias.set(k, n.id);
+    });
+    const tBefore = [];
+    for (const key of texts) {
+      const t = findText(key);
+      if (!t) continue;
+      tBefore.push({ key, x: t.x, y: t.y, color: t.color, runs: t.runs });
+      if (dx || dy) { t.x = r4(clampN((t.x || 0) + dx, 0, 0.98)); t.y = r4(clampN((t.y || 0) + dy, 0, 0.98)); }
+      if (color) { t.color = color; delete t.runs; }
+      t.ts = now;
+      const node = textEls.get(key);
+      if (node) { node.style.transform = ""; if (color) fillTextEl(node, t); placeText(node, t); }
+    }
+    if (!news.length && !tBefore.length) return null;
+    rec.strokes = keep.concat(news);
+    addRemoved(rec, oldKeys);
+    ink.replaceStrokes(oldKeys, news, { shift: color ? null : [dx, dy] }); // 옮기기만이면 떠 있는 비트맵을 그대로 씀
+    ink.alias(alias);
+    clearTimeout(textTimer); textTimer = 0;
+    persist();
+    return { keys: news.map(n => n.id), texts: tBefore.map(t => t.key), undo: () => lassoRestore(news.map(n => n.id), olds, tBefore) };
+  }
+  // 되돌리기: ids(옮겨졌으면 alias로 따라간 지금 획)를 olds 모양으로(새 id), 글 상자는 예전 자리·색으로
+  function lassoRestore(ids, olds, tBefore) {
+    if (destroyed || !writable) return false;
+    const idx = new Map(ids.map((id, j) => [ink.resolve(id), j]));
+    const rec = pathFor(true), now = Date.now();
+    const keep = [], back = [], gone = [], alias = new Map();
+    rec.strokes.forEach((s, i) => {
+      const k = strokeKey(s, i + baseN);
+      if (!s || !idx.has(k)) { keep.push(s); return; }
+      const n = { ...olds[idx.get(k)], id: newId("st"), ts: now + back.length };
+      back.push(n); gone.push(k); alias.set(k, n.id);
+    });
+    let tDone = 0;
+    for (const b of tBefore || []) {
+      const t = findText(b.key);
+      if (!t) continue;
+      t.x = b.x; t.y = b.y; t.color = b.color;
+      if (b.runs) t.runs = b.runs; else delete t.runs;
+      t.ts = now;
+      const node = textEls.get(b.key);
+      if (node) { node.style.transform = ""; fillTextEl(node, t); placeText(node, t); }
+      tDone++;
+    }
+    if (!back.length && !tDone) return false;
+    rec.strokes = keep.concat(back);
+    addRemoved(rec, gone);
+    ink.replaceStrokes(gone, back);
+    ink.alias(alias);
+    persist();
+    return true;
+  }
+  function lassoRemove({ keys = [], texts = [] }) {
+    if (destroyed || !writable) return null;
+    const rec = pathFor(true);
+    const want = new Set(keys);
+    const keep = [], gone = [], goneKeys = [];
+    rec.strokes.forEach((s, i) => { const k = strokeKey(s, i + baseN); if (s && want.has(k)) { gone.push(s); goneKeys.push(k); } else keep.push(s); });
+    const goneTexts = [];
+    for (const key of texts) {
+      const i = rec.texts.findIndex(x => x && x.id === key);
+      if (i < 0) continue;
+      goneTexts.push({ ...rec.texts[i] });
+      rec.texts.splice(i, 1);
+      if (selKey === key) select(null);
+      const node = textEls.get(key);
+      textEls.delete(key);
+      if (node) node.remove();
+    }
+    if (!gone.length && !goneTexts.length) return null;
+    rec.strokes = keep;
+    addRemoved(rec, goneKeys.concat(goneTexts.map(t => t.id)));
+    ink.replaceStrokes(goneKeys, []);
+    clearTimeout(textTimer); textTimer = 0;
+    persist();
+    return {
+      undo: () => {
+        if (destroyed || !writable) return false;
+        const r = pathFor(true), now = Date.now();
+        const back = gone.map((s, j) => ({ ...s, id: newId("st"), ts: now + j }));
+        const backT = goneTexts.map((t, j) => ({ ...t, id: newId("tx"), ts: now + j }));
+        const alias = new Map();
+        gone.forEach((s, j) => { if (s.id) alias.set(s.id, back[j].id); });
+        r.strokes = r.strokes.concat(back);
+        r.texts = r.texts.concat(backT);
+        ink.alias(alias);
+        ink.replaceStrokes([], back);
+        persist();
+        doRefresh();
+        return true;
+      },
+    };
   }
 
   // 배경 이미지 동기화 (편집기에서 교체 시)
@@ -845,6 +989,7 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
     renderTexts();
     renderImages();
     lastSig = recSig(rec);
+    lasso?.refresh();
   }
   // 외부(스토어 변경) 새로고침: 내 Rec이 그대로면 O(획 수) 작업 생략. 지우기/되돌리기/로컬 커밋은 doRefresh 직접.
   function refresh() {
@@ -869,6 +1014,7 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
       frame.classList.toggle("tool-image", imgMode);
       ink.setTool(textMode || t === "image" ? "pen" : t);
       ink.setReadOnly(!writable || textMode || t === "image");
+      lasso?.setActive(t === "lasso");
       canvas.style.pointerEvents = textMode || imgMode ? "none" : "";
       if (!textMode) select(null); else placeSel();
       if (!imgMode) { imgDrag?.end(true); selImg = null; }
@@ -890,6 +1036,9 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
       ink.setColor(c);
     },
     setShape(k) { ink.setShape(k); },
+    // 올가미로 고른 것이 있으면 그 색으로 바꿈(도구바 색, 올가미 도구일 때). 바꿨으면 true
+    recolorSelection: (c) => !!(lasso && lasso.active && lasso.recolor(c)),
+    hasSelection: () => !!(lasso && lasso.active && lasso.hasSelection()),
     // 글 상자에서 고른 글자만 색 바꾸기(텍스트 도구일 때, 도구바가 setColor보다 먼저 부름). 칠했으면 true
     paintText: (c) => paintText(c),
     setSize(s) {
@@ -920,6 +1069,7 @@ export function renderSlide({ root, slide, session, scope, scopeId, readOnly, au
       imgDrag?.end(false);
       if (editImgs) document.removeEventListener("keydown", onImgKey);
       if (writable) document.removeEventListener("selectionchange", onSelChange);
+      lasso?.destroy();
       zv?.destroy();
       ink.destroy();
       textEls.clear();

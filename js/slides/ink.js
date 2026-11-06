@@ -45,6 +45,7 @@ const TOOLS = [
   { id: "pen", label: "펜" },
   { id: "highlight", label: "형광펜" },
   { id: "eraser", label: "지우개" },
+  { id: "lasso", label: "올가미 — 둘러싸 고른 뒤 끌어 옮기기 · 색을 누르면 그 색으로 · 🗑 지우기" },
   { id: "text", label: "텍스트 — 글자를 골라 색을 누르면 그 부분만 바뀌어요" },
   { id: "shape", label: "도형" },
 ];
@@ -60,6 +61,7 @@ const SVG = {
   pen: '<path d="M4 20l4-1 11-11-3-3L5 16l-1 4z"/><path d="M14 6l3 3"/>',
   highlight: '<path d="M9 15l-4 4h6l1-1"/><path d="M9 15l7-11 4 3-7 11z"/><path d="M8 14l5 3"/>',
   eraser: '<path d="M7 20h12"/><path d="M5 15l9-9 5 5-8 8H8z"/><path d="M10 10l5 5"/>',
+  lasso: '<path d="M7.2 15.6C4.7 14.5 3 12.6 3 10.5 3 6.9 7 4 12 4s9 2.9 9 6.5-4 6.5-9 6.5c-1.2 0-2.3-.2-3.4-.4" stroke-dasharray="3.2 2.6"/><path d="M8.6 16.6c-.9 1.1-1 2.4-.1 3.1.8.6 2 .5 2.6-.4"/>',
   text: '<path d="M5 6V4h14v2"/><path d="M12 4v16"/><path d="M9 20h6"/>',
   image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/>',
   undo: '<path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 010 12h-3"/>',
@@ -75,7 +77,7 @@ const SVG = {
 };
 const PEN_ICON = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${SVG.pen}</svg>`;
 
-const LOCAL_ICONS = new Set(["zoomIn", "zoomOut", "hand", "sh-line", "sh-arrow", "sh-rect", "sh-ellipse", "sh-tri"]); // 앱 공용 아이콘에 없는 것
+const LOCAL_ICONS = new Set(["zoomIn", "zoomOut", "hand", "lasso", "sh-line", "sh-arrow", "sh-rect", "sh-ellipse", "sh-tri"]); // 앱 공용 아이콘에 없는 것
 function icon(name) {
   if (typeof ui.icon === "function" && !LOCAL_ICONS.has(name)) {
     try { const n = ui.icon(name); if (n) return n; } catch (_) {}
@@ -144,9 +146,14 @@ const CSS = `
 .ink-float .ink-tool, .ink-float .ink-size, .ink-float .ink-swatch { width:44px; height:44px; }
 @media (max-width:520px) { .ink-float { overflow-x:auto; max-width:calc(100vw - 16px); }
   .ink-float .ink-tool, .ink-float .ink-size, .ink-float .ink-swatch { width:44px; height:44px; min-width:44px; min-height:44px; } }
+/* 넓은 세로 태블릿(아이패드 프로 12.9 세로 1024px 등): 올가미까지 한 줄에(v2.19) */
+@media (max-width:1100px) {
+  .ink-wrap:not(.bar-side) .ink-float { gap:2px; }
+  .ink-wrap:not(.bar-side) .ink-float .ink-tool { width:42px; }
+}
 /* 세로 태블릿(아이패드 744~834px, 갤럭시탭 800px): 아래 도구바가 한 줄에 다 들어가게 폭만 줄임(높이 44px 유지) */
 @media (max-width:940px) {
-  .ink-wrap:not(.bar-side) .ink-float { gap:2px; padding:4px 6px; }
+  .ink-wrap:not(.bar-side) .ink-float { gap:1px; padding:4px 6px; }
   .ink-wrap:not(.bar-side) .ink-float .ink-tool, .ink-wrap:not(.bar-side) .ink-float .ink-size { width:40px; }
   .ink-wrap:not(.bar-side) .ink-float .ink-swatch { width:36px; min-width:36px; }
   .ink-wrap:not(.bar-side) .ink-float .ink-sep { margin:0 2px; }
@@ -156,12 +163,18 @@ const CSS = `
   .ink-wrap:not(.bar-side) .ink-float .ink-tool, .ink-wrap:not(.bar-side) .ink-float .ink-size { width:37px; }
   .ink-wrap:not(.bar-side) .ink-float .ink-swatch { width:32px; min-width:32px; }
 }
-/* 세로 아이패드(744~834px)에서 도형 도구·✋까지 한 줄에(높이 44px 유지). 휴대폰은 그대로(가로 스크롤) */
+/* 세로 아이패드(744~834px)에서 올가미·도형 도구·✋까지 한 줄에(높이 44px 유지). 휴대폰은 그대로(가로 스크롤) */
 @media (min-width:521px) and (max-width:860px) {
   .ink-wrap:not(.bar-side) .ink-float { gap:1px; padding:4px; }
-  .ink-wrap:not(.bar-side) .ink-float .ink-swatch { width:30px; min-width:30px; }
-  .ink-wrap:not(.bar-side) .ink-float .ink-size { width:34px; min-width:34px; }
+  .ink-wrap:not(.bar-side) .ink-float .ink-tool { width:38px; }
+  .ink-wrap:not(.bar-side) .ink-float .ink-swatch { width:29px; min-width:29px; }
+  .ink-wrap:not(.bar-side) .ink-float .ink-size { width:32px; min-width:32px; }
   .ink-wrap:not(.bar-side) .ink-float .ink-sep { margin:0 1px; }
+}
+/* 아이패드 미니 세로(744px)·768px: 올가미까지 한 줄에(v2.19) */
+@media (min-width:521px) and (max-width:790px) {
+  .ink-wrap:not(.bar-side) .ink-float .ink-tool { width:35px; }
+  .ink-wrap:not(.bar-side) .ink-float .ink-zlbl { min-width:40px; }
 }
 .ink-wait { flex:1; display:grid; place-items:center; }
 .ink-gallery { flex:1; min-height:0; overflow:auto; padding:2px; display:flex; flex-direction:column; gap:12px; }
@@ -382,7 +395,9 @@ function makeToolbar(getViewer, { float = false, extras = [], zoom = false, tool
     onPointerdown: (e) => e.preventDefault(),
     onClick: () => {
       getViewer()?.paintText?.(c); // 텍스트 도구에서 글자를 골라 두었으면 그 부분만
-      st.color = c; if (st.tool === "eraser" || st.tool === "image") st.tool = "pen"; sync(); apply();
+      // 올가미로 고른 것이 있으면 그 색으로(도구는 올가미 그대로), 없으면 펜으로
+      if (st.tool === "lasso" && getViewer()?.recolorSelection?.(c)) { st.color = c; sync(); apply(); return; }
+      st.color = c; if (st.tool === "eraser" || st.tool === "image" || st.tool === "lasso") st.tool = "pen"; sync(); apply();
     },
   }, [el("i", {})]));
   const sizeBtns = SIZES.map((s, i) => el("button", {

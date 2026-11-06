@@ -139,6 +139,7 @@ js/canvas.js            [I]  InkCanvas: stroke id, undo, destroy, 소수 4자리
 js/lesson-view.js       [I]  renderSlide: 병합(tombstone), 디바운스 저장, dispose
 js/zoom-view.js         [I]  필기 화면 확대·이동(핀치·휠·버튼), 내용 영역 맞춤 — renderSlide({ zoom:true })
 js/pen-input.js         [I]  펜·손바닥 입력 공용(§6.3 '펜·손바닥'): 펜 우선·손바닥 판정·손가락 필기 설정·필기 화면 기본 동작 막기
+js/lasso.js             [I]  올가미(v2.19, §6.3 '올가미'): 둘러싸 고르기·끌어 옮기기·색 바꾸기·지우기 — lesson-view가 씀
 js/worksheet.js         [B/C] 학습지 공용(§9.5): wsPages·wsForced·setWsForce·wsStats(작성 중/작성함)·makeWsSessionView(개별 모드 Proxy)·wsTab(📝 탭)·CSS
 js/slides/registry.js   [H]  레지스트리 + 헬퍼(effectiveMode, parseYouTubeId, groupStudents, fmtMs, shuffle, escapeHtml, newId)
 js/slides/common.js     [H]  플러그인 공용 UI: activityBar, choiceBars, countdownPill, loadYouTubeApi, normalizeAnswer, optionLetter
@@ -228,6 +229,8 @@ export function cloudWriteRecord(sessionId, slideId, scope, scopeId, rec)   // �
    //   · 실패하면 1·2·4·8·15초 …로 계속 다시 시도(실패 중 새 쓰기는 다음 시도에 실림, 재촉하지 않음). 3번 연속이면 toast 1회
    //     '인터넷이 느려 필기 저장이 늦어지고 있어요 · 계속 써도 연결되면 저장돼요', 되면 '필기를 저장했어요'. 수업이 지워짐(23503) 등은 그만두고 '필기를 저장하지 못했어요'
    //   · 저장이 1.5초 넘게 안 끝나면 저장할 내용을 localStorage 'hada:rq:<키>'에 보관 → 저장되면 지움. 다음 cloudFetchSession이 병합하고 서버에 없으면 다시 저장(3일 뒤 버림)
+   //   · v2.19: 행의 지운 표시가 400개를 넘으면(올가미로 자주 옮기기·많이 지우기) 최근 120개만 남기고 나머지를 묶음 행(strokes [], removed […])으로.
+   //     읽는 쪽은 묶음 행의 removed도 합친다. 큰 덩어리(획 300개)를 40번 옮겨도 머리 행 ≈ 50 KB
 export async function cloudSubmitResponse(r /* Response without id */) → Response   // upsert onConflict 'session_id,slide_id,student_id,item_key' .select().single()
 export async function cloudDeleteResponse(sessionId, slideId, studentId, itemKey)
 export async function cloudDeleteResponsesForSlide(sessionId, slideId)              // 교사 '초기화'/'다시'
@@ -389,6 +392,16 @@ ctx = {
 - **PowerPoint(.pptx, v2.15)**: 서버 없이 `js/pptx.js`가 브라우저에서 그린다 — fflate 0.8.2(jsDelivr ESM)로 압축 풀기 + DOMParser. 숨긴 슬라이드 제외, 장마다 캔버스(가로 2400px · 세로 슬라이드는 높이 3000px) → PDF 쪽과 같은 인코딩·업로드(`pagesToSlides`, 동시 3개).
   그리는 것: 배경(단색·그라데이션·그림·바둑판·두 색 효과), 그림(자르기·투명도·도형 모양 잘라내기), 도형(사각·둥근 사각·원·삼각형·마름모·평행사변형·사다리꼴·오각·셰브런·육각·팔각·십자·화살표·별·하트 + 자유형), 선·연결선(점선·화살촉), 글자(크기·굵게·기울임·밑줄·취소선·위·아래 첨자·대문자·색·글꼴, 정렬·들여쓰기·줄·문단 간격·글머리·번호, 자동 맞춤(넘치면 줄임)·세로 맞춤·여백·세로쓰기 회전), 표(파일의 표 스타일, 없으면 PowerPoint 기본처럼), 그룹(회전·뒤집기), SmartArt(파일에 저장된 그림 drawing*.xml, 글자는 거꾸로 서지 않게), 개체 틀 상속(레이아웃 → 마스터, idx 먼저 · 없으면 종류), 테마 색·글꼴·스타일 참조(fillRef·lnRef·fontRef), clrMap 덮어쓰기.
   그리지 않는 것: 차트(옅은 '차트' 상자), 동영상(표지 그림만), 그림자·3D·애니메이션, EMF·WMF·TIFF 그림. 없는 글꼴은 Pretendard → 줄바꿈이 조금 다를 수 있다. 한글은 어절 단위로 줄바꿈(한 어절이 칸보다 길면 글자 단위). 옛 .ppt·.key 는 '.pptx나 PDF로 저장해서 올려 주세요' 안내.
+
+#### 올가미 (v2.19, js/lasso.js · canvas 12 · lesson-view)
+- 도구바 **올가미**(지우개 다음, 교사·학생·편집기 공통): 옮길 획·글 상자를 둘러싸 그리면 점선 상자로 고르고, 상자 안(둘레 14px 여유)을 끌면 옮겨짐(종이 밖으로는 안 나감), 놓으면 저장.
+  상자 위 막대 `n개 · 🗑 · ✕`(위 끝이면 아래), 도구바 색 = 고른 것을 그 색으로(도구는 올가미 그대로), 빈 곳 톡·✕·Esc = 해제, Delete·Backspace = 지우기. 되돌리기는 옮기기·색·지우기를 작업 하나씩.
+- 고르는 기준: 획은 점(최대 24개 고르게)의 절반 이상이 올가미 안, 글 상자는 가운데가 안. 편집기 기본 필기(바닥 레이어)는 고르지 않는다(지우개처럼 원본 보호). 입력 규칙은 펜과 같다(펜·마우스, 손가락은 손가락 필기가 켜졌을 때만, 두 손가락 = 확대·이동, 펜 지우개 끝은 지우개).
+- 데이터: 획은 바뀌지 않는 값 → 옮기기·색 바꾸기는 옛 id를 지운 표시로, 새 id 획(새 ts — 맨 위)으로 다시 만든다(병합·묶음 행이 id로 합쳐도 겹치지 않음, 이전 버전 화면도 그대로 이해). 글 상자는 같은 id에 x·y·ts(·색, 부분 색은 지움)만. edit scope는 slide.strokes를 바로 바꿈.
+  되돌리기 = 지금 그 획(옮겨질 때마다 InkCanvas alias로 새 id를 따라감)을 원래 모양의 새 id 획으로, 지우기 되돌리기 = 지운 것을 새 id로 다시.
+- 최적화: 고르는 순간 고른 획을 '떠 있는 층'으로(고른 획을 뺀 캐시 다시 그리기 + 고른 획 비트맵, 한 번). 끄는 동안 프레임마다 그림 2장, 놓아도 비트맵을 그대로 두고 자리만 기억(`replaceStrokes shift`), 풀 때 비트맵을 캐시에 찍어 넣음 →
+  획 1,564개 쪽에서 581개를 골라 끌기·놓기·다시 끌기·풀기 동안 획 다시 그리기 0번(고를 때만 한 번). 형광펜이 섞였거나 고른 뒤 바꾸지 않았으면 풀 때 캐시를 다시 그림(쌓인 순서·섞는 방식 그대로).
+- 도구바 폭: 버튼이 하나 늘어 세로 태블릿 한 줄 규칙을 다시 맞춤 — 1100px 이하 도구 42px, 521~860px 도구 38·크기 32·색 29px, 521~790px 도구 35px(높이는 모두 44px). 744·768·800·820·834·860·879·940·1024·1366px에서 한 줄.
 
 #### 펜·손바닥 (v2.6.1, js/pen-input.js · zoom-view · canvas · lesson-view)
 - **원인(이전)**: ① 손바닥(터치)이 펜보다 먼저 닿으면 InkCanvas가 그 터치를 '첫 포인터'로 잡아 선을 긋고 펜을 무시 ② 손바닥 접점 둘 = 두 손가락 확대·이동 → 화면이 끌리고 그동안 펜도 막힘 ③ 길게 누르기·S펜 옆 버튼·Chromebook 길게 누르기 = 오른쪽 클릭 메뉴, 펜으로 끌면 글자 선택·끌어 놓기(막는 처리 없음) ④ 텍스트 상자가 펜 도구일 때도 편집 가능 → iPad Scribble이 근처 필기를 가로챔.

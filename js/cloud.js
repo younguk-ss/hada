@@ -1505,6 +1505,8 @@ const SEG = "~";
 const SEAL_AT = 48 * 1024;     // 머리 행 획(압축 JSON)이 이보다 크면 오래된 획부터 묶는다
 const SEAL_KEEP = 12 * 1024;   // 묶은 뒤 머리에 남길 최근 획(지우기·되돌리기는 보통 최근 획)
 const SEG_MAX = 96 * 1024;     // 묶음 행 하나의 크기(이전 버전이 쓴 큰 쪽은 여러 묶음으로)
+const RM_SEAL_AT = 400;        // 행의 지운 표시가 이보다 많으면(올가미로 자주 옮기기·많이 지우기) 오래된 것을 묶음 행으로(v2.19)
+const RM_KEEP = 120;           // 그때 행에 남길 최근 지운 표시
 const RETRY_MS = [1000, 2000, 4000, 8000, 15000]; // 저장 실패 → 다시 시도 간격(마지막 값으로 계속)
 const SLOW_TRIES = 3;          // 이만큼 연달아 실패하면 한 번 알림
 const recKey = (sessionId, slideId, scope, scopeId) => `${sessionId}|${slideId}|${scope}|${scopeId}`;
@@ -1616,6 +1618,7 @@ const recSegs = new Map();       // recKey → Set(묶음 id) — 서버에 있�
 const recSealed = new Map();     // recKey → Set(획 키) — 묶음 행에 든 획(머리에 다시 싣지 않음)
 const recHead = new Map();       // recKey → 마지막으로 받은 머리 Rec(개별 쪽: 모르는 묶음을 받아 온 뒤 수렴 판단을 다시 할 때)
 const recMySegs = new Map();     // recKey → Set(이 기기가 만든 묶음 id) — 전체·모둠 쪽 기기 행에 싣는다
+const recSealedRm = new Map();   // recKey → Set(지운 id) — 묶음 행에 든 지운 표시(행에 다시 싣지 않음, v2.19)
 const setOf = (m, k) => { let x = m.get(k); if (!x) { x = new Set(); m.set(k, x); } return x; };
 function noteRemote(key, rec) {
   const seen = setOf(recRemoteSeen, key);
@@ -1658,6 +1661,7 @@ function applyRecordRow(session, row, { fromFetch = false } = {}) {
     setOf(recSegs, key).add(seg);
     const sealed = setOf(recSealed, key);
     for (const x of incoming.strokes) if (x) sealed.add(itemKey(x));
+    if (incoming.removed.length) { const sr = setOf(recSealedRm, key); for (const id of incoming.removed) sr.add(id); }
   }
   const slot = recSlot(session, scope, scopeId);
   const ex = slot[slideId];
@@ -1686,7 +1690,7 @@ function convergeCheck(session, key, slideId, scope, scopeId, incoming) {
   const ids = new Set((incoming.strokes || []).map(x => x && itemKey(x)));
   const incTexts = new Map((incoming.texts || []).filter(Boolean).map(x => [itemKey(x), x]));
   const incRemoved = new Set(incoming.removed || []);
-  const sealed = recSealed.get(key), own = recOwn.get(key);
+  const sealed = recSealed.get(key), own = recOwn.get(key), sealedRm = recSealedRm.get(key);
   let anyExtra = false, ownExtra = false;
   for (const x of ex.strokes || []) {
     if (!x) continue;
@@ -1703,7 +1707,7 @@ function convergeCheck(session, key, slideId, scope, scopeId, incoming) {
     if (own && own.has(k)) { ownExtra = true; break; }
   }
   if (!ownExtra) for (const id of ex.removed || []) {
-    if (incRemoved.has(id)) continue;
+    if (incRemoved.has(id) || (sealedRm && sealedRm.has(id))) continue;
     anyExtra = true;
     if (own && own.has("r:" + id)) { ownExtra = true; break; }
   }
@@ -1916,9 +1920,26 @@ async function writeRecordRows(key, { sessionId, slideId, scope, scopeId, rec })
     }
     if (done.size) headW = headW.filter((_, i) => !done.has(i));
   }
+  // 지운 표시: 묶음 행에 든 것은 빼고, 너무 많으면 오래된 것을 묶음 행으로(v2.19 — 올가미로 자주 옮겨도 행이 커지지 않게)
+  const sealedRm = recSealedRm.get(key);
+  let tomb = (shared ? (rec.removed || []).filter(id => mine("r:" + id)) : (rec.removed || [])).filter(id => !(sealedRm && sealedRm.has(id)));
+  if (tomb.length > RM_SEAL_AT) {
+    const old = tomb.slice(0, tomb.length - RM_KEEP), segId = newSegId();
+    const { error } = await supa.from("slide_records").upsert({
+      session_id: sessionId, slide_id: slideId + SEG + segId, scope, scope_id: scopeId,
+      strokes: [], texts: [], removed: old,
+      last_writer: CLIENT_ID, updated_at: nowIso(),
+    }, { onConflict: "session_id,slide_id,scope,scope_id" });
+    if (error) warn("sealRemoved", error);
+    else {
+      setOf(recSegs, key).add(segId); setOf(recMySegs, key).add(segId);
+      const sr = setOf(recSealedRm, key), seen = setOf(recRemoteSeen, key);
+      for (const id of old) { sr.add(id); seen.add("r:" + id); }
+      tomb = tomb.slice(old.length);
+    }
+  }
   const refs = shared ? recMySegs.get(key) : recSegs.get(key);
   const texts = shared ? (rec.texts || []).filter(x => x && mine(itemKey(x))) : (rec.texts || []);
-  const tomb = shared ? (rec.removed || []).filter(id => mine("r:" + id)) : (rec.removed || []);
   const removed = refs && refs.size ? tomb.concat([...refs].map(id => SEG + id)) : tomb;
   const { error } = await supa.from("slide_records").upsert({
     session_id: sessionId, slide_id: shared ? slideId + SEG + DEV : slideId, scope, scope_id: scopeId,
@@ -1950,11 +1971,11 @@ function outboxWrite(key) {
   const p = pendingRec.get(key);
   if (!p || !p.args) return; // 이미 저장됨
   const { sessionId, slideId, scope, scopeId, rec } = p.args;
-  const owner = ownerOf(scope, scopeId), sealed = recSealed.get(key), own = recOwn.get(key);
+  const owner = ownerOf(scope, scopeId), sealed = recSealed.get(key), own = recOwn.get(key), sealedRm = recSealedRm.get(key);
   const shared = scope !== "individual", mine = (k) => !shared || !!(own && own.has(k));
   const strokes = (rec.strokes || []).filter(x => x && !(sealed && sealed.has(itemKey(x))) && mine(itemKey(x))).map(s => packStroke(s, owner));
   const texts = (rec.texts || []).filter(x => x && mine(itemKey(x)));
-  const removed = (rec.removed || []).filter(id => mine("r:" + id));
+  const removed = (rec.removed || []).filter(id => mine("r:" + id) && !(sealedRm && sealedRm.has(id)));
   try {
     localStorage.setItem(OUTBOX + key, JSON.stringify({ v: 1, at: Date.now(), sessionId, slideId, scope, scopeId, strokes, texts, removed }));
   } catch (_) {}
