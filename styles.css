@@ -1209,6 +1209,9 @@ body:has(.float-toolbar, .stu-toolbar, .ink-float) .toast-stack { bottom: calc(8
 .live-body {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto; /* 스테이지 | 패널(한 번에 하나) | 아이콘 레일 */
+  /* 행 높이 = 화면에 남은 높이로 고정. 행을 지정하지 않으면(auto) 패널 내용(게임 기록 표 등)이 화면보다 길 때 행이 그만큼 늘어나
+     아래가 잘리고, 패널·스테이지가 내용만큼 커져 스크롤도 안 됐다(v2.18.1) */
+  grid-template-rows: minmax(0, 1fr);
   min-height: 0;
   position: relative;
   overflow: hidden; overflow: clip; /* 닫힌 드로어(화면 밖)로 가로 스크롤이 생기지 않게 */
