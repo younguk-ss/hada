@@ -15,6 +15,7 @@ import { sync } from "./sync.js";
 import { currentChannel } from "./realtime.js";
 import { uploadSlideImage, isDataUrl, removeLessonImages, copySlideImage } from "./storage.js";
 import * as ui from "./ui.js";
+import { packStroke, unpackStrokes } from "./ink-codec.js";
 
 export const SUPABASE_JS = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4/+esm";
 
@@ -218,9 +219,6 @@ export function toResponse(r) {
     payload: r.payload || {}, score: r.score == null ? null : Number(r.score), correct: r.correct ?? null,
     timeMs: r.time_ms ?? null, updatedAt: ms(r.updated_at) || Date.now(),
   };
-}
-function toRec(r) {
-  return { strokes: r.strokes || [], texts: r.texts || [], removed: r.removed || [] };
 }
 
 // 키 순서와 무관한 비교 (jsonb는 키를 재정렬해 돌려준다)
@@ -981,7 +979,6 @@ export async function cloudFetchSession(sessionId, { forStudentId } = {}) {
     if (s) { ensureSessionShape(s); s._full = true; }
     return s || null;
   }
-  const fetchStart = Date.now();
   try {
     const { data: row, error } = await supa.from("sessions").select(SESSION_COLS).eq("id", sessionId).maybeSingle();
     if (error) throw error;
@@ -997,11 +994,12 @@ export async function cloudFetchSession(sessionId, { forStudentId } = {}) {
       needSnap ? fetchSnapRow(sessionId) : Promise.resolve({ data: null }),
       fetchAll(() => supa.from("session_participants").select(`student_id,joined_at,students(${STUDENT_COLS})`)
         .eq("session_id", sessionId).order("student_id")),
+      // 필기 행은 커질 수 있어 100행씩(한 요청이 DB 시간 한도 3초를 넘지 않게)
       fetchAll(() => {
         let q = supa.from("slide_records").select(RECORD_COLS).eq("session_id", sessionId);
         if (scopeIds) q = q.in("scope_id", scopeIds);
         return q.order("id");
-      }),
+      }, 100),
       fetchAll(() => supa.from("responses").select(RESPONSE_COLS).eq("session_id", sessionId).order("id")),
     ]);
     // 스냅샷: session_snapshots → 레거시 slides_snapshot → lesson slides
@@ -1048,7 +1046,10 @@ export async function cloudFetchSession(sessionId, { forStudentId } = {}) {
     // 조회 중 realtime으로 들어온 참여자를 잃지 않게 합집합(참여자 삭제는 앱에서 하지 않음)
     const fetchedIds = parts.map(p => p.student_id);
     s.participants = [...fetchedIds, ...(s.participants || []).filter(x => !fetchedIds.includes(x))];
-    for (const r of recs) applyRecordRow(s, r, { fromFetch: true, fetchStart });
+    // 필기: 묶음 행 먼저(머리 행의 수렴 판단이 묶음에 든 획을 '빠짐'으로 보지 않게) → 머리 행 → 기기에 보관된 저장 전 필기
+    for (const r of recs) if (isSegRowId(r.slide_id)) applyRecordRow(s, r, { fromFetch: true });
+    for (const r of recs) if (!isSegRowId(r.slide_id)) applyRecordRow(s, r, { fromFetch: true });
+    outboxRestore(s);
     // responses: 서버 목록 + 아직 서버 id가 없는 로컬 임시(음수 id)
     const grouped = {};
     for (const r of resps) (grouped[r.slide_id] ||= []).push(toResponse(r));
@@ -1479,9 +1480,60 @@ export function ensureStudentsLoaded(ids) {
 }
 
 // ── 필기 레코드 ──
-const MAX_REC_BYTES = 700 * 1024;
+// v2.18.2 — 논설문처럼 한 쪽에 길게 쓰면 '이 슬라이드의 필기가 너무 많아요' 뒤 더 저장되지 않고, 쓴 글이 지워지던 문제.
+//   원인 ① 쪽 하나가 700 KB를 넘으면 저장을 아예 하지 않았다(확대해서 작게 쓴 논설문 6줄 ≈ 획 1,000~1,500개 ≈ 700 KB).
+//        ② 저장할 때마다 쪽 전체(수백 KB)를 다시 보내 반 전체가 쓰면 DB가 버티지 못해 시간 초과(3번 실패하면 포기).
+//        ③ 저장되지 못한 채 다시 맞추기(재연결·화면 다시 켜기)가 오면 개별 쪽은 서버의 옛 내용으로 통째로 바꿔
+//           방금 쓴 글·입력한 글 상자가 화면에서 사라졌다(그 뒤로도 저장되지 않음).
+//   고침 ① 한도 없음 + 획 압축(ink-codec.js, 약 5배)
+//        ② 오래된 획은 '묶음 행'으로 한 번만 옮겨 두고, 저장할 때는 아직 묶지 않은 최근 획·글·지운 표시만 보낸다(쪽이 길어져도 저장 크기 일정)
+//        ③ 받은 행은 언제나 병합(지운 표시 tombstone 기준) — 내 쪽에만 있는 획·더 새 글은 남기고 다시 써서 DB를 맞춘다
+//        ④ 저장 실패는 포기하지 않고 계속 다시 시도(1·2·4·8·15초 …, 실패 중에는 쓸 때마다 재촉하지 않음)
+//        ⑤ 저장이 끝나기 전 내용을 기기(localStorage)에 잠깐 보관 → 그 사이 새로 고치거나 탭이 닫혀도 다음 조회 때 되살려 다시 저장.
+// 행 모양(테이블은 그대로):
+//   머리 행  slide_id = <slideId>             개별 쪽: strokes = 아직 묶지 않은 획(압축) · texts = 전부 · removed = 지운 id 전부 + 묶음 표시 '~<묶음id>'
+//   기기 행  slide_id = <slideId>~@<기기id>   전체·모둠 쪽: 그 기기(페이지 열 때마다 새 id)가 만든 것만 — 획·글·지운 표시 + 그 기기의 묶음 표시.
+//                                              기기마다 자기 행만 쓰므로 여럿이 동시에 써도 서로의 획을 다시 싣거나 덮지 않는다.
+//   묶음 행  slide_id = <slideId>~<묶음id>    strokes = 묶은 획(압축, 쓴 뒤 바꾸지 않음) · texts·removed = []
+//   읽을 때 머리·기기·묶음 행을 한 Rec로 합친다(화면·기록·인쇄는 그대로 Rec 하나). 묶음 표시는 메모리 Rec.removed에 넣지 않는다.
+//   이전 버전이 쓴 전체·모둠 머리 행(<slideId>)은 그대로 읽어 합친다(새 버전은 그 행을 다시 쓰지 않는다).
+// 가정: 개별 쪽에서 학생·첨삭 교사가 같은 획을 거의 동시에 묶으면 묶음이 겹칠 수 있다 — 읽을 때 id로 합치므로 문제없다(조금 클 뿐).
+// 가정: 이전 버전 화면은 묶음 행을 모르는 슬라이드의 기록으로 보고 지나치고, 묶음 표시는 그냥 지운 id로 본다(죽지 않음, 새로 고치면 다 보임).
+// 가정: 개별 쪽에서 남(교사·학생)의 항목만 빠진 경우는 다시 쓰지 않는다 — 각자 자기 것만 다시 쓴다(서로 묶음을 놓쳐 번갈아 쓰지 않게).
+// 가정: 전체·모둠 쪽은 수렴 쓰기가 필요 없다(남의 행을 쓰지 않으므로 남의 것을 떨어뜨릴 일이 없음). 개별 쪽만 머리 행을 함께 쓴다(학생·첨삭 교사).
+const SEG = "~";
+const SEAL_AT = 48 * 1024;     // 머리 행 획(압축 JSON)이 이보다 크면 오래된 획부터 묶는다
+const SEAL_KEEP = 12 * 1024;   // 묶은 뒤 머리에 남길 최근 획(지우기·되돌리기는 보통 최근 획)
+const SEG_MAX = 96 * 1024;     // 묶음 행 하나의 크기(이전 버전이 쓴 큰 쪽은 여러 묶음으로)
+const RETRY_MS = [1000, 2000, 4000, 8000, 15000]; // 저장 실패 → 다시 시도 간격(마지막 값으로 계속)
+const SLOW_TRIES = 3;          // 이만큼 연달아 실패하면 한 번 알림
 const recKey = (sessionId, slideId, scope, scopeId) => `${sessionId}|${slideId}|${scope}|${scopeId}`;
-const pendingRec = new Map(); // key → { timer, args, tries }
+const pendingRec = new Map(); // key → { timer, args, tries, seq, inflight, again, due, first, conv }
+const ownerOf = (scope, scopeId) => (scope === "individual" ? scopeId : null);
+const DEV = "@" + CLIENT_ID.replace(/^cli_/, ""); // 이 기기(페이지)의 행 꼬리표 — 전체·모둠 쪽
+const tsOf = (x) => (x && (x.ts || x.at)) || 0; // 글 상자 ts, 주관식 실시간 답안(sa-draft)은 at
+
+// slide_id → { slideId, seg: 묶음 id | null, dev: 기기 행이면 true }
+function splitSlideId(id) {
+  const s = String(id ?? "");
+  const i = s.indexOf(SEG);
+  if (i < 0) return { slideId: s, seg: null, dev: false };
+  const rest = s.slice(i + 1);
+  return rest[0] === "@" ? { slideId: s.slice(0, i), seg: null, dev: true } : { slideId: s.slice(0, i), seg: rest || null, dev: false };
+}
+const isSegRowId = (id) => { const x = splitSlideId(id); return !!x.seg; };
+const newSegId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+// DB 행(또는 로컬 메시지) → { rec, segs }. 획은 풀고(ink-codec), removed의 묶음 표시('~…')는 segs로 따로
+function parseRecRow(r) {
+  const owner = r && r.scope === "individual" ? r.scope_id : null;
+  const removed = [], segs = [];
+  for (const id of (r && r.removed) || []) {
+    if (typeof id === "string" && id[0] === SEG) { if (id.length > 1) segs.push(id.slice(1)); }
+    else removed.push(id);
+  }
+  return { rec: { strokes: unpackStrokes((r && r.strokes) || [], owner), texts: (r && r.texts) || [], removed }, segs };
+}
 
 // 레코드 슬롯(슬라이드id → Rec 맵)
 function recSlot(session, scope, scopeId, create = true) {
@@ -1508,90 +1560,197 @@ function bumpRec(rec) {
 
 const itemKey = x => x.id || `${x.ts || 0}:${(x.points || []).length}:${x.value || ""}`;
 
-// whole/group 병합: stroke/text id 합집합 + removed 합집합(tombstone). a를 제자리 수정. 바뀌면 true
+// 병합: stroke/text id 합집합 + removed 합집합(tombstone). 글은 같은 id면 더 새 것(ts, 없으면 at). a를 제자리 수정. 바뀌면 true
+// 가정: 바뀐 배열만 새로 만든다(그대로면 같은 배열 → 화면이 다시 그리지 않음).
 export function mergeRec(a, b) {
   a.strokes ||= []; a.texts ||= []; a.removed ||= [];
-  const before = `${a.strokes.length}|${a.texts.length}|${a.removed.length}`;
-  const removed = new Set([...a.removed, ...(b.removed || [])]);
-  const sMap = new Map(a.strokes.map(x => [itemKey(x), x]));
-  let added = false;
-  for (const x of b.strokes || []) if (!sMap.has(itemKey(x))) { sMap.set(itemKey(x), x); added = true; }
-  const tMap = new Map(a.texts.map(x => [itemKey(x), x]));
-  let textChanged = false;
-  for (const x of b.texts || []) {
-    const k = itemKey(x), cur = tMap.get(k);
-    if (!cur || (x.ts || 0) > (cur.ts || 0)) { tMap.set(k, x); textChanged = textChanged || cur !== x; }
+  const rm = new Set(a.removed);
+  let rmNew = false;
+  for (const id of (b && b.removed) || []) if (!rm.has(id)) { rm.add(id); rmNew = true; }
+  const gone = (x) => !!(x && x.id && rm.has(x.id));
+  // 획
+  let strokes = a.strokes, sChanged = false;
+  const have = new Set();
+  for (const x of strokes) have.add(itemKey(x));
+  const add = [];
+  for (const x of (b && b.strokes) || []) {
+    if (!x) continue;
+    const k = itemKey(x);
+    if (!have.has(k)) { have.add(k); add.push(x); }
   }
-  let strokes = [...sMap.values()].filter(x => !removed.has(x.id));
-  if (added) strokes = strokes.map((x, i) => [x, i]).sort((p, q) => ((p[0].ts || 0) - (q[0].ts || 0)) || (p[1] - q[1])).map(p => p[0]);
-  a.strokes = strokes;
-  a.texts = [...tMap.values()].filter(x => !removed.has(x.id));
-  a.removed = [...removed];
-  return added || textChanged || before !== `${a.strokes.length}|${a.texts.length}|${a.removed.length}`;
+  if (add.length || rmNew) {
+    let next = add.length ? strokes.concat(add) : strokes;
+    const kept = next.filter(x => !gone(x));
+    if (kept.length !== next.length) next = kept;
+    if (add.length) next = next.map((x, i) => [x, i]).sort((p, q) => ((p[0].ts || 0) - (q[0].ts || 0)) || (p[1] - q[1])).map(p => p[0]);
+    if (next !== strokes) { sChanged = add.length > 0 || next.length !== strokes.length; strokes = next; }
+  }
+  // 글
+  let texts = a.texts, tChanged = false, tNext = null;
+  const tIdx = new Map();
+  texts.forEach((x, i) => { if (x) tIdx.set(itemKey(x), i); });
+  for (const x of (b && b.texts) || []) {
+    if (!x) continue;
+    const k = itemKey(x), i = tIdx.get(k);
+    if (i == null) { (tNext ||= texts.slice()).push(x); tIdx.set(k, tNext.length - 1); tChanged = true; continue; }
+    const cur = (tNext || texts)[i];
+    if (cur !== x && tsOf(x) > tsOf(cur)) { (tNext ||= texts.slice())[i] = x; tChanged = true; }
+  }
+  if (tNext || rmNew) {
+    const src = tNext || texts;
+    const kept = src.filter(x => !gone(x));
+    if (kept.length !== src.length) tChanged = true;
+    texts = kept.length !== src.length ? kept : src;
+  }
+  if (strokes !== a.strokes) a.strokes = strokes;
+  if (texts !== a.texts) a.texts = texts;
+  if (rmNew) a.removed = [...rm];
+  return sChanged || tChanged || rmNew;
 }
 
-// 원격(또는 조회한) 레코드 행을 세션에 반영. 반환: 바뀌었는지
-// whole/group 수렴용: 원격에서 본 항목 키 / 이 클라이언트가 만든 항목 키 ('r:'+id = 지운 표시)
+// 수렴 판단용: 원격에서 본 항목 키 / 이 클라이언트가 만든(또는 더 새로 고친) 항목 키 ('r:'+id = 지운 표시)
 const recRemoteSeen = new Map(); // recKey → Set
+const recRemoteTs = new Map();   // recKey → Map(글 키 → 원격에서 본 가장 새 ts)
 const recOwn = new Map();        // recKey → Set
-const recTouched = new Map();    // recKey → 마지막 로컬 쓰기 시각(ms) — individual 조회가 로컬을 덮지 않게
+const recSegs = new Map();       // recKey → Set(묶음 id) — 서버에 있다고 아는 묶음
+const recSealed = new Map();     // recKey → Set(획 키) — 묶음 행에 든 획(머리에 다시 싣지 않음)
+const recHead = new Map();       // recKey → 마지막으로 받은 머리 Rec(개별 쪽: 모르는 묶음을 받아 온 뒤 수렴 판단을 다시 할 때)
+const recMySegs = new Map();     // recKey → Set(이 기기가 만든 묶음 id) — 전체·모둠 쪽 기기 행에 싣는다
 const setOf = (m, k) => { let x = m.get(k); if (!x) { x = new Set(); m.set(k, x); } return x; };
 function noteRemote(key, rec) {
   const seen = setOf(recRemoteSeen, key);
-  for (const x of rec.strokes || []) seen.add(itemKey(x));
-  for (const x of rec.texts || []) seen.add(itemKey(x));
+  for (const x of rec.strokes || []) if (x) seen.add(itemKey(x));
+  if ((rec.texts || []).length) {
+    let rts = recRemoteTs.get(key);
+    if (!rts) { rts = new Map(); recRemoteTs.set(key, rts); }
+    for (const x of rec.texts) {
+      if (!x) continue;
+      const k = itemKey(x);
+      seen.add(k);
+      if (tsOf(x) > (rts.get(k) || 0)) rts.set(k, tsOf(x));
+    }
+  }
   for (const id of rec.removed || []) seen.add("r:" + id);
 }
+// 원격에서 본 적 없는 항목·지운 표시, 원격보다 새로 고친 글 = 이 클라이언트가 만든 것
+function markOwn(key, cur) {
+  const seen = recRemoteSeen.get(key), rts = recRemoteTs.get(key), own = setOf(recOwn, key);
+  for (const x of cur.strokes || []) { if (!x) continue; const k = itemKey(x); if (!seen || !seen.has(k)) own.add(k); }
+  for (const x of cur.texts || []) {
+    if (!x) continue;
+    const k = itemKey(x);
+    if (!seen || !seen.has(k) || (rts && (rts.get(k) || 0) < tsOf(x))) own.add(k);
+  }
+  for (const id of cur.removed || []) if (!seen || !seen.has("r:" + id)) own.add("r:" + id);
+}
 
-function applyRecordRow(session, row, { fromFetch = false, fetchStart = 0 } = {}) {
+function applyRecordRow(session, row, { fromFetch = false } = {}) {
   if (!session || !row) return false;
   if (!fromFetch && row.last_writer && row.last_writer === CLIENT_ID) return false;
   const scope = row.scope;
   const scopeId = scope === "whole" ? session.id : row.scope_id;
-  const slot = recSlot(session, scope, scopeId);
-  const incoming = toRec(row);
-  const ex = slot[row.slide_id];
-  const key = recKey(session.id, row.slide_id, scope, scopeId);
-  if (scope !== "individual") noteRemote(key, incoming);
-  if (!ex) { slot[row.slide_id] = incoming; bumpRec(incoming); return true; }
-  if (scope === "individual") {
-    if (pendingRec.has(key)) return false; // 내가 쓰는 중이면 로컬 유지
-    // 조회 시작 뒤에 로컬에서 쓴 레코드는 (저장이 끝났어도) 조회 결과가 더 낡았다 → 로컬 유지
-    if (fromFetch && (recTouched.get(key) || 0) >= fetchStart) return false;
-    ex.strokes = incoming.strokes; ex.texts = incoming.texts; ex.removed = incoming.removed;
-    bumpRec(ex);
-    return true;
+  const { slideId, seg, dev } = splitSlideId(row.slide_id);
+  if (!slideId || !scopeId) return false;
+  const { rec: incoming, segs } = parseRecRow(row);
+  const key = recKey(session.id, slideId, scope, scopeId);
+  noteRemote(key, incoming);
+  if (seg) {
+    setOf(recSegs, key).add(seg);
+    const sealed = setOf(recSealed, key);
+    for (const x of incoming.strokes) if (x) sealed.add(itemKey(x));
   }
-  const changed = mergeRec(ex, incoming);
-  if (changed) bumpRec(ex);
-  // 로컬에만 있는 항목이 있으면 다시 써서 DB 수렴.
-  // 내 항목이 빠졌으면 곧(0.3~1.3초), 남의 항목만 빠졌으면 늦게(4~8초: 보통 작성자가 먼저 다시 쓰고 그 행이 오면 취소)
-  if (isCloud) {
-    const ids = new Set([...(incoming.strokes || []), ...(incoming.texts || [])].map(itemKey));
-    const incRemoved = new Set(incoming.removed || []);
-    const own = recOwn.get(key);
-    let anyExtra = false, ownExtra = false;
-    for (const x of [...ex.strokes, ...ex.texts]) {
-      const k = itemKey(x);
-      if (ids.has(k)) continue;
-      anyExtra = true;
-      if (own && own.has(k)) { ownExtra = true; break; }
-    }
-    if (!ownExtra) for (const id of ex.removed) {
-      if (incRemoved.has(id)) continue;
-      anyExtra = true;
-      if (own && own.has("r:" + id)) { ownExtra = true; break; }
-    }
-    const p = pendingRec.get(key);
-    if (ownExtra) scheduleRecordWrite(session.id, row.slide_id, scope, scopeId, ex, 300 + Math.random() * 1000, "conv");
-    else if (anyExtra) scheduleRecordWrite(session.id, row.slide_id, scope, scopeId, ex, 4000 + Math.random() * 4000, "conv");
-    else if (p && p.conv && p.timer && !p.inflight) {
-      // DB가 이미 내 상태를 다 가짐 → 예약된 수렴 쓰기 취소
-      clearTimeout(p.timer); p.timer = null;
-      pendingRec.delete(key);
-    }
+  const slot = recSlot(session, scope, scopeId);
+  const ex = slot[slideId];
+  let changed;
+  if (!ex) { slot[slideId] = incoming; bumpRec(incoming); changed = true; }
+  else { changed = mergeRec(ex, incoming); if (changed) bumpRec(ex); }
+  if (!seg && isCloud) {
+    // 머리·기기 행: 모르는 묶음이 있으면 받아 온다. 개별 쪽 머리 행은 (묶음을 다 안 뒤에) 수렴 판단
+    const known = recSegs.get(key);
+    const missing = segs.filter(id => !known || !known.has(id));
+    const conv = scope === "individual" && !dev;
+    if (conv) recHead.set(key, incoming);
+    if (missing.length) fetchSegments(session, slideId, scope, scopeId, missing);
+    else if (conv) convergeCheck(session, key, slideId, scope, scopeId, incoming);
   }
   return changed;
+}
+
+// 개별 쪽: 다른 기기(학생·첨삭 교사)가 머리 행을 덮어 내 항목(또는 더 새 글)이 빠졌으면 곧(0.3~1.3초) 다시 써서 DB 수렴.
+// 남의 항목만 빠진 것은 그 주인이 다시 쓴다.
+function convergeCheck(session, key, slideId, scope, scopeId, incoming) {
+  if (scope !== "individual") return;
+  const slot = recSlot(session, scope, scopeId, false);
+  const ex = slot && slot[slideId];
+  if (!ex || !incoming) return;
+  const ids = new Set((incoming.strokes || []).map(x => x && itemKey(x)));
+  const incTexts = new Map((incoming.texts || []).filter(Boolean).map(x => [itemKey(x), x]));
+  const incRemoved = new Set(incoming.removed || []);
+  const sealed = recSealed.get(key), own = recOwn.get(key);
+  let anyExtra = false, ownExtra = false;
+  for (const x of ex.strokes || []) {
+    if (!x) continue;
+    const k = itemKey(x);
+    if (ids.has(k) || (sealed && sealed.has(k))) continue;
+    anyExtra = true;
+    if (own && own.has(k)) { ownExtra = true; break; }
+  }
+  if (!ownExtra) for (const x of ex.texts || []) {
+    if (!x) continue;
+    const k = itemKey(x), inc = incTexts.get(k);
+    if (inc && tsOf(inc) >= tsOf(x)) continue;
+    anyExtra = true;
+    if (own && own.has(k)) { ownExtra = true; break; }
+  }
+  if (!ownExtra) for (const id of ex.removed || []) {
+    if (incRemoved.has(id)) continue;
+    anyExtra = true;
+    if (own && own.has("r:" + id)) { ownExtra = true; break; }
+  }
+  const p = pendingRec.get(key);
+  if (ownExtra) scheduleRecordWrite(session.id, slideId, scope, scopeId, ex, 300 + Math.random() * 1000, "conv");
+  else if (!anyExtra && p && p.conv && p.timer && !p.inflight && !p.tries) {
+    // DB가 이미 내 상태를 다 가짐 → 예약된 수렴 쓰기 취소
+    clearTimeout(p.timer); p.timer = null;
+    pendingRec.delete(key);
+    outboxClear(key);
+  }
+}
+
+// 머리 행이 가리키는데 아직 모르는 묶음 행 받아 오기(키별 하나씩, 모이면 20개씩)
+const segWant = new Map(); // key → { session, slideId, scope, scopeId, ids:Set, running }
+function fetchSegments(session, slideId, scope, scopeId, ids) {
+  const key = recKey(session.id, slideId, scope, scopeId);
+  let w = segWant.get(key);
+  if (!w) { w = { ids: new Set(), running: false }; segWant.set(key, w); }
+  Object.assign(w, { session, slideId, scope, scopeId });
+  for (const id of ids) w.ids.add(id);
+  if (!w.running) runSegFetch(key, w);
+}
+async function runSegFetch(key, w) {
+  w.running = true;
+  let ok = true;
+  try {
+    while (w.ids.size) {
+      const ids = [...w.ids].slice(0, 20);
+      ids.forEach(id => w.ids.delete(id));
+      const { data, error } = await supa.from("slide_records").select(RECORD_COLS)
+        .eq("session_id", w.session.id).eq("scope", w.scope).eq("scope_id", w.scopeId)
+        .in("slide_id", ids.map(id => w.slideId + SEG + id));
+      if (error) { warn("fetchSegments", error); ok = false; break; } // 다음 머리 행·다시 맞추기 때 다시
+      let changed = false;
+      for (const row of data || []) if (applyRecordRow(w.session, row, { fromFetch: true })) changed = true;
+      const known = setOf(recSegs, key);
+      for (const id of ids) known.add(id); // 서버에 없는 묶음도 다시 찾지 않음(그 획은 수렴 판단이 다시 쓴다)
+      if (changed) store.set(st => st);
+    }
+  } catch (e) { warn("fetchSegments", e); ok = false; }
+  w.running = false;
+  if (!ok) { segWant.delete(key); return; }
+  if (w.ids.size) { runSegFetch(key, w); return; }
+  segWant.delete(key);
+  const head = recHead.get(key);
+  if (head && isCloud && w.scope === "individual") convergeCheck(w.session, key, w.slideId, w.scope, w.scopeId, head);
 }
 
 // 외부용: 레코드 행(또는 {slideId, scope, scopeId, strokes, texts, removed}) 반영 + 리스너 호출
@@ -1607,12 +1766,11 @@ export function applyRecord(sessionId, row) {
   return changed;
 }
 
-// 250ms 디바운스(키별 최신만). whole이면 scopeId=sessionId
+// 250ms 디바운스(키별 최신만, 최대 1초). whole이면 scopeId=sessionId
 export function cloudWriteRecord(sessionId, slideId, scope, scopeId, rec) {
   if (!sessionId || !slideId || !rec) return;
   if (scope === "whole") scopeId = sessionId;
   const key = recKey(sessionId, slideId, scope, scopeId);
-  recTouched.set(key, Date.now());
   // store의 레코드와 연결 (제자리)
   const s = findSession(sessionId);
   if (s) {
@@ -1620,6 +1778,7 @@ export function cloudWriteRecord(sessionId, slideId, scope, scopeId, rec) {
     const ex = slot[slideId];
     if (!ex) slot[slideId] = rec;
     else if (ex !== rec) {
+      // 다른 객체로 쓰면(주관식 실시간 답안) 개별 쪽은 그 내용으로, 공유 쪽은 병합
       if (scope === "individual") { ex.strokes = rec.strokes || []; ex.texts = rec.texts || []; ex.removed = rec.removed || []; }
       else mergeRec(ex, rec);
     }
@@ -1627,17 +1786,14 @@ export function cloudWriteRecord(sessionId, slideId, scope, scopeId, rec) {
     if (!isCloud) store.save();
   }
   const cur = s ? recSlot(s, scope, scopeId)[slideId] : rec;
-  // 원격에서 본 적 없는 항목·지운 표시 = 이 클라이언트가 만든 것 (수렴 쓰기 판단용)
-  if (scope !== "individual" && cur) {
-    const seen = recRemoteSeen.get(key), own = setOf(recOwn, key);
-    for (const x of [...(cur.strokes || []), ...(cur.texts || [])]) { const k = itemKey(x); if (!seen || !seen.has(k)) own.add(k); }
-    for (const id of cur.removed || []) if (!seen || !seen.has("r:" + id)) own.add("r:" + id);
-  }
+  if (cur) markOwn(key, cur);
   scheduleRecordWrite(sessionId, slideId, scope, scopeId, cur, 250, "own");
+  outboxSave(key);
 }
 
 // kind 'own': 디바운스(최대 1초 대기). kind 'conv'(수렴): 이미 잡힌 마감을 늦추지 않음(스로틀), 원격 행이 덮으면 취소 가능.
 // 가정: 진행 중(inflight)이면 끝난 뒤 again으로 한 번 더 쓴다(병합된 최신 Rec).
+// 가정: 저장이 실패해 다시 시도를 기다리는 중이면 새로 써도 앞당기지 않는다(다음 시도에 최신 내용이 실린다 — DB가 버거울 때 재촉하지 않게).
 function scheduleRecordWrite(sessionId, slideId, scope, scopeId, rec, delay, kind = "own") {
   const key = recKey(sessionId, slideId, scope, scopeId);
   let p = pendingRec.get(key);
@@ -1647,6 +1803,7 @@ function scheduleRecordWrite(sessionId, slideId, scope, scopeId, rec, delay, kin
   const now = Date.now();
   if (kind === "own") {
     p.conv = false;
+    if (p.tries > 0 && (p.timer || p.inflight)) { if (p.inflight) p.again = true; return; }
     if (!p.timer) p.first = now;
     const due = Math.min(now + delay, p.first + 1000);
     clearTimeout(p.timer);
@@ -1654,8 +1811,9 @@ function scheduleRecordWrite(sessionId, slideId, scope, scopeId, rec, delay, kin
     p.timer = setTimeout(() => flushRecord(key), Math.max(0, due - now));
     return;
   }
-  // 수렴: 쓰는 중이면 끝난 뒤 다시(이미 대기 중인 쓰기가 병합본을 실어 감)
+  // 수렴: 쓰는 중이면 끝난 뒤 다시(이미 대기 중인 쓰기가 병합본을 실어 감). 실패 뒤 기다리는 중이면 그 시도에 맡김
   if (p.inflight && !p.timer) { p.again = true; return; }
+  if (p.tries > 0 && p.timer) return;
   const due = now + delay;
   if (p.timer && p.due <= due) return; // 더 이른 마감 유지
   clearTimeout(p.timer);
@@ -1663,6 +1821,13 @@ function scheduleRecordWrite(sessionId, slideId, scope, scopeId, rec, delay, kin
   p.due = due;
   p.timer = setTimeout(() => flushRecord(key), delay);
 }
+
+// 다시 시도해도 소용없는 오류(수업이 지워짐·형식 오류 등)
+function fatalRecError(e) {
+  const c = String((e && e.code) || "");
+  return c === "23503" || c === "23502" || c === "22P02" || c === "42501" || c === "42P01" || c === "PGRST204" || c === "PGRST205";
+}
+let slowShown = false;
 
 async function flushRecord(key) {
   const p = pendingRec.get(key);
@@ -1674,48 +1839,93 @@ async function flushRecord(key) {
   p.conv = true; // 지금 쓰는 내용에 내 변경이 다 담김 → 이후 예약은 다시 판단
   const seq = p.seq;
   const { sessionId, slideId, scope, scopeId, rec } = p.args;
-  const body = { strokes: rec.strokes || [], texts: rec.texts || [], removed: rec.removed || [] };
-  const json = JSON.stringify(body);
-  if (json.length > MAX_REC_BYTES) {
-    pendingRec.delete(key);
-    toastOnce("rec-big:" + key, "이 슬라이드의 필기가 너무 많아요");
-    return;
-  }
   if (!isCloud) {
     pendingRec.delete(key);
-    sync.emit({ type: "record", sessionId, slideId, scope, scopeId, rec: JSON.parse(json), from: CLIENT_ID });
+    const body = { strokes: rec.strokes || [], texts: rec.texts || [], removed: rec.removed || [] };
+    sync.emit({ type: "record", sessionId, slideId, scope, scopeId, rec: JSON.parse(JSON.stringify(body)), from: CLIENT_ID });
     return;
   }
   p.inflight = true;
   let error = null;
-  try {
-    ({ error } = await supa.from("slide_records").upsert({
-      session_id: sessionId, slide_id: slideId, scope, scope_id: scopeId, ...body,
-      last_writer: CLIENT_ID, updated_at: nowIso(),
-    }, { onConflict: "session_id,slide_id,scope,scope_id" }));
-  } catch (e) { error = e; }
+  try { error = await writeRecordRows(key, p.args); } catch (e) { error = e || new Error("writeRecord"); }
   p.inflight = false;
   if (error) {
     warn("writeRecord", error);
     if (ownBatch) p.conv = false; // 내 변경이 아직 저장 안 됨 → 취소 대상 아님
-    if (p.tries < 3) {
-      p.tries++;
-      if (!p.timer) {
-        const d = 1000 * 2 ** p.tries;
-        p.first = Date.now(); p.due = Date.now() + d;
-        p.timer = setTimeout(() => flushRecord(key), d);
-      }
-    } else {
-      p.tries = 0;
-      if (!p.timer) pendingRec.delete(key); // 그 사이 새 쓰기가 예약됐으면 유지
+    if (fatalRecError(error)) {
+      pendingRec.delete(key);
       toastOnce("rec-fail", "필기를 저장하지 못했어요");
+      return;
     }
+    p.tries++;
+    if (p.tries === SLOW_TRIES && !slowShown) { slowShown = true; toast("인터넷이 느려 필기 저장이 늦어지고 있어요 · 계속 써도 연결되면 저장돼요"); }
+    if (!p.timer) {
+      const d = RETRY_MS[Math.min(p.tries, RETRY_MS.length) - 1] * (1 + Math.random() * 0.3);
+      p.first = Date.now(); p.due = Date.now() + d;
+      p.timer = setTimeout(() => flushRecord(key), d);
+    }
+    outboxSave(key);
     return;
   }
   p.tries = 0;
+  if (slowShown && ![...pendingRec.values()].some(x => x.tries > 0)) { slowShown = false; toast("필기를 저장했어요"); }
   if (p.again) { p.again = false; flushRecord(key); return; }
   // 저장 중에 새 쓰기가 예약되지 않았으면 대기 해제
-  if (p.seq === seq && !p.timer) pendingRec.delete(key);
+  if (p.seq === seq && !p.timer) { pendingRec.delete(key); outboxClear(key); }
+}
+
+// 행 쓰기: 개별 쪽은 머리 행(전부), 전체·모둠 쪽은 이 기기 행(내가 만든 것만). 아직 묶지 않은 획이 크면 오래된 것부터 묶음 행을 먼저.
+// → error | null
+// 가정: 묶음이 실패해도 행은 그대로 다 실어서 쓴다(묶음 문제로 저장이 막히지 않게). 다음 저장 때 다시 묶는다.
+async function writeRecordRows(key, { sessionId, slideId, scope, scopeId, rec }) {
+  const owner = ownerOf(scope, scopeId);
+  const shared = scope !== "individual";
+  const sealed = recSealed.get(key), own = recOwn.get(key);
+  const mine = (k) => !!(own && own.has(k));
+  const head = (rec.strokes || []).filter(x => x && !(sealed && sealed.has(itemKey(x))) && (!shared || mine(itemKey(x))));
+  let headW = head.map(s => packStroke(s, owner));
+  const sizes = headW.map(w => JSON.stringify(w).length + 1);
+  const total = sizes.reduce((a, b) => a + b, 0);
+  if (total > SEAL_AT) {
+    // 묶을 후보: id 있는 획(옛 레거시 획은 행에 둔다). 후보 중 최근 SEAL_KEEP만큼은 남긴다
+    let candBytes = 0;
+    const cand = [];
+    for (let i = 0; i < head.length; i++) { if (head[i].id) { cand.push(i); candBytes += sizes[i]; } }
+    const take = [];
+    for (const i of cand) { if (candBytes <= SEAL_KEEP) break; take.push(i); candBytes -= sizes[i]; }
+    const chunks = [];
+    let chunk = [], bytes = 0;
+    for (const i of take) {
+      if (chunk.length && bytes + sizes[i] > SEG_MAX) { chunks.push(chunk); chunk = []; bytes = 0; }
+      chunk.push(i); bytes += sizes[i];
+    }
+    if (chunk.length) chunks.push(chunk);
+    const done = new Set();
+    for (const c of chunks) {
+      const segId = newSegId();
+      const { error } = await supa.from("slide_records").upsert({
+        session_id: sessionId, slide_id: slideId + SEG + segId, scope, scope_id: scopeId,
+        strokes: c.map(i => headW[i]), texts: [], removed: [],
+        last_writer: CLIENT_ID, updated_at: nowIso(),
+      }, { onConflict: "session_id,slide_id,scope,scope_id" });
+      if (error) { warn("sealRecord", error); break; }
+      setOf(recSegs, key).add(segId);
+      setOf(recMySegs, key).add(segId);
+      const sl = setOf(recSealed, key), seen = setOf(recRemoteSeen, key);
+      for (const i of c) { const k = itemKey(head[i]); sl.add(k); seen.add(k); done.add(i); }
+    }
+    if (done.size) headW = headW.filter((_, i) => !done.has(i));
+  }
+  const refs = shared ? recMySegs.get(key) : recSegs.get(key);
+  const texts = shared ? (rec.texts || []).filter(x => x && mine(itemKey(x))) : (rec.texts || []);
+  const tomb = shared ? (rec.removed || []).filter(id => mine("r:" + id)) : (rec.removed || []);
+  const removed = refs && refs.size ? tomb.concat([...refs].map(id => SEG + id)) : tomb;
+  const { error } = await supa.from("slide_records").upsert({
+    session_id: sessionId, slide_id: shared ? slideId + SEG + DEV : slideId, scope, scope_id: scopeId,
+    strokes: headW, texts, removed,
+    last_writer: CLIENT_ID, updated_at: nowIso(),
+  }, { onConflict: "session_id,slide_id,scope,scope_id" });
+  return error || null;
 }
 
 // 크기 초과로 잘린 이벤트 → 행 직접 조회
@@ -1723,7 +1933,65 @@ async function refetchRecord(session, row) {
   const { data, error } = await supa.from("slide_records").select(RECORD_COLS)
     .eq("session_id", session.id).eq("slide_id", row.slide_id).eq("scope", row.scope).eq("scope_id", row.scope_id).maybeSingle();
   if (error || !data) return;
-  if (applyRecordRow(session, data)) store.set(s => s);
+  if (applyRecordRow(session, data, { fromFetch: true })) store.set(s => s);
+}
+
+// ── 저장 전 필기 보관(기기 localStorage) ──
+// 저장이 끝나기 전에 새로 고치거나 탭이 닫혀도, 다음에 그 수업을 조회할 때 되살려 병합하고 다시 저장한다.
+// 가정: 묶음 행에 이미 들어간 획은 빼고(서버에 있음) 머리만 보관. 3일 지난 것은 지운다. 저장 공간이 모자라면 조용히 건너뛴다.
+const OUTBOX = "hada:rq:";
+const OUTBOX_TTL = 3 * 24 * 3600 * 1000;
+const outboxTimers = new Map();
+function outboxSave(key) {
+  if (!isCloud || outboxTimers.has(key)) return;
+  outboxTimers.set(key, setTimeout(() => { outboxTimers.delete(key); outboxWrite(key); }, 1500));
+}
+function outboxWrite(key) {
+  const p = pendingRec.get(key);
+  if (!p || !p.args) return; // 이미 저장됨
+  const { sessionId, slideId, scope, scopeId, rec } = p.args;
+  const owner = ownerOf(scope, scopeId), sealed = recSealed.get(key), own = recOwn.get(key);
+  const shared = scope !== "individual", mine = (k) => !shared || !!(own && own.has(k));
+  const strokes = (rec.strokes || []).filter(x => x && !(sealed && sealed.has(itemKey(x))) && mine(itemKey(x))).map(s => packStroke(s, owner));
+  const texts = (rec.texts || []).filter(x => x && mine(itemKey(x)));
+  const removed = (rec.removed || []).filter(id => mine("r:" + id));
+  try {
+    localStorage.setItem(OUTBOX + key, JSON.stringify({ v: 1, at: Date.now(), sessionId, slideId, scope, scopeId, strokes, texts, removed }));
+  } catch (_) {}
+}
+function outboxClear(key) {
+  clearTimeout(outboxTimers.get(key)); outboxTimers.delete(key);
+  try { localStorage.removeItem(OUTBOX + key); } catch (_) {}
+}
+// 세션 조회 직후: 이 세션의 보관분을 병합하고, 서버에 없는 것이 있으면 다시 저장
+function outboxRestore(s) {
+  if (!isCloud || !s) return false;
+  const keys = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && k.startsWith(OUTBOX)) keys.push(k); }
+  } catch (_) { return false; }
+  let changed = false;
+  for (const k of keys) {
+    let e = null;
+    try { e = JSON.parse(localStorage.getItem(k) || "null"); } catch (_) {}
+    if (!e || !e.sessionId || !e.slideId || !e.scope || Date.now() - (e.at || 0) > OUTBOX_TTL) { try { localStorage.removeItem(k); } catch (_) {} continue; }
+    if (e.sessionId !== s.id) continue;
+    const scopeId = e.scope === "whole" ? s.id : e.scopeId;
+    const key = recKey(s.id, e.slideId, e.scope, scopeId);
+    if (pendingRec.has(key) || outboxTimers.has(key)) continue; // 이 탭이 지금 쓰는 중
+    const rec = { strokes: unpackStrokes(e.strokes || [], ownerOf(e.scope, scopeId)), texts: e.texts || [], removed: e.removed || [] };
+    const slot = recSlot(s, e.scope, scopeId);
+    if (!slot[e.slideId]) { slot[e.slideId] = rec; bumpRec(rec); changed = true; }
+    else if (mergeRec(slot[e.slideId], rec)) { bumpRec(slot[e.slideId]); changed = true; }
+    // 서버에서 본 적 없는 항목(또는 더 새 글)이 있으면 다시 저장, 다 있으면 보관분 삭제
+    const seen = recRemoteSeen.get(key), rts = recRemoteTs.get(key), sealed = recSealed.get(key);
+    const unsaved = rec.strokes.some(x => x && !(seen && seen.has(itemKey(x))) && !(sealed && sealed.has(itemKey(x)))) ||
+      rec.texts.some(x => x && (!(seen && seen.has(itemKey(x))) || ((rts && rts.get(itemKey(x))) || 0) < tsOf(x))) ||
+      rec.removed.some(id => !(seen && seen.has("r:" + id)));
+    if (unsaved) cloudWriteRecord(s.id, e.slideId, e.scope, scopeId, slot[e.slideId]);
+    else { try { localStorage.removeItem(k); } catch (_) {} }
+  }
+  return changed;
 }
 
 // ── 응답 ──
@@ -1861,6 +2129,7 @@ export function subscribeSession(sessionId, opts = {}) {
   const s0 = findSession(sessionId);
   let curGroup = groupId ?? (s0 ? myGroupId(s0, studentId) : null);
   let resyncTimer = null;
+  let subscribedOnce = false;
   const isStudent = role === "student";
 
   const resync = (delay = 0) => {
@@ -1930,8 +2199,10 @@ export function subscribeSession(sessionId, opts = {}) {
     c.subscribe((status) => {
       if (stopped || c !== ch) return;
       if (status === "SUBSCRIBED") {
-        // 첫 구독 포함 매번 resync: 캐시로 연 화면·조회~구독 사이에 놓친 응답/참여/필기를 채움
-        resync(0);
+        // 첫 구독 포함 매번 resync: 캐시로 연 화면·조회~구독 사이에 놓친 응답/참여/필기를 채움.
+        // 재연결이면 학생은 0.3~1.8초 흩어서(반 전체가 한꺼번에 다시 조회해 DB가 몰리지 않게)
+        resync(isStudent && subscribedOnce ? 300 + Math.random() * 1500 : 0);
+        subscribedOnce = true;
       } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
         console.warn("[cloud] 세션 구독 상태:", status);
       }

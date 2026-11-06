@@ -69,7 +69,8 @@ session  = { id, lessonId, teacherId, title, status /*'live'|'stopped'|'complete
              worksheet: Slide[] /* 학습지 스냅샷(시작 때 lesson.worksheet 복사, 불변). 학생 필기는 records[studentId][pageId] */,
              records: { __whole: { [slideId]: Rec }, __groups: { [groupId]: { [slideId]: Rec } }, [studentId]: { [slideId]: Rec } },
              responses: { [slideId]: Response[] } }
-Rec      = { strokes: Stroke[], texts: Text[], removed: string[] /* 지운 stroke id (whole/group 병합용 tombstone) */ }
+Rec      = { strokes: Stroke[], texts: Text[], removed: string[] /* 지운 stroke·text id (병합용 tombstone, 모든 scope) */ }
+             // DB·실시간에서는 획을 압축하고(js/ink-codec.js) 한 쪽이 여러 행으로 나뉜다(v2.18.2, §5.1 cloudWriteRecord). 메모리 Rec 모양은 그대로
 Stroke   = { id /*'st_…'*/, by /*작성자 id*/, tool /*'pen'|'highlight'|'eraser'*/, color, size, ts, points: [{x,y,p}] /* 0..1, 소수 4자리로 반올림 */,
              shape? /*'line'|'arrow'|'rect'|'ellipse'|'tri' (v2.10 도형)*/, box? /*[시작x, 시작y, 끝x, 끝y] 정규화*/ }
              // 도형: 그리기는 box로 정확하게, points는 윤곽을 기준 화면 8px 간격으로 채운 점(지우개·필기 범위·이전 버전 화면용)
@@ -105,6 +106,7 @@ worksheet_pages(id pk, lesson_id fk cascade, position, title, bg_url, bg_path, t
 session_participants(session_id, student_id, joined_at, pk(session_id, student_id))
 slide_records(id, session_id fk cascade, slide_id, scope, scope_id NOT NULL /* whole → session_id */, strokes jsonb, texts jsonb, removed jsonb default '[]',
               last_writer, updated_at, unique(session_id, slide_id, scope, scope_id))
+              -- v2.18.2: slide_id 꼬리 '~<묶음id>' = 묶음 행, '~@<기기id>' = 전체·모둠 쪽 기기 행(DB 변경 없음, §5.1)
 responses(id bigserial, session_id fk cascade, slide_id, student_id, item_key default '', payload jsonb, score numeric, correct bool, time_ms int,
           last_writer, updated_at, unique(session_id, slide_id, student_id, item_key))
 view lesson_meta(id, teacher_id, title, created_at, updated_at, slide_count, cover)   -- 006 이후에도 그대로(교과는 lessons.subject_id 를 따로 읽음)
@@ -216,8 +218,16 @@ export async function cloudFindSessionByReviewCode(code) → { id, teacherId, st
 
 // 참여·필기·응답
 export async function cloudAddParticipant(sessionId, studentId)
-export function cloudWriteRecord(sessionId, slideId, scope, scopeId, rec)   // 키별 250ms 디바운스(최신만), whole이면 scopeId=sessionId
-   // 행 > 700 KB면 저장하지 않고 toast('이 슬라이드의 필기가 너무 많아요') 1회
+export function cloudWriteRecord(sessionId, slideId, scope, scopeId, rec)   // 키별 250ms 디바운스(최신만, 길어도 1초), whole이면 scopeId=sessionId
+   // v2.18.2 (논설문 수업: 한 쪽 700 KB 한도에 막혀 '필기가 너무 많아요' 뒤 저장 안 됨 + 쪽 전체 재전송으로 DB 시간 초과 + 다시 맞추기가 옛 내용으로 덮어 글이 지워짐):
+   //   · 크기 한도 없음. 획은 points 대신 pz(짧은 문자열, ink-codec.js — x·y 1/10000·p 1/100 정수 차이를 5비트 base64url 가변 길이로, 약 5배 작음).
+   //     개별 쪽의 주인 학생 by·기본 tool 'pen'은 빼고 보낸다(풀 때 되살림). 이전 버전 화면은 points 없는 획을 건너뛴다(새로 고치면 보임)
+   //   · 행 나누기: 개별 쪽 = 머리 행(<slideId>, 학생·첨삭 교사가 함께 씀). 전체·모둠 쪽 = 기기 행(<slideId>~@<기기id>, 그 기기가 만든 것만 — 남의 행을 쓰지 않음).
+   //     행의 획(압축 JSON)이 48 KB를 넘으면 오래된 획(최근 12 KB는 남김)을 묶음 행(<slideId>~<묶음id>, ≤96 KB, 한 번 쓰고 안 바꿈)으로 먼저 옮기고
+   //     행의 removed에 묶음 표시 '~<묶음id>'를 남긴다(메모리 Rec.removed에는 넣지 않음). 묶음이 실패해도 행은 다 실어서 쓴다
+   //   · 실패하면 1·2·4·8·15초 …로 계속 다시 시도(실패 중 새 쓰기는 다음 시도에 실림, 재촉하지 않음). 3번 연속이면 toast 1회
+   //     '인터넷이 느려 필기 저장이 늦어지고 있어요 · 계속 써도 연결되면 저장돼요', 되면 '필기를 저장했어요'. 수업이 지워짐(23503) 등은 그만두고 '필기를 저장하지 못했어요'
+   //   · 저장이 1.5초 넘게 안 끝나면 저장할 내용을 localStorage 'hada:rq:<키>'에 보관 → 저장되면 지움. 다음 cloudFetchSession이 병합하고 서버에 없으면 다시 저장(3일 뒤 버림)
 export async function cloudSubmitResponse(r /* Response without id */) → Response   // upsert onConflict 'session_id,slide_id,student_id,item_key' .select().single()
 export async function cloudDeleteResponse(sessionId, slideId, studentId, itemKey)
 export async function cloudDeleteResponsesForSlide(sessionId, slideId)              // 교사 '초기화'/'다시'
@@ -230,7 +240,10 @@ export function subscribeSession(sessionId, { role, studentId, groupId }) → un
    //   session_participants filter session_id=eq.  → participants 증분(+학생 정보 없으면 1회 조회)
    //   responses filter session_id=eq.             → INSERT/UPDATE: (slide_id,student_id,item_key) 교체, DELETE: old.id로 제거
    //   slide_records: 교사 filter session_id=eq.<id>; 학생 filter scope_id=in.(<studentId>,<groupId|none>,<sessionId>)
-   //   → applyRecord: last_writer===clientId면 무시. whole/group은 id 기준 합집합 병합 + removed 합집합, individual은 원격 채택.
+   //   → applyRecord: last_writer===clientId면 무시. 모든 scope가 id 기준 합집합 병합 + removed 합집합(글은 ts·없으면 at가 새 것) — v2.18.2부터 individual도
+   //     병합(예전엔 원격 채택이라 저장 안 된 내 필기가 다시 맞추기 때 지워졌다). 머리·기기·묶음 행을 한 Rec로 합치고, 모르는 묶음 표시는 그 행만 조회(fetchSegments).
+   //     개별 쪽 머리 행에서 내 항목이 빠졌으면 0.3~1.3초 뒤 다시 씀(남의 것은 그 주인이). 전체·모둠은 각자 자기 행이라 수렴 쓰기 없음.
+   //   cloudFetchSession은 필기 행을 100행씩 읽고 묶음 행 → 나머지 순으로 반영, 끝에 기기 보관분 병합. 학생의 재연결 resync는 0.3~1.8초 흩어서.
    // SUBSCRIBED 재진입(재연결) 시 resync = cloudFetchSession. visibilitychange(visible)·online 이벤트에도 resync(500ms 디바운스).
    // 모둠 변경 시 학생은 unsubscribe 후 재구독.
 export function watchTeacherLive(teacherId, onLive /*(sessionMeta)*/) → stop   // 학생 대기: sessions filter teacher_id=eq + 5초 폴링
